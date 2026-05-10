@@ -215,6 +215,16 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ==========================
+# msg for update
+# ==============
+async def on_startup(app: Application):
+    await app.bot.send_message(
+        chat_id=ADMIN_ID,
+        text="🤖 ربات آپدیت شد و با موفقیت آنلاین است\n\nخیالت راحت 🌹"
+    )
+
+
 # =========================
 # AUTO REPLY
 # =========================
@@ -252,23 +262,21 @@ async def auto_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.bot_data["AUTO_REPLY"] = True
-
-    app = Application.builder().token(BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("panel", panel))
     app.add_handler(CommandHandler("broadcast", broadcast))
-
     app.add_handler(CallbackQueryHandler(callbacks))
 
     app.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
+           # filters.TEXT & ~filters.COMMAND,
+            filters.ALL
             auto_reply
         )
     )
 
     print("Bot Started...")
+    app.post_init = on_startup
 
     app.run_polling()
 
