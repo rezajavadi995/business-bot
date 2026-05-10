@@ -270,7 +270,7 @@ def main():
     app.add_handler(
         MessageHandler(
            # filters.TEXT & ~filters.COMMAND,
-            filters.ALL
+            filters.ALL,
             auto_reply
         )
     )
