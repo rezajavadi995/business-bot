@@ -27,7 +27,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 ADMIN_ID = 8062924341
 
-AUTO_REPLY = True
+#AUTO_REPLY = True
 
 START_TIME = time.time()
 
@@ -136,7 +136,6 @@ async def panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 
 async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
     global AUTO_REPLY
 
     query = update.callback_query
@@ -177,20 +176,12 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "on":
-
-        AUTO_REPLY = True
-
-        await query.message.reply_text(
-            "✅ Auto Reply Enabled"
-        )
+        context.bot_data["AUTO_REPLY"] = True
+        await query.message.reply_text("✅ Auto Reply Enabled")
 
     elif data == "off":
-
-        AUTO_REPLY = False
-
-        await query.message.reply_text(
-            "❌ Auto Reply Disabled"
-        )
+        context.bot_data["AUTO_REPLY"] = False
+        await query.message.reply_text("❌ Auto Reply Disabled")
 
 
 # =========================
@@ -230,8 +221,6 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def auto_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    global AUTO_REPLY
-
     if not update.message:
         return
 
@@ -242,16 +231,18 @@ async def auto_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_admin(user.id):
         return
 
-    if AUTO_REPLY:
+    # 🔥 حالت صحیح
+    if not context.bot_data.get("AUTO_REPLY", True):
+        return
 
-        text = (
-            "<b>سلام دوست عزیز⚘️</b>\n\n"
-            "<b>🔰 پیام شما توسط ربات دریافت شد 🔰</b>\n\n"
-            "از این که تا زمان پاسخ‌گویی صبور هستید،\n"
-            "از شما بسیار سپاس‌گزاریم 🙏"
-        )
+    text = (
+        "<b>سلام دوست عزیز⚘️</b>\n\n"
+        "<b>🔰 پیام شما توسط ربات دریافت شد 🔰</b>\n\n"
+        "از این که تا زمان پاسخ‌گویی صبور هستید،\n"
+        "از شما بسیار سپاس‌گزاریم 🙏"
+    )
 
-        await update.message.reply_text(text, parse_mode="HTML")
+    await update.message.reply_text(text, parse_mode="HTML")
 
 
 # =========================
@@ -259,6 +250,8 @@ async def auto_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 
 def main():
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.bot_data["AUTO_REPLY"] = True
 
     app = Application.builder().token(BOT_TOKEN).build()
 
