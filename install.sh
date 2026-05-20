@@ -353,9 +353,9 @@ set_env_key() {
     echo "${k}=${v}" >> "$ENV_FILE"
   fi
 }
-set_token(){ read -r -p "توکن ربات: " t; [[ -n "$t" ]] || { echo "توکن خالی است"; exit 1; }; set_env_key BOT_TOKEN "$t"; echo "[SUCCESS] BOT_TOKEN ذخیره شد"; }
-set_admin(){ read -r -p "آیدی عددی ادمین: " a; [[ "$a" =~ ^[0-9]+$ ]] || { echo "آیدی نامعتبر"; exit 1; }; set_env_key ADMIN_ID "$a"; echo "[SUCCESS] ADMIN_ID ذخیره شد"; }
-set_channel(){ read -r -p "آیدی عددی چنل اجباری (مثال: -1003939099054): " c; [[ "$c" =~ ^-100[0-9]{6,}$ ]] || { echo "فرمت نامعتبر است. مثال صحیح: -1003939099054"; exit 1; }; set_env_key FORCE_JOIN_CHANNEL "$c"; echo "[SUCCESS] FORCE_JOIN_CHANNEL ذخیره شد"; }
+set_token(){ read -r -s -p "Telegram bot token: " t; echo; [[ -n "$t" ]] || { echo "Token is empty"; exit 1; }; set_env_key BOT_TOKEN "$t"; echo "[SUCCESS] BOT_TOKEN saved"; }
+set_admin(){ read -r -p "Admin numeric ID: " a; [[ "$a" =~ ^[0-9]+$ ]] || { echo "Invalid admin ID"; exit 1; }; set_env_key ADMIN_ID "$a"; echo "[SUCCESS] ADMIN_ID saved"; }
+set_channel(){ read -r -p "Mandatory channel numeric ID (e.g. -1003939099054): " c; [[ "$c" =~ ^-100[0-9]{6,}$ ]] || { echo "Invalid format. Example: -1003939099054"; exit 1; }; set_env_key FORCE_JOIN_CHANNEL "$c"; echo "[SUCCESS] FORCE_JOIN_CHANNEL saved"; }
 run_bot(){ cd "$PROJECT_DIR"; source "$VENV_DIR/bin/activate"; exec python bot.py; }
 service_enable(){
 cat > "/etc/systemd/system/$SERVICE_NAME" <<UNIT
@@ -376,7 +376,7 @@ WantedBy=multi-user.target
 UNIT
 systemctl daemon-reload
 systemctl enable --now "$SERVICE_NAME"
-echo "[SUCCESS] سرویس فعال و اجرا شد"
+echo "[SUCCESS] service enabled and started"
 }
 service_status(){ systemctl status "$SERVICE_NAME" --no-pager; }
 bot_status(){ pgrep -af "python.*bot.py" || true; systemctl is-active "$SERVICE_NAME" || true; }
@@ -389,7 +389,7 @@ bot_test(){
   [[ -n "${ADMIN_ID:-}" ]] || { echo "ADMIN_ID تنظیم نشده"; exit 1; }
   msg="✅ تست اتصال موفق بود"
   curl -fsS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" -d "chat_id=${ADMIN_ID}" -d "text=${msg}" >/dev/null
-  echo "[SUCCESS] پیام تست به ادمین ارسال شد"
+  echo "[SUCCESS] test message sent to admin only"
 }
 uninstall_all(){
   systemctl disable --now "$SERVICE_NAME" 2>/dev/null || true
@@ -397,36 +397,36 @@ uninstall_all(){
   systemctl daemon-reload
   rm -f /usr/local/bin/manage
   rm -rf "$PROJECT_DIR"
-  echo "[SUCCESS] حذف نصب کامل انجام شد"
+  echo "[SUCCESS] full uninstall completed"
 }
 
 draw_menu(){
-  local width=42
+  local width=50
   local line
   line=$(printf "═%.0s" $(seq 1 $width))
   printf "\n╔%s╗\n" "$line"
-  printf "║%-42s║\n" "        BUSINESS BOT MANAGE"
+  printf "║%-50s║\n" "        BUSINESS BOT MANAGE"
   printf "╠%s╣\n" "$line"
-  printf "║ %-40s ║\n" "1) ست کردن توکن تلگرام"
-  printf "║ %-40s ║\n" "2) ست کردن آیدی عددی ادمین"
-  printf "║ %-40s ║\n" "3) ست کردن چنل جوین اجباری"
-  printf "║ %-40s ║\n" "4) تست متصل بودن ربات"
-  printf "║ %-40s ║\n" "5) اجرای ربات بدون systemd"
-  printf "║ %-40s ║\n" "6) راه‌اندازی ربات با systemd"
-  printf "║ %-40s ║\n" "7) وضعیت systemd"
-  printf "║ %-40s ║\n" "8) وضعیت ربات"
-  printf "║ %-40s ║\n" "9) ریست/ریکاوری systemd"
-  printf "║ %-40s ║\n" "10) دریافت لاگ‌ها"
-  printf "║ %-40s ║\n" "11) دریافت خطاها"
-  printf "║ %-40s ║\n" "12) حذف نصب کامل"
-  printf "║ %-40s ║\n" "13) خروج"
+  printf "║ %-48s ║\n" "1) Set Telegram token"
+  printf "║ %-48s ║\n" "2) Set admin numeric ID"
+  printf "║ %-48s ║\n" "3) Set mandatory join channel"
+  printf "║ %-48s ║\n" "4) Test bot connectivity"
+  printf "║ %-48s ║\n" "5) Run bot without systemd"
+  printf "║ %-48s ║\n" "6) Enable and start systemd"
+  printf "║ %-48s ║\n" "7) systemd status"
+  printf "║ %-48s ║\n" "8) bot status"
+  printf "║ %-48s ║\n" "9) systemd recover/reset"
+  printf "║ %-48s ║\n" "10) show logs"
+  printf "║ %-48s ║\n" "11) show errors"
+  printf "║ %-48s ║\n" "12) full uninstall"
+  printf "║ %-48s ║\n" "13) exit"
   printf "╚%s╝\n" "$line"
 }
 
 while true; do
   for d in "." ".." "..."; do printf "\rدر حال آماده‌سازی منوی مدیریت %s" "$d"; sleep 0.12; done; printf "\r%*s\r" 60 ""
   draw_menu
-  read -r -p "گزینه را وارد کنید [1-13]: " opt
+  read -r -p "Choose option [1-13]: " opt
   case "$opt" in
     1) set_token ;;
     2) set_admin ;;
@@ -439,9 +439,9 @@ while true; do
     9) service_recover ;;
     10) logs_all ;;
     11) logs_error ;;
-    12) read -r -p "مطمئن هستید؟ (yes/no): " y; [[ "$y" == "yes" ]] && uninstall_all && exit 0 ;;
+    12) read -r -p "Confirm uninstall (yes/no): " y; [[ "$y" == "yes" ]] && uninstall_all && exit 0 ;;
     13) exit 0 ;;
-    *) echo "گزینه نامعتبر" ;;
+    *) echo "Invalid option" ;;
   esac
 done
 EOF

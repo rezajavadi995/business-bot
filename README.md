@@ -1,60 +1,111 @@
-# Telegram Business Bot (Ubuntu 24)
+# Business Bot (Telegram)
 
-ربات بیزینسی با نصب یک‌خطی، مدیریت سراسری با `manage`، پنل ادمین مدرن، و اجرای دائمی با systemd.
+Production-ready Telegram business bot with:
+- One-line installer
+- Global `manage` command
+- Persistent data (`data.json`) and env config (`.env`)
+- Admin panel with feature toggles and text editor
+- Optional `systemd` auto-start
 
-## نصب سریع (One-liner)
+## One-line install
 
 ```bash
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/rezajavadi995/business-bot/main/install.sh)"
 ```
 
-## بعد از نصب، فقط این را بزن
+After installation, run from **any directory**:
 
 ```bash
 manage
 ```
 
-این دستور از هر مسیر/دایرکتوری اجرا می‌شود و خودش:
-- مسیر نصب را می‌شناسد
-- venv را خودکار فعال می‌کند
-- منوی مدیریت را باز می‌کند
+---
 
-## منوی manage
+## `manage` menu (13 options)
 
-1. اجرای ربات در foreground
-2. فعال‌سازی سرویس دائمی systemd (بعد از reboot هم بالا می‌ماند)
-3. ری‌استارت سرویس
-4. وضعیت سرویس
-5. لاگ زنده سرویس
+1. Set Telegram token (hidden input)
+2. Set admin numeric ID
+3. Set mandatory join channel (format: `-1003939099054`)
+4. Test bot connectivity (sends success message to admin only)
+5. Run bot without systemd
+6. Enable/start bot with systemd
+7. Show systemd status
+8. Show bot status
+9. Recover/reset systemd
+10. Show logs
+11. Show errors
+12. Full uninstall
+13. Exit
 
-## تنظیمات ربات
+---
 
-نیازی به ویرایش دستی پیچیده نیست؛ مسیرها و ساختار توسط installer آماده می‌شود. فقط مقدار توکن را یک بار در `.env` قرار بدهید.
+## Bot commands (BotFather)
 
-## دستورات BotFather
+- `/start` — welcome + reply keyboard menu
+- `/panel` — open admin panel (admin only)
+- `/broadcast` — send broadcast (admin only)
 
-- `/start` - شروع
-- `/broadcast` - ارسال همگانی توسط ادمین
+You can also type `panel` without slash to open admin panel (admin only).
 
-## ویژگی‌های مهم
+---
 
-- پنل ادمین جذاب‌تر با دکمه‌های inline مدرن
-- دکمه راهنمای فعال‌سازی systemd داخل منوی ادمین
-- تغییر پیام آفلاین
-- سوییچ ON/OFF برای فیچرها
-- لاگ فایل و لاگ سرویس
+## Admin panel behavior
 
-## اجرای سرویس دائمی
+- Admin panel is hidden from public users.
+- `/start` always shows user menu flow.
+- Admin panel opens only with `/panel` or `panel`.
+- Admin can:
+  - enable/disable bot
+  - edit runtime texts
+  - toggle features
+  - see reports
 
-راه سریع: `manage` -> گزینه `Enable systemd service`.
+---
 
-بعد از این مرحله، با بستن ترمینال یا ریبوت سرور، ربات روشن می‌ماند.
+## Text editor behavior
 
+From admin panel -> **Edit Texts**:
+1. Choose text key
+2. Bot shows current (old) value
+3. Send new text
+4. Bot saves and confirms old/new values
 
-## فرمت چنل جوین اجباری
+Editable text keys:
+- Offline message
+- Services text
+- Pricing text
+- Working hours
+- Location text
+- FAQ text
+- Contact text
 
-در گزینه 3 منوی `manage`، فقط آیدی عددی سوپرگروه/چنل با فرمت زیر پذیرفته می‌شود:
+---
 
-`-1003939099054`
+## Feature system
 
-اگر فرمت اشتباه باشد، ذخیره انجام نمی‌شود.
+The bot has 20 runtime feature toggles:
+- 10 admin features
+- 10 user features
+
+All toggles are available in admin panel -> Features.
+
+---
+
+## Important note about Telegram Business behavior
+
+If your Telegram account is connected to a Business bot, delivery rules depend on Telegram Business settings and update types.
+This project handles standard bot updates and interactive flows. If you want auto-replies to incoming business messages from users that never pressed `/start`, your Telegram business routing and permissions must allow forwarding those messages to the bot.
+
+---
+
+## Logs
+
+- Bot log file: `logs/bot.log`
+- Service logs: `manage` option 10/11
+
+---
+
+## Data files
+
+- `.env` -> token/admin/channel
+- `data.json` -> runtime settings, visitors, feature flags, editable texts
