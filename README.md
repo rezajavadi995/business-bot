@@ -1,47 +1,74 @@
-# ربات بیزینس تلگرام
+# Telegram Business Bot
 
-این پروژه یک ربات بیزینسی با نصب سریع، دستور `manage`، پنل ادمین، و داده‌ی پایدار است.
+این نسخه با حفظ flow فعلی، برای migration تدریجی به معماری مدرن (aiogram-first در آینده) آماده شده است؛ بدون rewrite سنگین و بدون شکستن handler/callback های فعلی.
 
-## نصب سریع
+## نصب
 ```bash
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/rezajavadi995/business-bot/main/install.sh)"
 ```
 
-## اجرای مدیریت
-بعد از نصب، از هر مسیر:
+سپس:
 ```bash
 manage
 ```
 
-## دستورات ربات
+## معماری فعلی (Hybrid Migration Ready)
+- Runtime فعلی روی `python-telegram-bot` باقی مانده (پایدار و production-safe).
+- لایه abstraction برای keyboard/buttons اضافه شده تا مهاجرت آینده ساده شود:
+  - `create_primary_button`
+  - `create_success_button`
+  - `create_danger_button`
+  - `create_menu_keyboard`
+  - `create_admin_keyboard`
+- Handlerها و flow فعلی حذف یا شکسته نشده‌اند.
+
+## پایگاه داده: SQLite
+- تمام داده‌های مهم در `bot.db` نگه‌داری می‌شوند.
+- جدول `kv`: تنظیمات ربات (features/texts/state)
+- جدول `users`: اطلاعات کاربران
+
+فیلدهای کاربر:
+- `user_id`
+- `username` (شناسه @)
+- `full_name`
+- `phone` (اگر ارسال شود)
+- `is_channel_joined` (yes/no)
+- `last_seen_at`
+- `source`
+
+## رفتار Business Test (ایزوله و قابل حذف)
+هندلر تست ایزوله فعال است:
+- اگر business message دقیقاً `عجیبستان` باشد
+- پاسخ می‌دهد: `✅ Business Bot Works`
+- لاگ موفق/خطا واضح ثبت می‌شود.
+
+## دستورات
 - `/start`
 - `/panel` (فقط ادمین)
 - `/broadcast` (فقط ادمین)
+- `panel` بدون اسلش (فقط ادمین)
+- `menu`
 
-همچنین ادمین می‌تواند به‌جای `/panel`، متن `panel` بفرستد.
+## Dependency Analysis
+- کتابخانه اصلی: `python-telegram-bot==21.10`
+- سازگار با async handlers فعلی پروژه.
+- پشتیبانی style واقعی دکمه‌ها (`style=primary/success/danger`) در این لایه تضمین‌شده نیست؛ بنابراین fallback امن با emoji semantic استفاده شده است (بدون crash/serialization issue).
+- برای migration آینده به aiogram، abstraction layer دکمه‌ها و keyboardها coupling را کم کرده است.
 
-## تست موقت Business Connection
-یک هندلر ایزوله برای تست اضافه شده است:
-- اگر پیام بیزینسی ورودی دقیقاً `عجیبستان` باشد
-- پاسخ می‌دهد: `✅ Business Bot Works`
-- لاگ موفق/ناموفق شفاف ثبت می‌شود.
+## Migration Readiness Report
+- ✅ Keyboard system مرکزی شد.
+- ✅ Button factory اضافه شد.
+- ✅ Callback routing حفظ شد.
+- ✅ Business test flow ایزوله شد.
+- ✅ Data persistence از JSON پراکنده به SQLite مرکزی منتقل شد.
+- ✅ Backward compatibility حفظ شد (commands/handlers اصلی پابرجا).
 
-این بخش برای تست موقت است و در آینده به‌راحتی قابل حذف است (تابع `business_test_handler`).
-
-## دیتابیس MySQL (اختیاری)
-برای فعال‌سازی ذخیره‌سازی کاربران در MySQL:
-- در `.env` بگذارید:
-```env
-USE_MYSQL=1
-MYSQL_HOST=127.0.0.1
-MYSQL_USER=root
-MYSQL_PASSWORD=...
-MYSQL_DB=business_bot
-```
-
-اگر `USE_MYSQL=1` نباشد، ذخیره‌سازی فقط در `data.json` انجام می‌شود.
+### Compatibility Risks
+- Business message routing وابسته به تنظیمات Telegram Business account و permissionها است.
+- در برخی clientها/سناریوها ممکن است business update نرسد؛ لاگ برای تشخیص اضافه شده است.
 
 ## فایل‌ها
-- `.env`: تنظیمات حساس
-- `data.json`: وضعیت و متن‌ها و فیچرها
-- `logs/bot.log`: لاگ اجرایی
+- `bot.py` منطق ربات + adapters + handlers
+- `bot.db` دیتابیس SQLite
+- `logs/bot.log` لاگ
+- `.env` تنظیمات حساس
