@@ -153,6 +153,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text, pm = styled(f"سلام {user.first_name} 🌟\nبه ربات خوش آمدی. دکمه منو را بزن.", data)
     await update.message.reply_text(text, parse_mode=pm, reply_markup=ReplyKeyboardMarkup([["menu"]], resize_keyboard=True))
 
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_user:
+        return
+    data = load_data()
+    user = update.effective_user
+    if user.id not in data["visitors"]:
+        data["visitors"].append(user.id)
+        save_data(data)
+    text, pm = styled(f"Welcome {user.first_name}!\nTap Menu to continue.", data)
+    await update.message.reply_text(text, parse_mode=pm, reply_markup=ReplyKeyboardMarkup([["menu"]], resize_keyboard=True))
+
+def admin_panel(data: dict[str, Any]) -> InlineKeyboardMarkup:
+    onoff = "🟢 روشن" if data["active"] else "🔴 خاموش"
+    bold = "🟢 Bold ON" if data.get("bold_mode") else "⚪ Bold OFF"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🧊  {onoff}  🧊", callback_data="toggle:active")],
+        [InlineKeyboardButton("🎨  ویرایش متن‌ها  🎨", callback_data="admin:texts")],
+        [InlineKeyboardButton("💵  مشاهده تعرفه  💵", callback_data="visitor:pricing")],
+        [InlineKeyboardButton(f"🔠  {bold}  🔠", callback_data="toggle:bold")],
+        [InlineKeyboardButton("⚙️  مدیریت فیچر  ⚙️", callback_data="admin:features")],
+        [InlineKeyboardButton("📊  گزارش وضعیت  📊", callback_data="admin:report")],
+    ])
 
 async def panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_user:
@@ -304,7 +326,6 @@ def main() -> None:
         raise RuntimeError("BOT_TOKEN is missing")
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("panel", panel))
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CallbackQueryHandler(callbacks))
     app.add_handler(MessageHandler(filters.ALL, all_messages))
