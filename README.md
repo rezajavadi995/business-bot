@@ -5,7 +5,7 @@
 ## نصب سریع (One-liner)
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/<YOUR_USER>/<YOUR_REPO>/<BRANCH>/install.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/rezajavadi995/business-bot/maim/install.sh)"
 ```
 
 > اگر ریپو private است، ابتدا پروژه را clone کنید و داخل فولدر پروژه اجرا کنید:
