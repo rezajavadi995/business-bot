@@ -90,6 +90,10 @@ class DB:
         with self.conn() as c:
             return c.execute("SELECT * FROM users ORDER BY last_seen_at DESC LIMIT ?", (limit,)).fetchall()
 
+def styled(text: str, data: dict[str, Any]) -> tuple[str, str | None]:
+    if data.get("features", {}).get("admin_bold_mode", True) and data.get("bold_mode"):
+        return f"<b>{text}</b>", ParseMode.HTML
+    return text, None
 
 db = DB(DB_PATH)
 
@@ -371,7 +375,6 @@ def main() -> None:
         raise RuntimeError("BOT_TOKEN is missing")
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("panel", panel))
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CallbackQueryHandler(callbacks))
     app.add_handler(MessageHandler(filters.ALL, all_messages))
