@@ -5,7 +5,7 @@
 ## نصب سریع (One-liner)
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/<YOUR_USER>/<YOUR_REPO>/<BRANCH>/install.sh)"
+curl -fsSL https://raw.githubusercontent.com/rezajavadi995/business-bot/main/install.sh | bash
 ```
 
 > اگر ریپو private است، ابتدا پروژه را clone کنید و داخل فولدر پروژه اجرا کنید:
