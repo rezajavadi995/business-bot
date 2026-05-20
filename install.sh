@@ -14,6 +14,9 @@ REQUIREMENTS_FILE="${REQUIREMENTS_FILE:-$PROJECT_DIR/requirements.txt}"
 APT_FRONTEND="noninteractive"
 MIN_DISK_MB=512
 
+MANAGE_BIN="/usr/local/bin/manage"
+SERVICE_NAME="business-bot.service"
+
 # ---------- Colors ----------
 if [[ -t 1 ]]; then
   C_RESET='\033[0m'
@@ -329,6 +332,74 @@ EOF
   success ".env validation passed."
 }
 
+
+install_manage_command() {
+  log "Installing global manage command at $MANAGE_BIN"
+  cat > "$MANAGE_BIN" <<EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+PROJECT_DIR="${PROJECT_DIR}"
+VENV_DIR="${VENV_DIR}"
+SERVICE_NAME="${SERVICE_NAME}"
+
+run_bot() {
+  cd "$PROJECT_DIR"
+  # shellcheck disable=SC1090
+  source "$VENV_DIR/bin/activate"
+  exec python bot.py
+}
+
+service_enable() {
+  cat > "/etc/systemd/system/$SERVICE_NAME" <<UNIT
+[Unit]
+Description=Telegram Business Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$PROJECT_DIR
+ExecStart=$VENV_DIR/bin/python $PROJECT_DIR/bot.py
+Restart=always
+RestartSec=3
+User=root
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable --now "$SERVICE_NAME"
+  echo "[SUCCESS] systemd service enabled and started."
+}
+
+show_menu() {
+  echo ""
+  echo "=== business-bot manage ==="
+  echo "1) Run bot now (foreground)"
+  echo "2) Enable systemd service (persistent)"
+  echo "3) Restart systemd service"
+  echo "4) Service status"
+  echo "5) Follow service logs"
+  echo "6) Exit"
+  read -r -p "Select option [1-6]: " opt
+  case "$opt" in
+    1) run_bot ;;
+    2) service_enable ;;
+    3) systemctl restart "$SERVICE_NAME" && systemctl status "$SERVICE_NAME" --no-pager ;;
+    4) systemctl status "$SERVICE_NAME" --no-pager ;;
+    5) journalctl -u "$SERVICE_NAME" -f ;;
+    6) exit 0 ;;
+    *) echo "Invalid option"; exit 1 ;;
+  esac
+}
+
+show_menu
+EOF
+  chmod +x "$MANAGE_BIN"
+  success "manage command installed. Use: manage"
+}
+
 print_summary() {
   local pyv
   pyv="$(python3 --version 2>/dev/null || true)"
@@ -342,7 +413,8 @@ print_summary() {
   printf "Next steps   :\n"
   printf "  1) source '%s/bin/activate'\n" "$VENV_DIR"
   printf "  2) Edit '%s' and set BOT_TOKEN + ADMIN_ID\n" "$ENV_FILE"
-  printf "  3) python bot.py\n"
+  printf "  3) Run: manage (from anywhere)\n"
+printf "  4) In manage, choose option 2 to enable auto-start (systemd)\n"
   printf "%b=====================================%b\n\n" "$C_BOLD" "$C_RESET"
 }
 
@@ -364,6 +436,7 @@ main() {
   activate_venv
   install_python_dependencies
   ensure_env_file
+  install_manage_command
 
   success "Installation completed successfully."
   print_summary

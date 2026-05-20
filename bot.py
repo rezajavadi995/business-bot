@@ -11,14 +11,7 @@ import requests
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
@@ -33,7 +26,6 @@ DEFAULT_DATA: dict[str, Any] = {
     "active": False,
     "visitors": [],
     "features": {
-        # admin features
         "f_admin_stats": True,
         "f_admin_broadcast": True,
         "f_admin_manage_offline": True,
@@ -44,7 +36,6 @@ DEFAULT_DATA: dict[str, Any] = {
         "f_admin_user_count": True,
         "f_admin_block_user": True,
         "f_admin_quick_reports": True,
-        # visitor features
         "f_visitor_auto_reply": True,
         "f_visitor_help": True,
         "f_visitor_contact_admin": True,
@@ -63,7 +54,6 @@ DEFAULT_DATA: dict[str, Any] = {
     "hours_text": "ساعات کاری: شنبه تا چهارشنبه ۹ تا ۱۸",
     "location_text": "آدرس کسب‌وکار شما اینجاست.",
 }
-
 START_TIME = time.time()
 
 
@@ -80,10 +70,7 @@ def setup_logging() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-        handlers=[
-            logging.FileHandler(LOG_PATH, encoding="utf-8"),
-            logging.StreamHandler(),
-        ],
+        handlers=[logging.FileHandler(LOG_PATH, encoding="utf-8"), logging.StreamHandler()],
     )
 
 
@@ -101,16 +88,12 @@ def save_data(data: dict[str, Any]) -> None:
 
 
 def update_env(key: str, value: str) -> None:
-    lines = []
-    if ENV_PATH.exists():
-        lines = ENV_PATH.read_text(encoding="utf-8").splitlines()
-    found = False
-    for i, ln in enumerate(lines):
-        if ln.startswith(f"{key}="):
-            lines[i] = f"{key}={value}"
-            found = True
+    lines = ENV_PATH.read_text(encoding="utf-8").splitlines() if ENV_PATH.exists() else []
+    for idx, line in enumerate(lines):
+        if line.startswith(f"{key}="):
+            lines[idx] = f"{key}={value}"
             break
-    if not found:
+    else:
         lines.append(f"{key}={value}")
     ENV_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -118,22 +101,22 @@ def update_env(key: str, value: str) -> None:
 def is_admin(user_id: int, data: dict[str, Any]) -> bool:
     return user_id == int(data.get("admin_id") or 0)
 
+STATE = State()
 
 def uptime() -> str:
     seconds = int(time.time() - START_TIME)
-    h = seconds // 3600
-    m = (seconds % 3600) // 60
-    s = seconds % 60
-    return f"{h}h {m}m {s}s"
+    return f"{seconds // 3600}h {(seconds % 3600) // 60}m {seconds % 60}s"
 
 
 def get_system_info() -> str:
-    return (
-        f"🖥 CPU: {psutil.cpu_percent()}%\n"
-        f"💾 RAM: {psutil.virtual_memory().percent}%\n"
-        f"📂 Disk: {psutil.disk_usage('/').percent}%"
-    )
+    return f"🖥 CPU: {psutil.cpu_percent()}%\n💾 RAM: {psutil.virtual_memory().percent}%\n📂 Disk: {psutil.disk_usage('/').percent}%"
 
+def load_data() -> dict[str, Any]:
+    if not DATA_PATH.exists():
+        save_data(DEFAULT_DATA)
+        return json.loads(json.dumps(DEFAULT_DATA))
+    with DATA_PATH.open("r", encoding="utf-8") as f:
+        return json.load(f)
 
 def get_public_ip() -> str:
     try:
@@ -141,6 +124,9 @@ def get_public_ip() -> str:
     except Exception:
         return "Unknown"
 
+def save_data(data: dict[str, Any]) -> None:
+    with DATA_PATH.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup([["menu"]], resize_keyboard=True)
@@ -150,21 +136,23 @@ def admin_panel(data: dict[str, Any]) -> InlineKeyboardMarkup:
     active = "🟢 روشن" if data["active"] else "🔴 خاموش"
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton(f"وضعیت ربات: {active}", callback_data="toggle:bot_active")],
-            [InlineKeyboardButton("👤 ست ادمین", callback_data="set:admin_id")],
-            [InlineKeyboardButton("🔑 ست توکن", callback_data="set:token")],
+            [InlineKeyboardButton(f"✨ وضعیت ربات: {active}", callback_data="toggle:bot_active")],
+            [
+                InlineKeyboardButton("👤 ست ادمین", callback_data="set:admin_id"),
+                InlineKeyboardButton("🔑 ست توکن", callback_data="set:token"),
+            ],
             [InlineKeyboardButton("✍️ تغییر پیام آفلاین", callback_data="set:offline_text")],
-            [InlineKeyboardButton("📊 گزارش سریع", callback_data="admin:report")],
-            [InlineKeyboardButton("⚙️ سوییچ فیچرها", callback_data="menu:features")],
+            [
+                InlineKeyboardButton("📊 گزارش سریع", callback_data="admin:report"),
+                InlineKeyboardButton("⚙️ فیچرها", callback_data="menu:features"),
+            ],
+            [InlineKeyboardButton("🚀 فعال‌سازی سرویس دائمی (systemd)", callback_data="admin:systemd_help")],
         ]
     )
 
 
 def feature_menu(data: dict[str, Any]) -> InlineKeyboardMarkup:
-    rows = []
-    for key, value in data["features"].items():
-        state = "✅" if value else "❌"
-        rows.append([InlineKeyboardButton(f"{state} {key}", callback_data=f"toggle:{key}")])
+    rows = [[InlineKeyboardButton(f"{'✅' if v else '❌'} {k}", callback_data=f"toggle:{k}")] for k, v in data["features"].items()]
     rows.append([InlineKeyboardButton("🔙 بازگشت", callback_data="menu:admin")])
     return InlineKeyboardMarkup(rows)
 
@@ -175,8 +163,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user.id not in data["visitors"]:
         data["visitors"].append(user.id)
         save_data(data)
-    text = "به ربات بیزینس خوش آمدید 🌟\nبرای پنل مدیریتی «menu» را بزنید."
-    await update.message.reply_text(text, reply_markup=main_menu_keyboard())
+    await update.message.reply_text("به ربات بیزینس خوش آمدید 🌟\nبرای پنل مدیریتی «menu» را بزنید.", reply_markup=main_menu_keyboard())
 
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -192,10 +179,8 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "منوی کاربر:",
         reply_markup=InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton("ℹ️ راهنما", callback_data="visitor:help")],
-                [InlineKeyboardButton("🛍 خدمات", callback_data="visitor:services")],
-                [InlineKeyboardButton("💵 تعرفه", callback_data="visitor:pricing")],
-                [InlineKeyboardButton("🕒 ساعات کاری", callback_data="visitor:hours")],
+                [InlineKeyboardButton("ℹ️ راهنما", callback_data="visitor:help"), InlineKeyboardButton("🛍 خدمات", callback_data="visitor:services")],
+                [InlineKeyboardButton("💵 تعرفه", callback_data="visitor:pricing"), InlineKeyboardButton("🕒 ساعات کاری", callback_data="visitor:hours")],
             ]
         ),
     )
@@ -206,6 +191,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     data = load_data()
     uid = q.from_user.id
+
     if q.data.startswith("toggle:") and is_admin(uid, data):
         key = q.data.split(":", 1)[1]
         if key == "bot_active":
@@ -215,8 +201,10 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_data(data)
         await q.message.reply_text("✅ بروزرسانی شد", reply_markup=admin_panel(data))
         return
+
     if not is_admin(uid, data) and q.data.startswith(("set:", "menu:features", "admin:")):
         return
+
     if q.data == "menu:admin":
         await q.message.reply_text("پنل ادمین", reply_markup=admin_panel(data))
     elif q.data == "menu:features":
@@ -232,9 +220,9 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         STATE.await_offline_text_for = uid
         await q.message.reply_text("متن جدید پیام آفلاین را ارسال کنید.")
     elif q.data == "admin:report":
-        await q.message.reply_text(
-            f"👥 Users: {len(data['visitors'])}\n⏱ Uptime: {uptime()}\n🌐 IP: {get_public_ip()}\n{get_system_info()}"
-        )
+        await q.message.reply_text(f"👥 Users: {len(data['visitors'])}\n⏱ Uptime: {uptime()}\n🌐 IP: {get_public_ip()}\n{get_system_info()}")
+    elif q.data == "admin:systemd_help":
+        await q.message.reply_text("برای سرویس دائمی سرور، در ترمینال فقط بنویسید:\n`manage`\nسپس گزینه «Enable systemd service» را انتخاب کن.", parse_mode=ParseMode.MARKDOWN)
     elif q.data == "visitor:help":
         await q.message.reply_text("برای ارتباط پیام بدهید. در اولین فرصت پاسخ می‌گیرید.")
     elif q.data == "visitor:services":
@@ -260,8 +248,8 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_message(user_id, msg)
             sent += 1
-        except Exception as e:
-            logging.warning("send failed %s: %s", user_id, e)
+        except Exception as exc:
+            logging.warning("send failed %s: %s", user_id, exc)
     await update.message.reply_text(f"✅ Sent to {sent} users")
 
 
@@ -283,9 +271,7 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if uid not in data["visitors"]:
         data["visitors"].append(uid)
         save_data(data)
-    if is_admin(uid, data):
-        return
-    if not data["active"]:
+    if is_admin(uid, data) or not data["active"]:
         return
     if data["features"].get("f_visitor_auto_reply", True):
         await update.message.reply_text(data["offline_message"])
