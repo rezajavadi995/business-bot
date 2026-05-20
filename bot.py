@@ -101,6 +101,7 @@ def update_env(key: str, value: str) -> None:
 def is_admin(user_id: int, data: dict[str, Any]) -> bool:
     return user_id == int(data.get("admin_id") or 0)
 
+STATE = State()
 
 def uptime() -> str:
     seconds = int(time.time() - START_TIME)
@@ -110,6 +111,12 @@ def uptime() -> str:
 def get_system_info() -> str:
     return f"🖥 CPU: {psutil.cpu_percent()}%\n💾 RAM: {psutil.virtual_memory().percent}%\n📂 Disk: {psutil.disk_usage('/').percent}%"
 
+def load_data() -> dict[str, Any]:
+    if not DATA_PATH.exists():
+        save_data(DEFAULT_DATA)
+        return json.loads(json.dumps(DEFAULT_DATA))
+    with DATA_PATH.open("r", encoding="utf-8") as f:
+        return json.load(f)
 
 def get_public_ip() -> str:
     try:
@@ -117,6 +124,9 @@ def get_public_ip() -> str:
     except Exception:
         return "Unknown"
 
+def save_data(data: dict[str, Any]) -> None:
+    with DATA_PATH.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup([["menu"]], resize_keyboard=True)
