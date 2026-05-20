@@ -7,6 +7,7 @@ set -Eeuo pipefail
 SCRIPT_NAME="$(basename "$0")"
 PROJECT_NAME="business-bot"
 PROJECT_DIR="${PROJECT_DIR:-$PWD}"
+DEFAULT_REPO_URL="https://github.com/rezajavadi995/business-bot.git"
 VENV_DIR="${VENV_DIR:-$PROJECT_DIR/.venv}"
 ENV_FILE="${ENV_FILE:-$PROJECT_DIR/.env}"
 REQUIREMENTS_FILE="${REQUIREMENTS_FILE:-$PROJECT_DIR/requirements.txt}"
@@ -149,17 +150,34 @@ validate_repo_files() {
   log "Validating repository files..."
   if [[ ! -f "$REQUIREMENTS_FILE" || ! -f "$PROJECT_DIR/bot.py" ]]; then
     warn "Repository looks incomplete at: $PROJECT_DIR"
-    if [[ -n "${REPO_URL:-}" ]]; then
-      warn "Attempting automatic repo recreation from REPO_URL..."
-      local tmp_clone
-      tmp_clone="$(mktemp -d)"
-      retry_command 3 5 git clone --depth 1 "$REPO_URL" "$tmp_clone"
-      cp -a "$tmp_clone/." "$PROJECT_DIR/"
-      rm -rf "$tmp_clone"
-      success "Repository recreated from REPO_URL."
-    else
-      error_exit "Missing required files (bot.py or requirements.txt). Set REPO_URL to enable auto-recreate."
+
+    local repo_url="${REPO_URL:-$DEFAULT_REPO_URL}"
+    local target_dir="$PROJECT_DIR"
+
+    if [[ "$PROJECT_DIR" == "/root" ]]; then
+      target_dir="/opt/business-bot"
+      log "Detected one-liner/root mode. Using install path: $target_dir"
     fi
+
+    warn "Attempting automatic repo recreation from: $repo_url"
+    local tmp_clone
+    tmp_clone="$(mktemp -d)"
+    retry_command 3 5 git clone --depth 1 "$repo_url" "$tmp_clone"
+
+    [[ -f "$tmp_clone/bot.py" && -f "$tmp_clone/requirements.txt" ]] || error_exit "Cloned repository is incomplete."
+
+    if [[ "$target_dir" != "$PROJECT_DIR" ]]; then
+      PROJECT_DIR="$target_dir"
+      VENV_DIR="$PROJECT_DIR/.venv"
+      ENV_FILE="$PROJECT_DIR/.env"
+      REQUIREMENTS_FILE="$PROJECT_DIR/requirements.txt"
+    fi
+
+    rm -rf "$PROJECT_DIR"
+    mkdir -p "$PROJECT_DIR"
+    cp -a "$tmp_clone/." "$PROJECT_DIR/"
+    rm -rf "$tmp_clone"
+    success "Repository recreated successfully in $PROJECT_DIR."
   fi
 
   [[ -s "$REQUIREMENTS_FILE" ]] || error_exit "requirements.txt exists but is empty."
