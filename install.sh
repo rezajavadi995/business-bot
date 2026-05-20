@@ -355,7 +355,7 @@ set_env_key() {
 }
 set_token(){ read -r -p "توکن ربات: " t; [[ -n "$t" ]] || { echo "توکن خالی است"; exit 1; }; set_env_key BOT_TOKEN "$t"; echo "[SUCCESS] BOT_TOKEN ذخیره شد"; }
 set_admin(){ read -r -p "آیدی عددی ادمین: " a; [[ "$a" =~ ^[0-9]+$ ]] || { echo "آیدی نامعتبر"; exit 1; }; set_env_key ADMIN_ID "$a"; echo "[SUCCESS] ADMIN_ID ذخیره شد"; }
-set_channel(){ read -r -p "یوزرنیم/لینک چنل جوین اجباری: " c; set_env_key FORCE_JOIN_CHANNEL "$c"; echo "[SUCCESS] FORCE_JOIN_CHANNEL ذخیره شد"; }
+set_channel(){ read -r -p "آیدی عددی چنل اجباری (مثال: -1003939099054): " c; [[ "$c" =~ ^-100[0-9]{6,}$ ]] || { echo "فرمت نامعتبر است. مثال صحیح: -1003939099054"; exit 1; }; set_env_key FORCE_JOIN_CHANNEL "$c"; echo "[SUCCESS] FORCE_JOIN_CHANNEL ذخیره شد"; }
 run_bot(){ cd "$PROJECT_DIR"; source "$VENV_DIR/bin/activate"; exec python bot.py; }
 service_enable(){
 cat > "/etc/systemd/system/$SERVICE_NAME" <<UNIT
@@ -400,25 +400,32 @@ uninstall_all(){
   echo "[SUCCESS] حذف نصب کامل انجام شد"
 }
 
+draw_menu(){
+  local width=42
+  local line
+  line=$(printf "═%.0s" $(seq 1 $width))
+  printf "\n╔%s╗\n" "$line"
+  printf "║%-42s║\n" "        BUSINESS BOT MANAGE"
+  printf "╠%s╣\n" "$line"
+  printf "║ %-40s ║\n" "1) ست کردن توکن تلگرام"
+  printf "║ %-40s ║\n" "2) ست کردن آیدی عددی ادمین"
+  printf "║ %-40s ║\n" "3) ست کردن چنل جوین اجباری"
+  printf "║ %-40s ║\n" "4) تست متصل بودن ربات"
+  printf "║ %-40s ║\n" "5) اجرای ربات بدون systemd"
+  printf "║ %-40s ║\n" "6) راه‌اندازی ربات با systemd"
+  printf "║ %-40s ║\n" "7) وضعیت systemd"
+  printf "║ %-40s ║\n" "8) وضعیت ربات"
+  printf "║ %-40s ║\n" "9) ریست/ریکاوری systemd"
+  printf "║ %-40s ║\n" "10) دریافت لاگ‌ها"
+  printf "║ %-40s ║\n" "11) دریافت خطاها"
+  printf "║ %-40s ║\n" "12) حذف نصب کامل"
+  printf "║ %-40s ║\n" "13) خروج"
+  printf "╚%s╝\n" "$line"
+}
+
 while true; do
-  echo ""
-  echo "╔══════════════════════════════════════╗"
-  echo "║        BUSINESS BOT MANAGE          ║"
-  echo "╠══════════════════════════════════════╣"
-  echo "║ 1) ست کردن توکن تلگرام             ║"
-  echo "║ 2) ست کردن آیدی عددی ادمین         ║"
-  echo "║ 3) ست کردن چنل جوین اجباری         ║"
-  echo "║ 4) تست متصل بودن ربات              ║"
-  echo "║ 5) اجرای ربات بدون systemd         ║"
-  echo "║ 6) راه‌اندازی ربات با systemd      ║"
-  echo "║ 7) وضعیت systemd                   ║"
-  echo "║ 8) وضعیت ربات                      ║"
-  echo "║ 9) ریست/ریکاوری systemd            ║"
-  echo "║ 10) دریافت لاگ‌ها                  ║"
-  echo "║ 11) دریافت خطاها                   ║"
-  echo "║ 12) حذف نصب کامل                   ║"
-  echo "║ 13) خروج                           ║"
-  echo "╚══════════════════════════════════════╝"
+  for d in "." ".." "..."; do printf "\rدر حال آماده‌سازی منوی مدیریت %s" "$d"; sleep 0.12; done; printf "\r%*s\r" 60 ""
+  draw_menu
   read -r -p "گزینه را وارد کنید [1-13]: " opt
   case "$opt" in
     1) set_token ;;

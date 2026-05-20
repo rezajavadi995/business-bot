@@ -88,7 +88,8 @@ def update_env(key: str, value: str) -> None:
 
 
 def is_admin(user_id: int, data: dict[str, Any]) -> bool:
-    return user_id == int(data.get("admin_id") or 0)
+    admin_id = int(data.get("admin_id") or os.getenv("ADMIN_ID") or 0)
+    return user_id == admin_id
 
 
 def apply_style(text: str, data: dict[str, Any]) -> tuple[str, str | None]:
@@ -175,6 +176,8 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not update.message:
+        return
     data = load_data()
     uid = update.effective_user.id
     text = (update.message.text or "").strip()
@@ -225,6 +228,9 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Sent to {sent} users")
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logging.exception("Unhandled error: %s", context.error)
+
 def main() -> None:
     setup_logging()
     token = os.getenv("BOT_TOKEN")
@@ -235,6 +241,7 @@ def main() -> None:
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CallbackQueryHandler(callbacks))
     app.add_handler(MessageHandler(filters.ALL, menu_text))
+    app.add_error_handler(on_error)
     app.run_polling()
 
 
