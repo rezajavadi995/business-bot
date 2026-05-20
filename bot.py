@@ -21,45 +21,34 @@ LOG_PATH = LOG_DIR / "bot.log"
 
 load_dotenv(ENV_PATH)
 
+TEXT_KEYS = {
+    "offline_message": "پیام آفلاین",
+    "service_text": "متن خدمات",
+    "pricing_text": "متن تعرفه‌ها",
+    "hours_text": "متن ساعات کاری",
+    "location_text": "متن آدرس",
+}
+
 DEFAULT_DATA: dict[str, Any] = {
     "admin_id": 0,
     "active": False,
+    "force_join_channel": "",
+    "bold_mode": False,
     "visitors": [],
-    "features": {
-        "f_admin_stats": True,
-        "f_admin_broadcast": True,
-        "f_admin_manage_offline": True,
-        "f_admin_reply_all": True,
-        "f_admin_uptime": True,
-        "f_admin_sysinfo": True,
-        "f_admin_public_ip": True,
-        "f_admin_user_count": True,
-        "f_admin_block_user": True,
-        "f_admin_quick_reports": True,
-        "f_visitor_auto_reply": True,
-        "f_visitor_help": True,
-        "f_visitor_contact_admin": True,
-        "f_visitor_faq": True,
-        "f_visitor_services": True,
-        "f_visitor_price_list": True,
-        "f_visitor_location": True,
-        "f_visitor_working_hours": True,
-        "f_visitor_request_call": True,
-        "f_visitor_feedback": True,
-    },
+    "features": {"f_visitor_auto_reply": True},
     "offline_message": "سلام 🌹\nالان آف هستم. پیام شما دریافت شد و در اولین فرصت پاسخ می‌دهم.",
-    "blocked_users": [],
-    "service_text": "لیست خدمات شما اینجا قرار می‌گیرد.",
-    "pricing_text": "تعرفه‌ها اینجا قرار می‌گیرد.",
-    "hours_text": "ساعات کاری: شنبه تا چهارشنبه ۹ تا ۱۸",
-    "location_text": "آدرس کسب‌وکار شما اینجاست.",
+    "service_text": "",
+    "pricing_text": "",
+    "hours_text": "",
+    "location_text": "",
 }
 START_TIME = time.time()
 
 
 @dataclass
 class State:
-    await_offline_text_for: int | None = None
+    await_text_for_admin: int | None = None
+    await_text_key: str | None = None
 
 
 STATE = State()
@@ -67,11 +56,7 @@ STATE = State()
 
 def setup_logging() -> None:
     LOG_DIR.mkdir(exist_ok=True)
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-        handlers=[logging.FileHandler(LOG_PATH, encoding="utf-8"), logging.StreamHandler()],
-    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s", handlers=[logging.FileHandler(LOG_PATH, encoding="utf-8"), logging.StreamHandler()])
 
 
 def load_data() -> dict[str, Any]:
@@ -79,7 +64,10 @@ def load_data() -> dict[str, Any]:
         save_data(DEFAULT_DATA)
         return json.loads(json.dumps(DEFAULT_DATA))
     with DATA_PATH.open("r", encoding="utf-8") as f:
-        return json.load(f)
+        data = json.load(f)
+    for k, v in DEFAULT_DATA.items():
+        data.setdefault(k, v)
+    return data
 
 
 def save_data(data: dict[str, Any]) -> None:
@@ -89,11 +77,12 @@ def save_data(data: dict[str, Any]) -> None:
 
 def update_env(key: str, value: str) -> None:
     lines = ENV_PATH.read_text(encoding="utf-8").splitlines() if ENV_PATH.exists() else []
-    for idx, line in enumerate(lines):
+    done = False
+    for i, line in enumerate(lines):
         if line.startswith(f"{key}="):
-            lines[idx] = f"{key}={value}"
-            break
-    else:
+            lines[i] = f"{key}={value}"
+            done = True
+    if not done:
         lines.append(f"{key}={value}")
     ENV_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -101,22 +90,12 @@ def update_env(key: str, value: str) -> None:
 def is_admin(user_id: int, data: dict[str, Any]) -> bool:
     return user_id == int(data.get("admin_id") or 0)
 
-STATE = State()
 
-def uptime() -> str:
-    seconds = int(time.time() - START_TIME)
-    return f"{seconds // 3600}h {(seconds % 3600) // 60}m {seconds % 60}s"
+def apply_style(text: str, data: dict[str, Any]) -> tuple[str, str | None]:
+    if data.get("bold_mode") and text:
+        return f"<b>{text}</b>", ParseMode.HTML
+    return text, None
 
-
-def get_system_info() -> str:
-    return f"🖥 CPU: {psutil.cpu_percent()}%\n💾 RAM: {psutil.virtual_memory().percent}%\n📂 Disk: {psutil.disk_usage('/').percent}%"
-
-def load_data() -> dict[str, Any]:
-    if not DATA_PATH.exists():
-        save_data(DEFAULT_DATA)
-        return json.loads(json.dumps(DEFAULT_DATA))
-    with DATA_PATH.open("r", encoding="utf-8") as f:
-        return json.load(f)
 
 def get_public_ip() -> str:
     try:
@@ -124,66 +103,34 @@ def get_public_ip() -> str:
     except Exception:
         return "Unknown"
 
-def save_data(data: dict[str, Any]) -> None:
-    with DATA_PATH.open("w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-def main_menu_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup([["menu"]], resize_keyboard=True)
-
 
 def admin_panel(data: dict[str, Any]) -> InlineKeyboardMarkup:
-    active = "🟢 روشن" if data["active"] else "🔴 خاموش"
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton(f"✨ وضعیت ربات: {active}", callback_data="toggle:bot_active")],
-            [
-                InlineKeyboardButton("👤 ست ادمین", callback_data="set:admin_id"),
-                InlineKeyboardButton("🔑 ست توکن", callback_data="set:token"),
-            ],
-            [InlineKeyboardButton("✍️ تغییر پیام آفلاین", callback_data="set:offline_text")],
-            [
-                InlineKeyboardButton("📊 گزارش سریع", callback_data="admin:report"),
-                InlineKeyboardButton("⚙️ فیچرها", callback_data="menu:features"),
-            ],
-            [InlineKeyboardButton("🚀 فعال‌سازی سرویس دائمی (systemd)", callback_data="admin:systemd_help")],
-        ]
-    )
+    onoff = "🟢 روشن" if data["active"] else "🔴 خاموش"
+    bold = "🟢 Bold ON" if data.get("bold_mode") else "⚪ Bold OFF"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🧊  {onoff}  🧊", callback_data="toggle:active")],
+        [InlineKeyboardButton("🎨  ویرایش متن‌ها  🎨", callback_data="admin:texts")],
+        [InlineKeyboardButton("💵  مشاهده تعرفه  💵", callback_data="visitor:pricing")],
+        [InlineKeyboardButton(f"🔠  {bold}  🔠", callback_data="toggle:bold")],
+        [InlineKeyboardButton("⚙️  مدیریت فیچر  ⚙️", callback_data="admin:features")],
+        [InlineKeyboardButton("📊  گزارش وضعیت  📊", callback_data="admin:report")],
+    ])
 
 
-def feature_menu(data: dict[str, Any]) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(f"{'✅' if v else '❌'} {k}", callback_data=f"toggle:{k}")] for k, v in data["features"].items()]
+def text_list_menu(data: dict[str, Any]) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(f"🧩 {name}", callback_data=f"text:{key}")] for key, name in TEXT_KEYS.items()]
     rows.append([InlineKeyboardButton("🔙 بازگشت", callback_data="menu:admin")])
     return InlineKeyboardMarkup(rows)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
-    user = update.effective_user
-    if user.id not in data["visitors"]:
-        data["visitors"].append(user.id)
-        save_data(data)
-    await update.message.reply_text("به ربات بیزینس خوش آمدید 🌟\nبرای پنل مدیریتی «menu» را بزنید.", reply_markup=main_menu_keyboard())
-
-
-async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
     uid = update.effective_user.id
-    if is_admin(uid, data):
-        await update.message.reply_text("🎛 منوی ادمین مدرن", reply_markup=admin_panel(data))
-        return
-    if not data["active"]:
-        await update.message.reply_text("ربات هنوز توسط ادمین فعال نشده است.")
-        return
-    await update.message.reply_text(
-        "منوی کاربر:",
-        reply_markup=InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton("ℹ️ راهنما", callback_data="visitor:help"), InlineKeyboardButton("🛍 خدمات", callback_data="visitor:services")],
-                [InlineKeyboardButton("💵 تعرفه", callback_data="visitor:pricing"), InlineKeyboardButton("🕒 ساعات کاری", callback_data="visitor:hours")],
-            ]
-        ),
-    )
+    if uid not in data["visitors"]:
+        data["visitors"].append(uid)
+        save_data(data)
+    msg, pm = apply_style("به ربات بیزینس خوش آمدید 🌟\nبرای پنل مدیریتی «menu» را بزنید.", data)
+    await update.message.reply_text(msg, parse_mode=pm, reply_markup=ReplyKeyboardMarkup([["menu"]], resize_keyboard=True))
 
 
 async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -192,102 +139,102 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
     uid = q.from_user.id
 
-    if q.data.startswith("toggle:") and is_admin(uid, data):
-        key = q.data.split(":", 1)[1]
-        if key == "bot_active":
-            data["active"] = not data["active"]
-        elif key in data["features"]:
-            data["features"][key] = not data["features"][key]
-        save_data(data)
-        await q.message.reply_text("✅ بروزرسانی شد", reply_markup=admin_panel(data))
-        return
-
-    if not is_admin(uid, data) and q.data.startswith(("set:", "menu:features", "admin:")):
-        return
-
     if q.data == "menu:admin":
-        await q.message.reply_text("پنل ادمین", reply_markup=admin_panel(data))
-    elif q.data == "menu:features":
-        await q.message.reply_text("فیچرها (هرکدام ON/OFF)", reply_markup=feature_menu(data))
-    elif q.data == "set:admin_id":
-        data["admin_id"] = uid
+        await q.message.reply_text("🎛 منوی مدیریت", reply_markup=admin_panel(data))
+        return
+    if not is_admin(uid, data):
+        if q.data == "visitor:pricing":
+            text, pm = apply_style(data.get("pricing_text", ""), data)
+            await q.message.reply_text(text or "تعرفه هنوز ثبت نشده است.", parse_mode=pm)
+        return
+
+    if q.data == "toggle:active":
+        data["active"] = not data["active"]
         save_data(data)
-        update_env("ADMIN_ID", str(uid))
-        await q.message.reply_text(f"ادمین ست شد: `{uid}`", parse_mode=ParseMode.MARKDOWN)
-    elif q.data == "set:token":
-        await q.message.reply_text("توکن از .env خوانده می‌شود. مقدار BOT_TOKEN را در سرور تغییر دهید.")
-    elif q.data == "set:offline_text":
-        STATE.await_offline_text_for = uid
-        await q.message.reply_text("متن جدید پیام آفلاین را ارسال کنید.")
+        await q.message.reply_text("✅ انجام شد", reply_markup=admin_panel(data))
+    elif q.data == "toggle:bold":
+        data["bold_mode"] = not data["bold_mode"]
+        save_data(data)
+        await q.message.reply_text("✅ حالت Bold تغییر کرد", reply_markup=admin_panel(data))
+    elif q.data == "admin:texts":
+        await q.message.reply_text("لیست متن‌ها برای ویرایش:", reply_markup=text_list_menu(data))
+    elif q.data.startswith("text:"):
+        key = q.data.split(":", 1)[1]
+        if key in TEXT_KEYS:
+            old = data.get(key, "")
+            STATE.await_text_for_admin = uid
+            STATE.await_text_key = key
+            await q.message.reply_text(f"🔹 متن قبلی ({TEXT_KEYS[key]}):\n\n{old or '(خالی)'}\n\nمتن جدید را ارسال کنید:")
     elif q.data == "admin:report":
-        await q.message.reply_text(f"👥 Users: {len(data['visitors'])}\n⏱ Uptime: {uptime()}\n🌐 IP: {get_public_ip()}\n{get_system_info()}")
-    elif q.data == "admin:systemd_help":
-        await q.message.reply_text("برای سرویس دائمی سرور، در ترمینال فقط بنویسید:\n`manage`\nسپس گزینه «Enable systemd service» را انتخاب کن.", parse_mode=ParseMode.MARKDOWN)
-    elif q.data == "visitor:help":
-        await q.message.reply_text("برای ارتباط پیام بدهید. در اولین فرصت پاسخ می‌گیرید.")
-    elif q.data == "visitor:services":
-        await q.message.reply_text(data["service_text"])
+        uptime = int(time.time() - START_TIME)
+        rep = f"👥 users: {len(data['visitors'])}\n🌐 ip: {get_public_ip()}\n⏱ uptime: {uptime}s\n💾 ram: {psutil.virtual_memory().percent}%"
+        await q.message.reply_text(rep)
     elif q.data == "visitor:pricing":
-        await q.message.reply_text(data["pricing_text"])
-    elif q.data == "visitor:hours":
-        await q.message.reply_text(data["hours_text"])
+        text, pm = apply_style(data.get("pricing_text", ""), data)
+        await q.message.reply_text(text or "تعرفه هنوز ثبت نشده است.", parse_mode=pm)
+
+
+async def menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = load_data()
+    uid = update.effective_user.id
+    text = (update.message.text or "").strip()
+    if uid not in data["visitors"]:
+        data["visitors"].append(uid)
+        save_data(data)
+
+    if STATE.await_text_for_admin == uid and STATE.await_text_key and is_admin(uid, data):
+        key = STATE.await_text_key
+        old = data.get(key, "")
+        data[key] = text
+        save_data(data)
+        STATE.await_text_for_admin = None
+        STATE.await_text_key = None
+        await update.message.reply_text(f"✅ ذخیره شد\n\n🔹 قبلی:\n{old or '(خالی)'}\n\n🔸 جدید:\n{text}")
+        return
+
+    if text.lower() == "menu":
+        if is_admin(uid, data):
+            await update.message.reply_text("🎛 منوی مدیریت", reply_markup=admin_panel(data))
+            return
+        if not data.get("active"):
+            await update.message.reply_text("ربات هنوز فعال نشده است.")
+            return
+        await update.message.reply_text("منوی کاربر:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💵 تعرفه", callback_data="visitor:pricing")]]))
+        return
+
+    if not is_admin(uid, data) and data.get("active") and data["features"].get("f_visitor_auto_reply", True):
+        msg, pm = apply_style(data.get("offline_message", ""), data)
+        await update.message.reply_text(msg, parse_mode=pm)
 
 
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
     if not is_admin(update.effective_user.id, data):
         return
-    if not context.args:
+    msg = " ".join(context.args).strip()
+    if not msg:
         await update.message.reply_text("Usage: /broadcast your message")
         return
-    msg = " ".join(context.args)
     sent = 0
     for user_id in data["visitors"]:
-        if user_id in data["blocked_users"]:
-            continue
         try:
             await context.bot.send_message(user_id, msg)
             sent += 1
         except Exception as exc:
-            logging.warning("send failed %s: %s", user_id, exc)
+            logging.warning("broadcast failed %s %s", user_id, exc)
     await update.message.reply_text(f"✅ Sent to {sent} users")
-
-
-async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.effective_user:
-        return
-    data = load_data()
-    uid = update.effective_user.id
-    text = update.message.text or ""
-    if text.strip().lower() == "menu":
-        await menu(update, context)
-        return
-    if STATE.await_offline_text_for == uid and is_admin(uid, data):
-        data["offline_message"] = text
-        save_data(data)
-        STATE.await_offline_text_for = None
-        await update.message.reply_text("✅ پیام آفلاین ذخیره شد.")
-        return
-    if uid not in data["visitors"]:
-        data["visitors"].append(uid)
-        save_data(data)
-    if is_admin(uid, data) or not data["active"]:
-        return
-    if data["features"].get("f_visitor_auto_reply", True):
-        await update.message.reply_text(data["offline_message"])
 
 
 def main() -> None:
     setup_logging()
     token = os.getenv("BOT_TOKEN")
     if not token:
-        raise RuntimeError("BOT_TOKEN is missing. Set it in .env")
+        raise RuntimeError("BOT_TOKEN is missing")
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CallbackQueryHandler(callbacks))
-    app.add_handler(MessageHandler(filters.ALL, all_messages))
-    logging.info("Bot started")
+    app.add_handler(MessageHandler(filters.ALL, menu_text))
     app.run_polling()
 
 

@@ -341,21 +341,28 @@ set -Eeuo pipefail
 PROJECT_DIR="__PROJECT_DIR__"
 VENV_DIR="__VENV_DIR__"
 SERVICE_NAME="__SERVICE_NAME__"
+ENV_FILE="$PROJECT_DIR/.env"
 
-run_bot() {
-  cd "$PROJECT_DIR"
-  # shellcheck disable=SC1090
-  source "$VENV_DIR/bin/activate"
-  exec python bot.py
+load_env() { [[ -f "$ENV_FILE" ]] && source "$ENV_FILE"; }
+set_env_key() {
+  local k="$1"; local v="$2"
+  touch "$ENV_FILE"
+  if grep -q "^${k}=" "$ENV_FILE"; then
+    sed -i "s|^${k}=.*|${k}=${v}|" "$ENV_FILE"
+  else
+    echo "${k}=${v}" >> "$ENV_FILE"
+  fi
 }
-
-service_enable() {
-  cat > "/etc/systemd/system/$SERVICE_NAME" <<UNIT
+set_token(){ read -r -p "توکن ربات: " t; [[ -n "$t" ]] || { echo "توکن خالی است"; exit 1; }; set_env_key BOT_TOKEN "$t"; echo "[SUCCESS] BOT_TOKEN ذخیره شد"; }
+set_admin(){ read -r -p "آیدی عددی ادمین: " a; [[ "$a" =~ ^[0-9]+$ ]] || { echo "آیدی نامعتبر"; exit 1; }; set_env_key ADMIN_ID "$a"; echo "[SUCCESS] ADMIN_ID ذخیره شد"; }
+set_channel(){ read -r -p "یوزرنیم/لینک چنل جوین اجباری: " c; set_env_key FORCE_JOIN_CHANNEL "$c"; echo "[SUCCESS] FORCE_JOIN_CHANNEL ذخیره شد"; }
+run_bot(){ cd "$PROJECT_DIR"; source "$VENV_DIR/bin/activate"; exec python bot.py; }
+service_enable(){
+cat > "/etc/systemd/system/$SERVICE_NAME" <<UNIT
 [Unit]
 Description=Telegram Business Bot
 After=network-online.target
 Wants=network-online.target
-
 [Service]
 Type=simple
 WorkingDirectory=$PROJECT_DIR
@@ -364,43 +371,78 @@ Restart=always
 RestartSec=3
 User=root
 Environment=PYTHONUNBUFFERED=1
-
 [Install]
 WantedBy=multi-user.target
 UNIT
+systemctl daemon-reload
+systemctl enable --now "$SERVICE_NAME"
+echo "[SUCCESS] سرویس فعال و اجرا شد"
+}
+service_status(){ systemctl status "$SERVICE_NAME" --no-pager; }
+bot_status(){ pgrep -af "python.*bot.py" || true; systemctl is-active "$SERVICE_NAME" || true; }
+service_recover(){ systemctl daemon-reload; systemctl reset-failed "$SERVICE_NAME"; systemctl restart "$SERVICE_NAME" || systemctl start "$SERVICE_NAME"; systemctl status "$SERVICE_NAME" --no-pager; }
+logs_all(){ journalctl -u "$SERVICE_NAME" -n 300 --no-pager; }
+logs_error(){ journalctl -u "$SERVICE_NAME" -p err -n 200 --no-pager; }
+bot_test(){
+  load_env
+  [[ -n "${BOT_TOKEN:-}" ]] || { echo "BOT_TOKEN تنظیم نشده"; exit 1; }
+  [[ -n "${ADMIN_ID:-}" ]] || { echo "ADMIN_ID تنظیم نشده"; exit 1; }
+  msg="✅ تست اتصال موفق بود"
+  curl -fsS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" -d "chat_id=${ADMIN_ID}" -d "text=${msg}" >/dev/null
+  echo "[SUCCESS] پیام تست به ادمین ارسال شد"
+}
+uninstall_all(){
+  systemctl disable --now "$SERVICE_NAME" 2>/dev/null || true
+  rm -f "/etc/systemd/system/$SERVICE_NAME"
   systemctl daemon-reload
-  systemctl enable --now "$SERVICE_NAME"
-  echo "[SUCCESS] systemd service enabled and started."
+  rm -f /usr/local/bin/manage
+  rm -rf "$PROJECT_DIR"
+  echo "[SUCCESS] حذف نصب کامل انجام شد"
 }
 
-show_menu() {
+while true; do
   echo ""
-  echo "=== business-bot manage ==="
-  echo "1) Run bot now (foreground)"
-  echo "2) Enable systemd service (persistent)"
-  echo "3) Restart systemd service"
-  echo "4) Service status"
-  echo "5) Follow service logs"
-  echo "6) Exit"
-  read -r -p "Select option [1-6]: " opt
+  echo "╔══════════════════════════════════════╗"
+  echo "║        BUSINESS BOT MANAGE          ║"
+  echo "╠══════════════════════════════════════╣"
+  echo "║ 1) ست کردن توکن تلگرام             ║"
+  echo "║ 2) ست کردن آیدی عددی ادمین         ║"
+  echo "║ 3) ست کردن چنل جوین اجباری         ║"
+  echo "║ 4) تست متصل بودن ربات              ║"
+  echo "║ 5) اجرای ربات بدون systemd         ║"
+  echo "║ 6) راه‌اندازی ربات با systemd      ║"
+  echo "║ 7) وضعیت systemd                   ║"
+  echo "║ 8) وضعیت ربات                      ║"
+  echo "║ 9) ریست/ریکاوری systemd            ║"
+  echo "║ 10) دریافت لاگ‌ها                  ║"
+  echo "║ 11) دریافت خطاها                   ║"
+  echo "║ 12) حذف نصب کامل                   ║"
+  echo "║ 13) خروج                           ║"
+  echo "╚══════════════════════════════════════╝"
+  read -r -p "گزینه را وارد کنید [1-13]: " opt
   case "$opt" in
-    1) run_bot ;;
-    2) service_enable ;;
-    3) systemctl restart "$SERVICE_NAME" && systemctl status "$SERVICE_NAME" --no-pager ;;
-    4) systemctl status "$SERVICE_NAME" --no-pager ;;
-    5) journalctl -u "$SERVICE_NAME" -f ;;
-    6) exit 0 ;;
-    *) echo "Invalid option"; exit 1 ;;
+    1) set_token ;;
+    2) set_admin ;;
+    3) set_channel ;;
+    4) bot_test ;;
+    5) run_bot ;;
+    6) service_enable ;;
+    7) service_status ;;
+    8) bot_status ;;
+    9) service_recover ;;
+    10) logs_all ;;
+    11) logs_error ;;
+    12) read -r -p "مطمئن هستید؟ (yes/no): " y; [[ "$y" == "yes" ]] && uninstall_all && exit 0 ;;
+    13) exit 0 ;;
+    *) echo "گزینه نامعتبر" ;;
   esac
-}
-
-show_menu
+done
 EOF
   sed -i "s|__PROJECT_DIR__|$PROJECT_DIR|g" "$MANAGE_BIN"
   sed -i "s|__VENV_DIR__|$VENV_DIR|g" "$MANAGE_BIN"
   sed -i "s|__SERVICE_NAME__|$SERVICE_NAME|g" "$MANAGE_BIN"
   chmod +x "$MANAGE_BIN"
-  success "manage command installed. Use: manage"
+  success "manage command installed."
 }
 
 
@@ -415,10 +457,9 @@ print_summary() {
   printf "Project path : %s\n" "$PROJECT_DIR"
   printf "Venv path    : %s\n" "$VENV_DIR"
   printf "Next steps   :\n"
-  printf "  1) source '%s/bin/activate'\n" "$VENV_DIR"
-  printf "  2) Edit '%s' and set BOT_TOKEN + ADMIN_ID\n" "$ENV_FILE"
-  printf "  3) Run: manage (from anywhere)\n"
-printf "  4) In manage, choose option 2 to enable auto-start (systemd)\n"
+  printf "  1) Run: manage (from anywhere)\n"
+  printf "  2) Set token/admin/channel using menu options 1,2,3\n"
+  printf "  3) Use option 6 for persistent systemd service\n"
   printf "%b=====================================%b\n\n" "$C_BOLD" "$C_RESET"
 }
 
