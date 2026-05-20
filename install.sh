@@ -335,12 +335,12 @@ EOF
 
 install_manage_command() {
   log "Installing global manage command at $MANAGE_BIN"
-  cat > "$MANAGE_BIN" <<EOF
+  cat > "$MANAGE_BIN" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
-PROJECT_DIR="${PROJECT_DIR}"
-VENV_DIR="${VENV_DIR}"
-SERVICE_NAME="${SERVICE_NAME}"
+PROJECT_DIR="__PROJECT_DIR__"
+VENV_DIR="__VENV_DIR__"
+SERVICE_NAME="__SERVICE_NAME__"
 
 run_bot() {
   cd "$PROJECT_DIR"
@@ -396,9 +396,13 @@ show_menu() {
 
 show_menu
 EOF
+  sed -i "s|__PROJECT_DIR__|$PROJECT_DIR|g" "$MANAGE_BIN"
+  sed -i "s|__VENV_DIR__|$VENV_DIR|g" "$MANAGE_BIN"
+  sed -i "s|__SERVICE_NAME__|$SERVICE_NAME|g" "$MANAGE_BIN"
   chmod +x "$MANAGE_BIN"
   success "manage command installed. Use: manage"
 }
+
 
 print_summary() {
   local pyv
