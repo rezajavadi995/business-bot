@@ -114,9 +114,16 @@ class DB:
             c.execute("UPDATE users SET soft_ban_until=? WHERE user_id=?", (until_ts, user_id))
 
     def save_shortcuts(self, items: dict[str, str]):
+        cleaned: list[tuple[str, str]] = []
+        for k, v in items.items():
+            if k is None or not str(k).strip():
+                logging.warning("shortcut_rejected_invalid_key key=%r", k)
+                continue
+            cleaned.append((str(k).strip(), str(v or "").strip()))
         with self.conn() as c:
             c.execute("DELETE FROM shortcuts")
-            c.executemany("INSERT INTO shortcuts(name,response) VALUES(?,?)", list(items.items()))
+            if cleaned:
+                c.executemany("INSERT INTO shortcuts(name,response) VALUES(?,?)", cleaned)
 
     def load_shortcuts(self) -> dict[str, str]:
         with self.conn() as c:
@@ -242,10 +249,12 @@ def map_emojis(text: str) -> str | None:
 
 
 async def send_formatted_message(target, text: str, data: dict[str, Any]):
-    mapped = map_emojis(text)
+    raw = text if text is not None else ""
+    escaped = html.escape(raw)
+    mapped = map_emojis(escaped)
     if mapped is None:
         return
-    safe = html.escape(mapped)
+    safe = mapped
     if data.get("bold_mode", True):
         safe = f"<b>{safe}</b>"
     await target.reply_text(safe, parse_mode=ParseMode.HTML)
@@ -261,7 +270,10 @@ def is_spam(text: str, shortcuts: dict[str, str]) -> bool:
         if counts[w] > 5:
             return True
     for s in shortcuts.keys():
-        if text.lower().count(s.lower()) >= 3:
+        if not s or not str(s).strip():
+            continue
+        sk = str(s).strip().lower()
+        if text.lower().count(sk) >= 3:
             return True
     return False
 
@@ -279,12 +291,26 @@ async def maybe_welcome(update: Update, data: dict[str, Any], uid: int) -> bool:
         return False
     row = db.get_user(uid)
     now = int(time.time())
-    if row is None or now - int(row["last_seen_at"] or 0) > WELCOME_COOLDOWN_SECONDS:
+    if row is None:
         await send_formatted_message(update.message, data.get("welcome_text", "خوش آمدید"), data)
-        logging.info("welcome_trigger user=%s", uid)
+        logging.info("welcome_trigger first_chat user=%s", uid)
+        return True
+    last_seen = int(row["last_seen_at"] or 0)
+    if last_seen <= 0 or (now - last_seen) >= WELCOME_COOLDOWN_SECONDS:
+        await send_formatted_message(update.message, data.get("welcome_text", "خوش آمدید"), data)
+        logging.info("welcome_trigger inactivity user=%s delta=%s", uid, now - last_seen)
         return True
     return False
 
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_user:
+        return
+    data = load_data()
+    u = update.effective_user
+    db.upsert_user(u.id, u.username or "", u.full_name or u.first_name or "", None, False, "start", update.message.text)
+    await send_formatted_message(update.message, f"سلام {u.first_name} 🌟\nبه ربات خوش آمدی. دکمه منو را بزن.", data)
+    await update.message.reply_text("menu", reply_markup=ReplyKeyboardMarkup([["menu"]], resize_keyboard=True))
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_user:
@@ -435,14 +461,17 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
     uid = update.effective_user.id
     txt = (update.message.text or "").strip()
-    db.upsert_user(uid, update.effective_user.username or "", update.effective_user.full_name or update.effective_user.first_name or "", update.message.contact.phone_number if update.message.contact else None, False, "message", txt)
 
     user_row = db.get_user(uid)
     if user_row and int(user_row["soft_ban_until"] or 0) > int(time.time()):
         logging.info("anti_spam_ignored user=%s until=%s", uid, user_row["soft_ban_until"])
         return
 
-    if await maybe_welcome(update, data, uid):
+    welcome_sent = await maybe_welcome(update, data, uid)
+
+    db.upsert_user(uid, update.effective_user.username or "", update.effective_user.full_name or update.effective_user.first_name or "", update.message.contact.phone_number if update.message.contact else None, False, "message", txt)
+
+    if welcome_sent:
         return
 
     if STATE.admin_id == uid and STATE.flow == "text_edit" and STATE.step == "waiting_value" and STATE.pending_key:
