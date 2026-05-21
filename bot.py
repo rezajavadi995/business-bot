@@ -148,7 +148,7 @@ def text_with_custom_emoji_markup(message) -> str:
         if getattr(ent, "type", None) == "custom_emoji" and getattr(ent, "custom_emoji_id", None):
             start = ent.offset
             end = ent.offset + ent.length
-            original = txt[start:end] or "🙂"
+            original = (txt[start:end] or "🙂").replace("\n", "").strip() or "🙂"
             tag = f'<tg-emoji emoji-id="{ent.custom_emoji_id}">{original}</tg-emoji>'
             txt = txt[:start] + tag + txt[end:]
     return txt
@@ -184,11 +184,14 @@ def is_spam(text: str, shortcuts: dict[str, str]) -> bool:
     return False
 
 def match_shortcut(text: str, shortcuts: dict[str, str]) -> str | None:
-    t=text.lower()
-    for k,v in shortcuts.items():
-        if not k or not str(k).strip(): continue
-        kk=str(k).strip().lower()
-        if kk==t or kk in t: return v
+    t = text.lower().strip()
+    for k, v in shortcuts.items():
+        if not k or not str(k).strip():
+            continue
+        kk = str(k).strip().lower()
+        pattern = rf"(^|[^\w]){re.escape(kk)}([^\w]|$)"
+        if re.search(pattern, t):
+            return v
     return None
 
 async def maybe_welcome(update: Update, data: dict[str, Any], uid: int, source: str) -> bool:
@@ -276,7 +279,17 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
     db.upsert_user(uid,(bm.from_user.username if bm.from_user else "") or "",(bm.from_user.full_name if bm.from_user else bm.chat.full_name) or "",None,False,"business",txt)
     sc=db.load_shortcuts(); resp=match_shortcut(txt, sc)
     if resp:
-        kwargs={"chat_id":bm.chat.id,"text":f"<b>{preserve_tg_emoji_markup(resp)}</b>","parse_mode":ParseMode.HTML}; bc=getattr(bm,"business_connection_id",None)
+        bc=getattr(bm,"business_connection_id",None)
+        if data.get("self_bot_enabled") and is_admin(uid, data):
+            try:
+                del_kwargs = {"chat_id": bm.chat.id, "message_id": bm.message_id}
+                if bc:
+                    del_kwargs["business_connection_id"] = bc
+                await context.bot.delete_message(**del_kwargs)
+                logging.info("business_admin_shortcut_delete_ok uid=%s msg_id=%s", uid, bm.message_id)
+            except Exception as exc:
+                logging.exception("business_admin_shortcut_delete_failed uid=%s reason=%s", uid, exc)
+        kwargs={"chat_id":bm.chat.id,"text":f"<b>{preserve_tg_emoji_markup(resp)}</b>","parse_mode":ParseMode.HTML}
         if bc: kwargs["business_connection_id"]=bc
         await context.bot.send_message(**kwargs)
         logging.info("business_shortcut_sent uid=%s text=%s",uid, txt)
