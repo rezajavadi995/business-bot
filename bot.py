@@ -85,8 +85,8 @@ class DB:
                 logging.warning("shortcut_rejected_invalid_key key=%r", k); continue
             cleaned.append((str(k).strip(), str(v or "").strip()))
         with self.conn() as c:
-            c.execute("DELETE FROM shortcuts")
-            if cleaned: c.executemany("INSERT INTO shortcuts(name,response) VALUES(?,?)", cleaned)
+            for name, resp in cleaned:
+                c.execute("INSERT INTO shortcuts(name,response) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET response=excluded.response", (name, resp))
     def load_shortcuts(self) -> dict[str, str]:
         with self.conn() as c:
             return {r["name"]: r["response"] for r in c.execute("SELECT name,response FROM shortcuts").fetchall()}
@@ -139,8 +139,21 @@ def create_features_keyboard(data: dict[str, Any]) -> InlineKeyboardMarkup:
 def create_texts_keyboard() -> InlineKeyboardMarkup:
     rows=[[create_primary_button(name,f"text:{key}")] for key,name in TEXT_KEYS.items()]; rows.append([create_danger_button("بازگشت","menu:admin")]); return InlineKeyboardMarkup(rows)
 
+def preserve_tg_emoji_markup(raw: str) -> str:
+    pattern = re.compile(r'<tg-emoji\s+emoji-id="\d+">.*?</tg-emoji>', re.DOTALL)
+    placeholders: list[str] = []
+    def repl(m):
+        placeholders.append(m.group(0))
+        return f"__TG_EMOJI_{len(placeholders)-1}__"
+    tmp = pattern.sub(repl, raw)
+    escaped = html.escape(tmp)
+    for i, val in enumerate(placeholders):
+        escaped = escaped.replace(f"__TG_EMOJI_{i}__", val)
+    return escaped
+
+
 async def send_formatted_message(target, text: str, data: dict[str, Any]):
-    safe = html.escape(text if text is not None else "")
+    safe = preserve_tg_emoji_markup(text if text is not None else "")
     if data.get("bold_mode", True): safe = f"<b>{safe}</b>"
     await target.reply_text(safe, parse_mode=ParseMode.HTML)
 
@@ -252,7 +265,7 @@ async def business_test_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await context.bot.send_message(**kwargs); return
     sc=db.load_shortcuts(); resp=match_shortcut(txt, sc)
     if resp:
-        kwargs={"chat_id":bm.chat.id,"text":f"<b>{html.escape(resp)}</b>","parse_mode":ParseMode.HTML}; bc=getattr(bm,"business_connection_id",None)
+        kwargs={"chat_id":bm.chat.id,"text":f"<b>{preserve_tg_emoji_markup(resp)}</b>","parse_mode":ParseMode.HTML}; bc=getattr(bm,"business_connection_id",None)
         if bc: kwargs["business_connection_id"]=bc
         await context.bot.send_message(**kwargs); logging.info("business_shortcut_sent uid=%s",uid)
 
@@ -269,7 +282,7 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"ذخیره شد.\nمتن قبلی:\n{old or '(خالی)'}\n\nمتن جدید:\n{txt}", reply_markup=create_texts_keyboard()); return
     if STATE.admin_id==uid and STATE.flow=="shortcut_cfg" and can_edit_flow(uid):
         if STATE.step=="waiting_name": STATE.pending_key=txt; STATE.step="waiting_value"; await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"نام شورت‌کات: {txt}\nمتن شورت‌کات را وارد کنید:", reply_markup=build_back_kb("admin:shortcut_menu")); return
-        if STATE.step=="waiting_value": (STATE.temp_shortcuts or {})[STATE.pending_key or ""]=txt; STATE.step="confirm_continue"; kb=InlineKeyboardMarkup([[create_success_button("بله","shortcut:continue_yes"),create_danger_button("خیر","shortcut:continue_no")]]); await context.bot.edit_message_text(chat_id=update.effective_chat.id,message_id=STATE.message_id,text="آیا ادامه می‌دهید؟",reply_markup=kb); return
+        if STATE.step=="waiting_value": (STATE.temp_shortcuts or {})[STATE.pending_key or ""]=txt; STATE.step="confirm_continue"; kb=InlineKeyboardMarkup([[create_success_button("ادامه","shortcut:continue_yes"),create_danger_button("پایان","shortcut:continue_no")]]); await context.bot.edit_message_text(chat_id=update.effective_chat.id,message_id=STATE.message_id,text="آیا ادامه می‌دهید؟",reply_markup=kb); return
     if STATE.admin_id==uid and STATE.flow=="welcome_cfg" and STATE.step=="waiting_value" and can_edit_flow(uid):
         old=data.get("welcome_text",""); data["welcome_text"]=txt; save_data(data); STATE.flow=STATE.step=None
         await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"Welcome بروزرسانی شد.\nقبلی:\n{old}\n\nجدید:\n{txt}", reply_markup=create_admin_keyboard(data)); return
