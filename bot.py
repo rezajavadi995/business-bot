@@ -295,6 +295,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_formatted_message(update.message, f"سلام {u.first_name} 🌟\nبه ربات خوش آمدی. دکمه منو را بزن.", data)
     await update.message.reply_text("menu", reply_markup=ReplyKeyboardMarkup([["menu"]], resize_keyboard=True))
 
+def load_data() -> dict[str, Any]:
+    data = db.get_json("settings", get_default_data())
+    defaults = get_default_data()
+    for k, v in defaults.items():
+        data.setdefault(k, v)
+    data.setdefault("features", {})
+    for k, v in defaults["features"].items():
+        data["features"].setdefault(k, v)
+    return data
 
 async def panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_user:
@@ -547,7 +556,6 @@ def main() -> None:
         raise RuntimeError("BOT_TOKEN is missing")
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("panel", panel))
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CallbackQueryHandler(callbacks))
     app.add_handler(MessageHandler(filters.ALL, all_messages))
