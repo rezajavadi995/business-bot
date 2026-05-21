@@ -1,58 +1,129 @@
-# Telegram Business Bot (SQLite, Production)
+# Telegram Business Bot (Production, SQLite)
 
-## نصب
+ربات بیزینسی تلگرام با ذخیره‌سازی پایدار در SQLite، پنل ادمین، مدیریت شورت‌کات، سیستم بازخورد، Welcome هوشمند، و installer آماده‌ی سرور.
+
+## نصب سریع
 ```bash
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/rezajavadi995/business-bot/main/install.sh)"
 ```
 
-## مدیریت
+پس از نصب:
 ```bash
 manage
 ```
 
-## قابلیت‌های جدید این نسخه
-- ذخیره کامل state و تنظیمات در SQLite (`bot.db`)
-- سیستم مرکزی ایموجی سفارشی با mapping قابل تنظیم از پنل ادمین
-- Self Bot toggle در پنل ادمین
-- Shortcut Config Flow چندمرحله‌ای با edit message (بدون spam keyboard)
-- Anti-spam (soft ban 20 دقیقه)
-- Welcome system با تشخیص اولین چت/بیش از 24 ساعت
-- گزارش Human-readable با جزئیات کامل کاربران
-- لاگ کامل عملیات مهم
+---
 
-## جدول‌های SQLite
+## وضعیت نهایی معماری
+- Runtime فعلی: `python-telegram-bot` (async)
+- دیتابیس: `bot.db` (SQLite)
+- مسیر migration-safe:
+  - Button Factory مرکزی
+  - Keyboard Builder مرکزی
+  - State Flow قابل توسعه
+  - بدون شکستن handler/callback فعلی
+
+---
+
+## جداول SQLite
 - `kv`: تنظیمات و state
-- `users`: اطلاعات کامل کاربران
+- `users`: اطلاعات کاربران
 - `shortcuts`: شورت‌کات‌ها
-- `emoji_map`: نگاشت ایموجی‌ها
+- `feedbacks`: پیام‌های بازخورد
 
-## اطلاعات ذخیره‌شده کاربر
-- user_id
-- username
-- full_name
-- phone (در صورت ارسال contact)
-- is_channel_joined
-- first_seen_at / last_seen_at
-- source
-- soft_ban_until
-- spam_score
-- last_message
+---
 
-## منوی ادمین
-با `/panel` یا `panel`:
+## جریان اصلی کاربر
+1. کاربر `/start` می‌زند -> پیام خوشامد + Reply Keyboard
+2. کاربر `menu` می‌زند -> Inline menu نمایش داده می‌شود
+3. کاربر می‌تواند خدمات/ساعات/آدرس/FAQ/تماس/بازخورد بگیرد
+4. بازخورد کاربر ذخیره می‌شود و نوتیف برای ادمین ارسال می‌گردد
+
+---
+
+## پنل ادمین
+ورود به پنل:
+- `/panel`
+- یا `panel`
+
+امکانات پنل:
 - روشن/خاموش ربات
 - ویرایش متن‌ها
 - مدیریت فیچرها
-- گزارش وضعیت
+- گزارش وضعیت Human-readable
+- راهنمای Broadcast
 - Self Bot ON/OFF
-- پیکربندی سلف بات (shortcut)
-- Welcome ON/OFF
-- پیکربندی Welcome
-- پیکربندی ایموجی
+- مدیریت شورت‌کات‌ها (مشاهده + افزودن/ویرایش)
+- Welcome ON/OFF + تنظیم متن Welcome
+- نمایش همه بازخوردها
+- دکمه بازگشت در flowهای اجرایی
 
-## تست Business
-اگر business message دقیقا `عجیبستان` باشد، پاسخ:
+---
+
+## شورت‌کات‌ها
+در «مدیریت سلف بات»:
+- مشاهده شورت‌کات‌های فعلی
+- افزودن/ویرایش شورت‌کات
+
+رفتار:
+- اگر متن پیام شامل شورت‌کات باشد، پاسخ شورت‌کات ارسال می‌شود
+- در حالت Self Bot برای ادمین: پیام ادمین حذف می‌شود و پاسخ شورت‌کات ارسال می‌شود
+
+---
+
+## سیستم بازخورد
+- دکمه «ارسال بازخورد» کاربر را وارد حالت feedback می‌کند
+- متن prompt و success از پنل قابل شخصی‌سازی است
+- بعد از ثبت بازخورد:
+  - پیام موفقیت برای کاربر
+  - ذخیره در SQLite
+  - نوتیف برای ادمین با دکمه مشاهده متن
+- پنل ادمین: «پیام‌های بازخورد» برای مشاهده کل تاریخچه
+
+---
+
+## Welcome در Business PV
+Welcome برای مسیر business message در نظر گرفته شده:
+- پیام اول کاربر در PV بیزینسی
+- یا پس از 24 ساعت عدم تعامل
+
+---
+
+## Anti-Spam
+- تکرار غیرعادی کلمات یا shortcut flood تشخیص داده می‌شود
+- soft ban مدت‌دار (20 دقیقه)
+- لاگ کامل anti-spam ثبت می‌شود
+
+---
+
+## لاگ‌ها
+- فایل لاگ: `logs/bot.log`
+- لاگ‌های مهم:
+  - anti-spam
+  - shortcut execution
+  - welcome trigger
+  - business test/shortcut مسیر بیزینسی
+  - admin actions
+
+---
+
+## دستورات
+- `/start`
+- `/panel` (ادمین)
+- `/broadcast` (ادمین)
+- `panel` (ادمین)
+- `menu`
+
+---
+
+## Business Test موقت
+اگر business message دقیقاً این متن باشد:
+`عجیبستان`
+
+ربات پاسخ می‌دهد:
 `✅ Business Bot Works`
 
-## نکته فنی migration
-ساختار کیبورد و دکمه‌ها مرکزی شده (`create_primary_button`, `create_success_button`, `create_danger_button`, `create_menu_keyboard`, `create_admin_keyboard`) تا migration تدریجی aiogram در آینده بدون شکستن flow فعلی ممکن باشد.
+---
+
+## اجرای سرویس پایدار
+از `manage` گزینه مربوط به systemd را انتخاب کنید تا بعد از reboot هم فعال بماند.
