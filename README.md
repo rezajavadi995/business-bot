@@ -1,74 +1,58 @@
-# Telegram Business Bot
-
-این نسخه با حفظ flow فعلی، برای migration تدریجی به معماری مدرن (aiogram-first در آینده) آماده شده است؛ بدون rewrite سنگین و بدون شکستن handler/callback های فعلی.
+# Telegram Business Bot (SQLite, Production)
 
 ## نصب
 ```bash
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/rezajavadi995/business-bot/main/install.sh)"
 ```
 
-سپس:
+## مدیریت
 ```bash
 manage
 ```
 
-## معماری فعلی (Hybrid Migration Ready)
-- Runtime فعلی روی `python-telegram-bot` باقی مانده (پایدار و production-safe).
-- لایه abstraction برای keyboard/buttons اضافه شده تا مهاجرت آینده ساده شود:
-  - `create_primary_button`
-  - `create_success_button`
-  - `create_danger_button`
-  - `create_menu_keyboard`
-  - `create_admin_keyboard`
-- Handlerها و flow فعلی حذف یا شکسته نشده‌اند.
+## قابلیت‌های جدید این نسخه
+- ذخیره کامل state و تنظیمات در SQLite (`bot.db`)
+- سیستم مرکزی ایموجی سفارشی با mapping قابل تنظیم از پنل ادمین
+- Self Bot toggle در پنل ادمین
+- Shortcut Config Flow چندمرحله‌ای با edit message (بدون spam keyboard)
+- Anti-spam (soft ban 20 دقیقه)
+- Welcome system با تشخیص اولین چت/بیش از 24 ساعت
+- گزارش Human-readable با جزئیات کامل کاربران
+- لاگ کامل عملیات مهم
 
-## پایگاه داده: SQLite
-- تمام داده‌های مهم در `bot.db` نگه‌داری می‌شوند.
-- جدول `kv`: تنظیمات ربات (features/texts/state)
-- جدول `users`: اطلاعات کاربران
+## جدول‌های SQLite
+- `kv`: تنظیمات و state
+- `users`: اطلاعات کامل کاربران
+- `shortcuts`: شورت‌کات‌ها
+- `emoji_map`: نگاشت ایموجی‌ها
 
-فیلدهای کاربر:
-- `user_id`
-- `username` (شناسه @)
-- `full_name`
-- `phone` (اگر ارسال شود)
-- `is_channel_joined` (yes/no)
-- `last_seen_at`
-- `source`
+## اطلاعات ذخیره‌شده کاربر
+- user_id
+- username
+- full_name
+- phone (در صورت ارسال contact)
+- is_channel_joined
+- first_seen_at / last_seen_at
+- source
+- soft_ban_until
+- spam_score
+- last_message
 
-## رفتار Business Test (ایزوله و قابل حذف)
-هندلر تست ایزوله فعال است:
-- اگر business message دقیقاً `عجیبستان` باشد
-- پاسخ می‌دهد: `✅ Business Bot Works`
-- لاگ موفق/خطا واضح ثبت می‌شود.
+## منوی ادمین
+با `/panel` یا `panel`:
+- روشن/خاموش ربات
+- ویرایش متن‌ها
+- مدیریت فیچرها
+- گزارش وضعیت
+- Self Bot ON/OFF
+- پیکربندی سلف بات (shortcut)
+- Welcome ON/OFF
+- پیکربندی Welcome
+- پیکربندی ایموجی
 
-## دستورات
-- `/start`
-- `/panel` (فقط ادمین)
-- `/broadcast` (فقط ادمین)
-- `panel` بدون اسلش (فقط ادمین)
-- `menu`
+## تست Business
+اگر business message دقیقا `عجیبستان` باشد، پاسخ:
+`✅ Business Bot Works`
 
-## Dependency Analysis
-- کتابخانه اصلی: `python-telegram-bot==21.10`
-- سازگار با async handlers فعلی پروژه.
-- پشتیبانی style واقعی دکمه‌ها (`style=primary/success/danger`) در این لایه تضمین‌شده نیست؛ بنابراین fallback امن با emoji semantic استفاده شده است (بدون crash/serialization issue).
-- برای migration آینده به aiogram، abstraction layer دکمه‌ها و keyboardها coupling را کم کرده است.
-
-## Migration Readiness Report
-- ✅ Keyboard system مرکزی شد.
-- ✅ Button factory اضافه شد.
-- ✅ Callback routing حفظ شد.
-- ✅ Business test flow ایزوله شد.
-- ✅ Data persistence از JSON پراکنده به SQLite مرکزی منتقل شد.
-- ✅ Backward compatibility حفظ شد (commands/handlers اصلی پابرجا).
-
-### Compatibility Risks
-- Business message routing وابسته به تنظیمات Telegram Business account و permissionها است.
-- در برخی clientها/سناریوها ممکن است business update نرسد؛ لاگ برای تشخیص اضافه شده است.
-
-## فایل‌ها
-- `bot.py` منطق ربات + adapters + handlers
-- `bot.db` دیتابیس SQLite
-- `logs/bot.log` لاگ
-- `.env` تنظیمات حساس
+## نکته فنی migration
+ساختار کیبورد و دکمه‌ها مرکزی شده (`create_primary_button`, `create_success_button`, `create_danger_button`, `create_menu_keyboard`, `create_admin_keyboard`) تا migration تدریجی aiogram در آینده بدون شکستن flow فعلی ممکن باشد.
