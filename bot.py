@@ -268,22 +268,20 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         vid=q.data.split(":",2)[2]; msg=db.get_json(f"feedback_last:{vid}","(یافت نشد)")
         await q.edit_message_text(f"متن پیام بازخورد:\n{msg}", reply_markup=build_back_kb("menu:admin"))
 
-async def business_test_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def business_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bm=getattr(update,"business_message",None)
     if not bm or not bm.text: return
     data=load_data(); txt=bm.text.strip(); uid=(bm.from_user.id if bm.from_user else bm.chat.id)
     prev=db.get_user(uid)
     db.upsert_user(uid,(bm.from_user.username if bm.from_user else "") or "",(bm.from_user.full_name if bm.from_user else bm.chat.full_name) or "",None,False,"business",txt)
-    if txt=="عجیبستان":
-        kwargs={"chat_id":bm.chat.id,"text":"✅ Business Bot Works"}; bc=getattr(bm,"business_connection_id",None)
-        if bc: kwargs["business_connection_id"]=bc
-        await context.bot.send_message(**kwargs); return
     sc=db.load_shortcuts(); resp=match_shortcut(txt, sc)
     if resp:
         kwargs={"chat_id":bm.chat.id,"text":f"<b>{preserve_tg_emoji_markup(resp)}</b>","parse_mode":ParseMode.HTML}; bc=getattr(bm,"business_connection_id",None)
         if bc: kwargs["business_connection_id"]=bc
-        await context.bot.send_message(**kwargs); logging.info("business_shortcut_sent uid=%s",uid)
+        await context.bot.send_message(**kwargs)
+        logging.info("business_shortcut_sent uid=%s text=%s",uid, txt)
         return
+    logging.info("business_shortcut_no_match uid=%s text=%s", uid, txt)
     if data.get("welcome_enabled",True) and (prev is None or int(prev["last_seen_at"] or 0)<=0 or int(time.time())-int(prev["last_seen_at"] or 0)>=WELCOME_COOLDOWN_SECONDS):
         try:
             await context.bot.send_message(chat_id=bm.chat.id, text=f"<b>{preserve_tg_emoji_markup(data.get('welcome_text','خوش آمدید'))}</b>", parse_mode=ParseMode.HTML, business_connection_id=getattr(bm,"business_connection_id",None))
@@ -292,7 +290,7 @@ async def business_test_handler(update: Update, context: ContextTypes.DEFAULT_TY
             logging.exception("welcome_business_failed uid=%s reason=%s", uid, exc)
 
 async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if getattr(update,"business_message",None): await business_test_handler(update, context); return
+    if getattr(update,"business_message",None): await business_message_handler(update, context); return
     if not update.message or not update.effective_user: return
     data=load_data(); uid=update.effective_user.id; src_txt=text_with_custom_emoji_markup(update.message); txt=src_txt.strip()
     row=db.get_user(uid)

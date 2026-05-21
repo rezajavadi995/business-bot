@@ -102,7 +102,7 @@ Welcome برای مسیر business message در نظر گرفته شده:
   - anti-spam
   - shortcut execution
   - welcome trigger
-  - business test/shortcut مسیر بیزینسی
+  - shortcut مسیر بیزینسی
   - admin actions
 
 ---
@@ -113,15 +113,6 @@ Welcome برای مسیر business message در نظر گرفته شده:
 - `/broadcast` (ادمین)
 - `panel` (ادمین)
 - `menu`
-
----
-
-## Business Test موقت
-اگر business message دقیقاً این متن باشد:
-`عجیبستان`
-
-ربات پاسخ می‌دهد:
-`✅ Business Bot Works`
 
 ---
 
