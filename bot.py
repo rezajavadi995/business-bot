@@ -139,6 +139,20 @@ def create_features_keyboard(data: dict[str, Any]) -> InlineKeyboardMarkup:
 def create_texts_keyboard() -> InlineKeyboardMarkup:
     rows=[[create_primary_button(name,f"text:{key}")] for key,name in TEXT_KEYS.items()]; rows.append([create_danger_button("بازگشت","menu:admin")]); return InlineKeyboardMarkup(rows)
 
+
+
+def text_with_custom_emoji_markup(message) -> str:
+    txt = message.text or ""
+    entities = list(message.entities or [])
+    for ent in sorted(entities, key=lambda e: e.offset, reverse=True):
+        if getattr(ent, "type", None) == "custom_emoji" and getattr(ent, "custom_emoji_id", None):
+            start = ent.offset
+            end = ent.offset + ent.length
+            original = txt[start:end] or "🙂"
+            tag = f'<tg-emoji emoji-id="{ent.custom_emoji_id}">{original}</tg-emoji>'
+            txt = txt[:start] + tag + txt[end:]
+    return txt
+
 def preserve_tg_emoji_markup(raw: str) -> str:
     pattern = re.compile(r'<tg-emoji\s+emoji-id="\d+">.*?</tg-emoji>', re.DOTALL)
     placeholders: list[str] = []
@@ -232,7 +246,12 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(out, reply_markup=create_shortcut_menu_keyboard())
     elif q.data=="admin:shortcut_cfg": STATE.flow,STATE.step,STATE.admin_id,STATE.message_id,STATE.temp_shortcuts="shortcut_cfg","waiting_name",uid,q.message.message_id,{}; await q.edit_message_text("نام شورت‌کات را وارد کنید:", reply_markup=build_back_kb("admin:shortcut_menu"))
     elif q.data=="shortcut:continue_yes": STATE.step="waiting_name"; await q.edit_message_text("نام شورت‌کات بعدی را وارد کنید:", reply_markup=build_back_kb("admin:shortcut_menu"))
-    elif q.data=="shortcut:continue_no": db.save_shortcuts(STATE.temp_shortcuts or {}); STATE.flow=STATE.step=STATE.pending_key=None; STATE.temp_shortcuts=None; await q.edit_message_text("شورت‌کات‌ها ذخیره شدند.", reply_markup=create_shortcut_menu_keyboard())
+    elif q.data=="shortcut:continue_no":
+        if STATE.temp_shortcuts:
+            db.save_shortcuts(STATE.temp_shortcuts)
+        STATE.flow=STATE.step=STATE.pending_key=None
+        STATE.temp_shortcuts=None
+        await q.edit_message_text("شورت‌کات‌ها ذخیره شدند.", reply_markup=create_shortcut_menu_keyboard())
     elif q.data=="admin:welcome_toggle": data["welcome_enabled"]=not data.get("welcome_enabled",True); save_data(data); await q.edit_message_text("وضعیت Welcome تغییر کرد.", reply_markup=create_admin_keyboard(data))
     elif q.data=="admin:welcome_cfg": STATE.flow,STATE.step,STATE.admin_id,STATE.message_id,STATE.pending_key="welcome_cfg","waiting_value",uid,q.message.message_id,"welcome_text"; await q.edit_message_text(f"متن فعلی Welcome:\n{data.get('welcome_text','')}\n\nمتن جدید را ارسال کنید.", reply_markup=build_back_kb("menu:admin"))
     elif q.data=="admin:report":
@@ -254,10 +273,6 @@ async def business_test_handler(update: Update, context: ContextTypes.DEFAULT_TY
     if not bm or not bm.text: return
     data=load_data(); txt=bm.text.strip(); uid=(bm.from_user.id if bm.from_user else bm.chat.id)
     prev=db.get_user(uid)
-    if data.get("welcome_enabled",True) and (prev is None or int(prev["last_seen_at"] or 0)<=0 or int(time.time())-int(prev["last_seen_at"] or 0)>=WELCOME_COOLDOWN_SECONDS):
-        try: await context.bot.send_message(chat_id=bm.chat.id, text=f"<b>{html.escape(data.get('welcome_text','خوش آمدید'))}</b>", parse_mode=ParseMode.HTML, business_connection_id=getattr(bm,"business_connection_id",None))
-        except Exception: pass
-        db.upsert_user(uid,(bm.from_user.username if bm.from_user else "") or "",(bm.from_user.full_name if bm.from_user else bm.chat.full_name) or "",None,False,"business",txt); logging.info("welcome_trigger_business uid=%s",uid); return
     db.upsert_user(uid,(bm.from_user.username if bm.from_user else "") or "",(bm.from_user.full_name if bm.from_user else bm.chat.full_name) or "",None,False,"business",txt)
     if txt=="عجیبستان":
         kwargs={"chat_id":bm.chat.id,"text":"✅ Business Bot Works"}; bc=getattr(bm,"business_connection_id",None)
@@ -268,23 +283,39 @@ async def business_test_handler(update: Update, context: ContextTypes.DEFAULT_TY
         kwargs={"chat_id":bm.chat.id,"text":f"<b>{preserve_tg_emoji_markup(resp)}</b>","parse_mode":ParseMode.HTML}; bc=getattr(bm,"business_connection_id",None)
         if bc: kwargs["business_connection_id"]=bc
         await context.bot.send_message(**kwargs); logging.info("business_shortcut_sent uid=%s",uid)
+        return
+    if data.get("welcome_enabled",True) and (prev is None or int(prev["last_seen_at"] or 0)<=0 or int(time.time())-int(prev["last_seen_at"] or 0)>=WELCOME_COOLDOWN_SECONDS):
+        try:
+            await context.bot.send_message(chat_id=bm.chat.id, text=f"<b>{preserve_tg_emoji_markup(data.get('welcome_text','خوش آمدید'))}</b>", parse_mode=ParseMode.HTML, business_connection_id=getattr(bm,"business_connection_id",None))
+            logging.info("welcome_trigger_business uid=%s", uid)
+        except Exception as exc:
+            logging.exception("welcome_business_failed uid=%s reason=%s", uid, exc)
 
 async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if getattr(update,"business_message",None): await business_test_handler(update, context); return
     if not update.message or not update.effective_user: return
-    data=load_data(); uid=update.effective_user.id; txt=(update.message.text or "").strip()
+    data=load_data(); uid=update.effective_user.id; src_txt=text_with_custom_emoji_markup(update.message); txt=src_txt.strip()
     row=db.get_user(uid)
     if row and int(row["soft_ban_until"] or 0)>int(time.time()): return
     db.upsert_user(uid, update.effective_user.username or "", update.effective_user.full_name or update.effective_user.first_name or "", update.message.contact.phone_number if update.message.contact else None, False, "message", txt)
 
     if STATE.admin_id==uid and STATE.flow=="text_edit" and STATE.step=="waiting_value" and STATE.pending_key and can_edit_flow(uid):
-        key=STATE.pending_key; old=data.get(key,""); data[key]=txt; save_data(data); STATE.flow=STATE.step=STATE.pending_key=None
+        key=STATE.pending_key; old=data.get(key,""); data[key]=src_txt; save_data(data); STATE.flow=STATE.step=STATE.pending_key=None
         await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"ذخیره شد.\nمتن قبلی:\n{old or '(خالی)'}\n\nمتن جدید:\n{txt}", reply_markup=create_texts_keyboard()); return
     if STATE.admin_id==uid and STATE.flow=="shortcut_cfg" and can_edit_flow(uid):
         if STATE.step=="waiting_name": STATE.pending_key=txt; STATE.step="waiting_value"; await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"نام شورت‌کات: {txt}\nمتن شورت‌کات را وارد کنید:", reply_markup=build_back_kb("admin:shortcut_menu")); return
-        if STATE.step=="waiting_value": (STATE.temp_shortcuts or {})[STATE.pending_key or ""]=txt; STATE.step="confirm_continue"; kb=InlineKeyboardMarkup([[create_success_button("ادامه","shortcut:continue_yes"),create_danger_button("پایان","shortcut:continue_no")]]); await context.bot.edit_message_text(chat_id=update.effective_chat.id,message_id=STATE.message_id,text="آیا ادامه می‌دهید؟",reply_markup=kb); return
+        if STATE.step=="waiting_value":
+            key=(STATE.pending_key or "").strip()
+            if key:
+                (STATE.temp_shortcuts or {})[key]=src_txt
+                db.save_shortcuts({key: src_txt})
+                logging.info("shortcut_saved_single key=%s", key)
+            STATE.step="confirm_continue"
+            kb=InlineKeyboardMarkup([[create_success_button("ادامه","shortcut:continue_yes"),create_danger_button("پایان","shortcut:continue_no")]])
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id,message_id=STATE.message_id,text="آیا ادامه می‌دهید؟",reply_markup=kb)
+            return
     if STATE.admin_id==uid and STATE.flow=="welcome_cfg" and STATE.step=="waiting_value" and can_edit_flow(uid):
-        old=data.get("welcome_text",""); data["welcome_text"]=txt; save_data(data); STATE.flow=STATE.step=None
+        old=data.get("welcome_text",""); data["welcome_text"]=src_txt; save_data(data); STATE.flow=STATE.step=None
         await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"Welcome بروزرسانی شد.\nقبلی:\n{old}\n\nجدید:\n{txt}", reply_markup=create_admin_keyboard(data)); return
 
     shortcuts=db.load_shortcuts()
