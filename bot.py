@@ -217,24 +217,24 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif q.data=="admin:shortcut_view":
         sc=db.load_shortcuts(); out="📚 شورت‌کات‌های فعلی:\n\n" + ("\n".join([f"• {k} => {v}" for k,v in sc.items()]) if sc else "موردی ثبت نشده است.")
         await q.edit_message_text(out, reply_markup=create_shortcut_menu_keyboard())
-    elif q.data=="admin:shortcut_cfg": STATE.flow,STATE.step,STATE.admin_id,STATE.message_id,STATE.temp_shortcuts="shortcut_cfg","waiting_name",uid,q.message.message_id,{}; await q.edit_message_text("نام شورت‌کات را وارد کنید:", reply_markup=InlineKeyboardMarkup([[create_danger_button("بازگشت","admin:shortcut_menu")]]))
-    elif q.data=="shortcut:continue_yes": STATE.step="waiting_name"; await q.edit_message_text("نام شورت‌کات بعدی را وارد کنید:", reply_markup=InlineKeyboardMarkup([[create_danger_button("بازگشت","admin:shortcut_menu")]]))
+    elif q.data=="admin:shortcut_cfg": STATE.flow,STATE.step,STATE.admin_id,STATE.message_id,STATE.temp_shortcuts="shortcut_cfg","waiting_name",uid,q.message.message_id,{}; await q.edit_message_text("نام شورت‌کات را وارد کنید:", reply_markup=build_back_kb("admin:shortcut_menu"))
+    elif q.data=="shortcut:continue_yes": STATE.step="waiting_name"; await q.edit_message_text("نام شورت‌کات بعدی را وارد کنید:", reply_markup=build_back_kb("admin:shortcut_menu"))
     elif q.data=="shortcut:continue_no": db.save_shortcuts(STATE.temp_shortcuts or {}); STATE.flow=STATE.step=STATE.pending_key=None; STATE.temp_shortcuts=None; await q.edit_message_text("شورت‌کات‌ها ذخیره شدند.", reply_markup=create_shortcut_menu_keyboard())
     elif q.data=="admin:welcome_toggle": data["welcome_enabled"]=not data.get("welcome_enabled",True); save_data(data); await q.edit_message_text("وضعیت Welcome تغییر کرد.", reply_markup=create_admin_keyboard(data))
-    elif q.data=="admin:welcome_cfg": STATE.flow,STATE.step,STATE.admin_id,STATE.message_id,STATE.pending_key="welcome_cfg","waiting_value",uid,q.message.message_id,"welcome_text"; await q.edit_message_text(f"متن فعلی Welcome:\n{data.get('welcome_text','')}\n\nمتن جدید را ارسال کنید.", reply_markup=InlineKeyboardMarkup([[create_danger_button("بازگشت","menu:admin")]]))
+    elif q.data=="admin:welcome_cfg": STATE.flow,STATE.step,STATE.admin_id,STATE.message_id,STATE.pending_key="welcome_cfg","waiting_value",uid,q.message.message_id,"welcome_text"; await q.edit_message_text(f"متن فعلی Welcome:\n{data.get('welcome_text','')}\n\nمتن جدید را ارسال کنید.", reply_markup=build_back_kb("menu:admin"))
     elif q.data=="admin:report":
         users=db.list_users(50)
         lines=[f"• نام: {u['full_name'] or '-'}\n  آیدی: {u['user_id']} | یوزرنیم: @{u['username'] or '-'}\n  موبایل: {u['phone'] or '-'} | جوین: {'yes' if u['is_channel_joined'] else 'no'}" for u in users]
         rep=f"📊 گزارش سیستم\n• کاربران: {len(users)}\n• آپتایم: {int(time.time()-START_TIME)} ثانیه\n• CPU: {psutil.cpu_percent()}%\n• RAM: {psutil.virtual_memory().percent}%\n\n👤 لیست کاربران:\n\n" + ("\n\n".join(lines) if lines else "-")
-        await q.edit_message_text(rep, reply_markup=InlineKeyboardMarkup([[create_danger_button("بازگشت","menu:admin")]]))
-    elif q.data=="admin:broadcast_help": await q.edit_message_text("برای برودکست از دستور /broadcast <متن> استفاده کنید.", reply_markup=InlineKeyboardMarkup([[create_danger_button("بازگشت","menu:admin")]]))
+        await q.edit_message_text(rep, reply_markup=build_back_kb("menu:admin"))
+    elif q.data=="admin:broadcast_help": await q.edit_message_text("برای برودکست از دستور /broadcast <متن> استفاده کنید.", reply_markup=build_back_kb("menu:admin"))
     elif q.data=="admin:feedback_list":
         rows=db.list_feedbacks(100)
         out="📝 همه بازخوردها:\n\n" + ("\n\n".join([f"• {r['full_name'] or '-'} (@{r['username'] or '-'})\n  پیام: {r['message']}" for r in rows]) if rows else "موردی ثبت نشده است.")
-        await q.edit_message_text(out, reply_markup=InlineKeyboardMarkup([[create_danger_button("بازگشت","menu:admin")]]))
+        await q.edit_message_text(out, reply_markup=build_back_kb("menu:admin"))
     elif q.data.startswith("feedback:view:"):
         vid=q.data.split(":",2)[2]; msg=db.get_json(f"feedback_last:{vid}","(یافت نشد)")
-        await q.edit_message_text(f"متن پیام بازخورد:\n{msg}", reply_markup=InlineKeyboardMarkup([[create_danger_button("بازگشت","menu:admin")]]))
+        await q.edit_message_text(f"متن پیام بازخورد:\n{msg}", reply_markup=build_back_kb("menu:admin"))
 
 async def business_test_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bm=getattr(update,"business_message",None)
@@ -264,22 +264,29 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if row and int(row["soft_ban_until"] or 0)>int(time.time()): return
     db.upsert_user(uid, update.effective_user.username or "", update.effective_user.full_name or update.effective_user.first_name or "", update.message.contact.phone_number if update.message.contact else None, False, "message", txt)
 
-    if STATE.admin_id==uid and STATE.flow=="text_edit" and STATE.step=="waiting_value" and STATE.pending_key:
+    if STATE.admin_id==uid and STATE.flow=="text_edit" and STATE.step=="waiting_value" and STATE.pending_key and can_edit_flow(uid):
         key=STATE.pending_key; old=data.get(key,""); data[key]=txt; save_data(data); STATE.flow=STATE.step=STATE.pending_key=None
         await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"ذخیره شد.\nمتن قبلی:\n{old or '(خالی)'}\n\nمتن جدید:\n{txt}", reply_markup=create_texts_keyboard()); return
-    if STATE.admin_id==uid and STATE.flow=="shortcut_cfg":
-        if STATE.step=="waiting_name": STATE.pending_key=txt; STATE.step="waiting_value"; await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"نام شورت‌کات: {txt}\nمتن شورت‌کات را وارد کنید:", reply_markup=InlineKeyboardMarkup([[create_danger_button("بازگشت","admin:shortcut_menu")]])); return
+    if STATE.admin_id==uid and STATE.flow=="shortcut_cfg" and can_edit_flow(uid):
+        if STATE.step=="waiting_name": STATE.pending_key=txt; STATE.step="waiting_value"; await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"نام شورت‌کات: {txt}\nمتن شورت‌کات را وارد کنید:", reply_markup=build_back_kb("admin:shortcut_menu")); return
         if STATE.step=="waiting_value": (STATE.temp_shortcuts or {})[STATE.pending_key or ""]=txt; STATE.step="confirm_continue"; kb=InlineKeyboardMarkup([[create_success_button("بله","shortcut:continue_yes"),create_danger_button("خیر","shortcut:continue_no")]]); await context.bot.edit_message_text(chat_id=update.effective_chat.id,message_id=STATE.message_id,text="آیا ادامه می‌دهید؟",reply_markup=kb); return
-    if STATE.admin_id==uid and STATE.flow=="welcome_cfg" and STATE.step=="waiting_value":
+    if STATE.admin_id==uid and STATE.flow=="welcome_cfg" and STATE.step=="waiting_value" and can_edit_flow(uid):
         old=data.get("welcome_text",""); data["welcome_text"]=txt; save_data(data); STATE.flow=STATE.step=None
         await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"Welcome بروزرسانی شد.\nقبلی:\n{old}\n\nجدید:\n{txt}", reply_markup=create_admin_keyboard(data)); return
 
     shortcuts=db.load_shortcuts()
-    if is_spam(txt,shortcuts): db.set_soft_ban(uid, int(time.time())+SOFT_BAN_SECONDS); return
+    if is_spam(txt,shortcuts):
+        ban_until = int(time.time())+SOFT_BAN_SECONDS
+        db.set_soft_ban(uid, ban_until)
+        logging.warning("anti_spam_trigger uid=%s ban_until=%s text=%s", uid, ban_until, txt)
+        return
 
     if txt.lower()=="panel":
         if is_admin(uid,data): await update.message.reply_text("پنل ادمین", reply_markup=create_admin_keyboard(data)); return
-    if txt.lower()=="menu": await update.message.reply_text("منوی کاربر", reply_markup=create_menu_keyboard()); return
+    if txt.lower()=="menu":
+        logging.info("user_menu_open uid=%s", uid)
+        await update.message.reply_text("منوی کاربر", reply_markup=create_menu_keyboard())
+        return
 
     if db.get_json(f"feedback_wait:{uid}", False):
         db.add_feedback(uid, update.effective_user.username or "", update.effective_user.full_name or update.effective_user.first_name or "", txt)
@@ -315,6 +322,15 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"ارسال شد برای {sent} کاربر")
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE): logging.exception("Unhandled error: %s", context.error)
+
+
+def build_back_kb(target: str="menu:admin") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[create_danger_button("بازگشت", target)]])
+
+
+def can_edit_flow(uid: int) -> bool:
+    return STATE.admin_id == uid and STATE.message_id is not None and STATE.flow is not None
+
 
 def main() -> None:
     setup_logging(); db.init(); save_data(load_data())
