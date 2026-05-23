@@ -5,6 +5,7 @@ import os
 import re
 import sqlite3
 import time
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,7 @@ from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
+from features.log_export import build_logs_keyboard
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
@@ -58,6 +60,11 @@ class DB:
             )""")
             c.execute("CREATE TABLE IF NOT EXISTS shortcuts (name TEXT PRIMARY KEY, response TEXT NOT NULL)")
             c.execute("CREATE TABLE IF NOT EXISTS feedbacks (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT, full_name TEXT, message TEXT, created_at INTEGER)")
+            c.execute("CREATE TABLE IF NOT EXISTS watch_settings (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
+            c.execute("""CREATE TABLE IF NOT EXISTS keyword_hits (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, keyword TEXT NOT NULL, user_id INTEGER, username TEXT, full_name TEXT,
+                chat_id INTEGER, chat_title TEXT, text TEXT, created_at INTEGER
+            )""")
     def get_json(self, key: str, default: Any) -> Any:
         with self.conn() as c:
             row = c.execute("SELECT v FROM kv WHERE k=?", (key,)).fetchone()
@@ -97,6 +104,23 @@ class DB:
     def list_feedbacks(self, limit:int=100):
         with self.conn() as c:
             return c.execute("SELECT * FROM feedbacks ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    def set_watch(self, key: str, value: Any):
+        with self.conn() as c:
+            c.execute("INSERT INTO watch_settings(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (key, json.dumps(value, ensure_ascii=False)))
+    def get_watch(self, key: str, default: Any):
+        with self.conn() as c:
+            row = c.execute("SELECT v FROM watch_settings WHERE k=?", (key,)).fetchone()
+            return default if not row else json.loads(row["v"])
+    def add_keyword_hit(self, keyword: str, user_id: int | None, username: str, full_name: str, chat_id: int, chat_title: str, text: str):
+        with self.conn() as c:
+            c.execute("INSERT INTO keyword_hits(keyword,user_id,username,full_name,chat_id,chat_title,text,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                      (keyword, user_id, username, full_name, chat_id, chat_title, text, int(time.time())))
+    def hit_stats(self):
+        with self.conn() as c:
+            return c.execute("SELECT keyword, COUNT(*) AS cnt FROM keyword_hits GROUP BY keyword ORDER BY cnt DESC, keyword ASC").fetchall()
+    def delete_shortcut(self, key: str):
+        with self.conn() as c:
+            c.execute("DELETE FROM shortcuts WHERE name=?", (key,))
 
 db = DB(DB_PATH)
 
@@ -127,7 +151,18 @@ def create_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[create_success_button("خدمات","user:services"),create_primary_button("ساعات کاری","user:hours")],[create_primary_button("آدرس","user:location"),create_success_button("پرسش‌های پرتکرار","user:faq")],[create_danger_button("تماس","user:contact"),create_primary_button("ارسال بازخورد","user:feedback")]])
 
 def create_shortcut_menu_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[create_primary_button("مشاهده شورت‌کات‌های فعلی","admin:shortcut_view")],[create_success_button("افزودن/ویرایش شورت‌کات","admin:shortcut_cfg")],[create_danger_button("بازگشت","menu:admin")]])
+    return InlineKeyboardMarkup([
+        [create_primary_button("مشاهده شورت‌کات‌های فعلی", "admin:shortcut_view"), create_primary_button("حذف شورت‌کات", "admin:shortcut_delete_menu")],
+        [create_success_button("افزودن/ویرایش شورت‌کات", "admin:shortcut_cfg"), create_success_button("ویرایش شورت‌کات موجود", "admin:shortcut_edit_menu")],
+        [create_primary_button("تنظیم چنل گزارشات", "admin:watch_channel_cfg"), create_primary_button("افزودن کلمات مانیتور", "admin:watch_keywords_add")],
+        [create_primary_button("حذف کلمات مانیتور", "admin:watch_keywords_remove"), create_primary_button("آمار کلمات مانیتور", "admin:watch_keywords_stats")],
+        [create_primary_button("لاگ‌ها", "admin:logs_menu")],
+        [create_danger_button("بازگشت", "menu:admin")],
+    ])
+
+
+def parse_keyword_csv(raw: str) -> list[str]:
+    return [x.strip() for x in str(raw or "").split(",") if x.strip()]
 
 def create_admin_keyboard(data: dict[str, Any]) -> InlineKeyboardMarkup:
     status = "روشن" if data["active"] else "خاموش"; selfb="ON" if data.get("self_bot_enabled") else "OFF"; wel="ON" if data.get("welcome_enabled") else "OFF"
@@ -271,6 +306,56 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             out = "📚 شورت‌کات‌های فعلی:\n\nموردی ثبت نشده است."
         await q.edit_message_text(out, parse_mode=ParseMode.HTML, reply_markup=create_shortcut_menu_keyboard())
     elif q.data=="admin:shortcut_cfg": STATE.flow,STATE.step,STATE.admin_id,STATE.message_id,STATE.temp_shortcuts="shortcut_cfg","waiting_name",uid,q.message.message_id,{}; await q.edit_message_text("نام شورت‌کات را وارد کنید:", reply_markup=build_back_kb("admin:shortcut_menu"))
+    elif q.data=="admin:shortcut_delete_menu":
+        sc = db.load_shortcuts()
+        rows = [[create_danger_button(k, f"admin:shortcut_delete_pick:{k}")] for k in sc.keys()] if sc else []
+        rows.append([create_danger_button("بازگشت", "admin:shortcut_menu")])
+        await q.edit_message_text("انتخاب شورت‌کات برای حذف:", reply_markup=InlineKeyboardMarkup(rows))
+    elif q.data.startswith("admin:shortcut_delete_pick:"):
+        key = q.data.split(":", 3)[3]
+        await q.edit_message_text(f"حذف «{key}» تایید می‌شود؟", reply_markup=InlineKeyboardMarkup([[create_danger_button("تایید حذف", f"admin:shortcut_delete_confirm:{key}")], [create_primary_button("انصراف", "admin:shortcut_menu")]]))
+    elif q.data.startswith("admin:shortcut_delete_confirm:"):
+        key = q.data.split(":", 3)[3]
+        db.delete_shortcut(key)
+        await q.edit_message_text("شورت‌کات حذف شد.", reply_markup=create_shortcut_menu_keyboard())
+    elif q.data=="admin:shortcut_edit_menu":
+        sc = db.load_shortcuts()
+        rows = [[create_primary_button(k, f"admin:shortcut_edit_pick:{k}")] for k in sc.keys()] if sc else []
+        rows.append([create_danger_button("بازگشت", "admin:shortcut_menu")])
+        await q.edit_message_text("انتخاب شورت‌کات برای ویرایش:", reply_markup=InlineKeyboardMarkup(rows))
+    elif q.data.startswith("admin:shortcut_edit_pick:"):
+        key = q.data.split(":", 3)[3]
+        STATE.flow, STATE.step, STATE.admin_id, STATE.message_id, STATE.pending_key = "shortcut_edit", "choose_field", uid, q.message.message_id, key
+        await q.edit_message_text(f"شورت‌کات «{key}»\nکدام بخش ویرایش شود؟", reply_markup=InlineKeyboardMarkup([[create_primary_button("کلید", "admin:shortcut_edit_key"), create_primary_button("متن", "admin:shortcut_edit_value")], [create_danger_button("بازگشت", "admin:shortcut_menu")]]))
+    elif q.data=="admin:shortcut_edit_key":
+        STATE.step = "waiting_new_key"
+        await q.edit_message_text("کلید جدید را ارسال کنید:", reply_markup=build_back_kb("admin:shortcut_menu"))
+    elif q.data=="admin:shortcut_edit_value":
+        STATE.step = "waiting_new_value"
+        await q.edit_message_text("متن جدید را ارسال کنید:", reply_markup=build_back_kb("admin:shortcut_menu"))
+    elif q.data=="admin:watch_channel_cfg":
+        STATE.flow, STATE.step, STATE.admin_id, STATE.message_id = "watch_cfg", "waiting_channel_id", uid, q.message.message_id
+        await q.edit_message_text("آیدی عددی چنل گزارشات را با علامت - ارسال کنید.\nمثال: -1001234567890", reply_markup=build_back_kb("admin:shortcut_menu"))
+    elif q.data=="admin:watch_keywords_add":
+        STATE.flow, STATE.step, STATE.admin_id, STATE.message_id = "watch_cfg", "waiting_keywords_add", uid, q.message.message_id
+        await q.edit_message_text("کلمات مانیتور را با ویرگول بفرستید.\nمثال: نامحدود,تست,ربات سلف", reply_markup=build_back_kb("admin:shortcut_menu"))
+    elif q.data=="admin:watch_keywords_remove":
+        STATE.flow, STATE.step, STATE.admin_id, STATE.message_id = "watch_cfg", "waiting_keywords_remove", uid, q.message.message_id
+        await q.edit_message_text("کلمات جهت حذف را با ویرگول بفرستید.", reply_markup=build_back_kb("admin:shortcut_menu"))
+    elif q.data=="admin:watch_keywords_stats":
+        rows = db.hit_stats()
+        out = "📈 آمار کلمات مانیتور:\n\n" + ("\n".join([f"• {r['keyword']}: {r['cnt']}" for r in rows]) if rows else "فعلا آماری ثبت نشده.")
+        await q.edit_message_text(out, reply_markup=build_back_kb("admin:shortcut_menu"))
+    elif q.data=="admin:logs_menu":
+        await q.edit_message_text("یک لاگ را انتخاب کنید:", reply_markup=build_logs_keyboard(BASE_DIR))
+    elif q.data.startswith("admin:log_file:"):
+        name = q.data.split(":", 2)[2].split(":", 1)[-1]
+        fp = BASE_DIR / "logs" / name
+        if not fp.exists():
+            await q.edit_message_text("فایل لاگ یافت نشد.", reply_markup=build_back_kb("admin:logs_menu"))
+        else:
+            await context.bot.send_document(chat_id=uid, document=fp.open("rb"), filename=f"{name}-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}.txt")
+            await q.edit_message_text("فایل لاگ ارسال شد.", reply_markup=build_back_kb("admin:logs_menu"))
     elif q.data=="shortcut:continue_yes": STATE.step="waiting_name"; await q.edit_message_text("نام شورت‌کات بعدی را وارد کنید:", reply_markup=build_back_kb("admin:shortcut_menu"))
     elif q.data=="shortcut:continue_no":
         if STATE.temp_shortcuts:
@@ -356,6 +441,31 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
 async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if getattr(update,"business_message",None): await business_message_handler(update, context); return
     if not update.message or not update.effective_user: return
+    if update.effective_chat and update.effective_chat.type in {"group", "supergroup"}:
+        data = load_data()
+        kw = db.get_watch("watch_keywords", [])
+        report_chat = int(db.get_watch("watch_report_chat_id", 0) or 0)
+        txt_group = update.message.text or ""
+        lower = txt_group.lower()
+        for k in kw:
+            kk = str(k or "").strip()
+            if kk and kk.lower() in lower and report_chat:
+                db.add_keyword_hit(kk, update.effective_user.id, update.effective_user.username or "", update.effective_user.full_name or update.effective_user.first_name or "", update.effective_chat.id, update.effective_chat.title or "", txt_group)
+                report = (
+                    f"🔎 کلید یافت شد: #{kk.replace(' ', '_')}\n"
+                    f"👤 نام: {update.effective_user.full_name or update.effective_user.first_name}\n"
+                    f"🆔 عددی: {update.effective_user.id}\n"
+                    f"🔗 یوزرنیم: @{update.effective_user.username or '-'}\n"
+                    f"🕒 زمان: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
+                    f"💬 گروه: {update.effective_chat.title or '-'}\n\n"
+                    f"{txt_group}"
+                )
+                try:
+                    await context.bot.send_message(chat_id=report_chat, text=report)
+                except Exception as exc:
+                    logging.warning("watch_report_send_failed reason=%s", exc)
+                break
+        return
     data=load_data(); uid=update.effective_user.id; src_txt=text_with_custom_emoji_markup(update.message); txt=src_txt.strip()
     row=db.get_user(uid)
     if row and int(row["soft_ban_until"] or 0)>int(time.time()): return
@@ -393,6 +503,32 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         old=data.get("welcome_text",""); data["welcome_text"]=src_txt; save_data(data); STATE.flow=STATE.step=None
         preview = f"Welcome بروزرسانی شد.\nقبلی:\n{render_html_text(old)}\n\nجدید:\n{render_html_text(src_txt)}"
         await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=preview, parse_mode=ParseMode.HTML, reply_markup=create_admin_keyboard(data)); return
+    if STATE.admin_id==uid and STATE.flow=="watch_cfg" and can_edit_flow(uid):
+        if STATE.step=="waiting_channel_id":
+            raw = txt.strip()
+            try:
+                cid = int(raw)
+                if cid >= 0:
+                    raise ValueError()
+            except Exception:
+                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="فرمت نامعتبر است. نمونه: -1001234567890", reply_markup=build_back_kb("admin:shortcut_menu"))
+                return
+            db.set_watch("watch_report_chat_id", cid)
+            STATE.flow = STATE.step = None
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"چنل گزارشات ذخیره شد: {cid}", reply_markup=create_shortcut_menu_keyboard()); return
+        if STATE.step=="waiting_keywords_add":
+            old = db.get_watch("watch_keywords", [])
+            merged = list(dict.fromkeys(old + parse_keyword_csv(txt)))
+            db.set_watch("watch_keywords", merged)
+            STATE.flow = STATE.step = None
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"کلمات ذخیره شدند.\n{', '.join(merged) if merged else '-'}", reply_markup=create_shortcut_menu_keyboard()); return
+        if STATE.step=="waiting_keywords_remove":
+            old = db.get_watch("watch_keywords", [])
+            remove_set = {x.lower() for x in parse_keyword_csv(txt)}
+            left = [x for x in old if str(x).lower() not in remove_set]
+            db.set_watch("watch_keywords", left)
+            STATE.flow = STATE.step = None
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"حذف انجام شد.\nباقی‌مانده: {', '.join(left) if left else '-'}", reply_markup=create_shortcut_menu_keyboard()); return
 
     if not data.get("active", False) and not is_admin(uid, data):
         return
