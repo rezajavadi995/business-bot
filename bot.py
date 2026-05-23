@@ -142,8 +142,15 @@ def create_texts_keyboard() -> InlineKeyboardMarkup:
 
 
 def text_with_custom_emoji_markup(message) -> str:
+    """Return HTML-safe text that keeps Telegram premium custom emoji tags intact."""
+    if not message:
+        return ""
+    text_html = getattr(message, "text_html", None)
+    if text_html:
+        return text_html
+
     txt = message.text or ""
-    entities = list(message.entities or [])
+    entities = list(getattr(message, "entities", []) or [])
     for ent in sorted(entities, key=lambda e: e.offset, reverse=True):
         if getattr(ent, "type", None) == "custom_emoji" and getattr(ent, "custom_emoji_id", None):
             start = ent.offset
@@ -274,9 +281,9 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def business_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bm=getattr(update,"business_message",None)
     if not bm or not bm.text: return
-    data=load_data(); txt=bm.text.strip(); uid=(bm.from_user.id if bm.from_user else bm.chat.id)
+    data=load_data(); src_txt=text_with_custom_emoji_markup(bm); txt=src_txt.strip(); uid=(bm.from_user.id if bm.from_user else bm.chat.id)
     prev=db.get_user(uid)
-    db.upsert_user(uid,(bm.from_user.username if bm.from_user else "") or "",(bm.from_user.full_name if bm.from_user else bm.chat.full_name) or "",None,False,"business",txt)
+    db.upsert_user(uid,(bm.from_user.username if bm.from_user else "") or "",(bm.from_user.full_name if bm.from_user else bm.chat.full_name) or "",None,False,"business",src_txt)
     sc=db.load_shortcuts(); resp=match_shortcut(txt, sc)
     if resp:
         bc=getattr(bm,"business_connection_id",None)
@@ -289,7 +296,9 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
                 logging.info("business_admin_shortcut_delete_ok uid=%s msg_id=%s", uid, bm.message_id)
             except Exception as exc:
                 logging.exception("business_admin_shortcut_delete_failed uid=%s reason=%s", uid, exc)
-        kwargs={"chat_id":bm.chat.id,"text":f"<b>{preserve_tg_emoji_markup(resp)}</b>","parse_mode":ParseMode.HTML}
+        safe_resp = preserve_tg_emoji_markup(resp)
+        out_text = f"<b>{safe_resp}</b>" if data.get("bold_mode", True) else safe_resp
+        kwargs={"chat_id":bm.chat.id,"text":out_text,"parse_mode":ParseMode.HTML}
         if bc: kwargs["business_connection_id"]=bc
         await context.bot.send_message(**kwargs)
         logging.info("business_shortcut_sent uid=%s text=%s",uid, txt)
@@ -297,7 +306,9 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
     logging.info("business_shortcut_no_match uid=%s text=%s", uid, txt)
     if data.get("welcome_enabled",True) and (prev is None or int(prev["last_seen_at"] or 0)<=0 or int(time.time())-int(prev["last_seen_at"] or 0)>=WELCOME_COOLDOWN_SECONDS):
         try:
-            await context.bot.send_message(chat_id=bm.chat.id, text=f"<b>{preserve_tg_emoji_markup(data.get('welcome_text','خوش آمدید'))}</b>", parse_mode=ParseMode.HTML, business_connection_id=getattr(bm,"business_connection_id",None))
+            safe_welcome = preserve_tg_emoji_markup(data.get("welcome_text", "خوش آمدید"))
+            out_welcome = f"<b>{safe_welcome}</b>" if data.get("bold_mode", True) else safe_welcome
+            await context.bot.send_message(chat_id=bm.chat.id, text=out_welcome, parse_mode=ParseMode.HTML, business_connection_id=getattr(bm,"business_connection_id",None))
             logging.info("welcome_trigger_business uid=%s", uid)
         except Exception as exc:
             logging.exception("welcome_business_failed uid=%s reason=%s", uid, exc)
@@ -357,9 +368,20 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     resp=match_shortcut(txt,shortcuts)
     if resp:
         if data.get("self_bot_enabled") and is_admin(uid,data):
-            try: await update.message.delete()
-            except Exception: pass
-            await send_formatted_message(update.message, resp, data); return
+            safe_resp = preserve_tg_emoji_markup(resp)
+            out_text = f"<b>{safe_resp}</b>" if data.get("bold_mode", True) else safe_resp
+            try:
+                await update.message.edit_text(out_text, parse_mode=ParseMode.HTML)
+                logging.info("admin_shortcut_edit_ok uid=%s msg_id=%s", uid, update.message.message_id)
+            except Exception as exc:
+                logging.warning("admin_shortcut_edit_failed uid=%s msg_id=%s reason=%s", uid, update.message.message_id, exc)
+                try:
+                    await update.message.delete()
+                    logging.info("admin_shortcut_delete_ok uid=%s msg_id=%s", uid, update.message.message_id)
+                except Exception as delete_exc:
+                    logging.warning("admin_shortcut_delete_failed uid=%s msg_id=%s reason=%s", uid, update.message.message_id, delete_exc)
+                await send_formatted_message(update.message, resp, data)
+            return
         if not is_admin(uid,data): await send_formatted_message(update.message, resp, data); return
 
     if data["active"] and not is_admin(uid,data): await send_formatted_message(update.message, data.get("offline_message",""), data)
