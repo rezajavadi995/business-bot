@@ -165,6 +165,19 @@ def create_shortcut_menu_keyboard() -> InlineKeyboardMarkup:
 def parse_keyword_csv(raw: str) -> list[str]:
     return [x.strip() for x in str(raw or "").split(",") if x.strip()]
 
+
+def build_shortcut_pick_keyboard(shortcuts: dict[str, str], prefix: str, map_key: str) -> InlineKeyboardMarkup:
+    token_map: dict[str, str] = {}
+    rows = []
+    for idx, key in enumerate(shortcuts.keys(), start=1):
+        token = f"s{idx}"
+        token_map[token] = key
+        label = key if len(key) <= 40 else f"{key[:37]}..."
+        rows.append([create_primary_button(label, f"{prefix}:{token}")])
+    db.set_watch(map_key, token_map)
+    rows.append([create_danger_button("بازگشت", "admin:shortcut_menu")])
+    return InlineKeyboardMarkup(rows)
+
 def create_admin_keyboard(data: dict[str, Any]) -> InlineKeyboardMarkup:
     status = "روشن" if data["active"] else "خاموش"
     locked = " ⛔️" if not data.get("active", False) else ""
@@ -321,11 +334,13 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif q.data=="admin:shortcut_cfg": STATE.flow,STATE.step,STATE.admin_id,STATE.message_id,STATE.temp_shortcuts="shortcut_cfg","waiting_name",uid,q.message.message_id,{}; await q.edit_message_text("نام شورت‌کات را وارد کنید:", reply_markup=build_back_kb("admin:shortcut_menu"))
     elif q.data=="admin:shortcut_delete_menu":
         sc = db.load_shortcuts()
-        rows = [[create_danger_button(k, f"admin:shortcut_delete_pick:{k}")] for k in sc.keys()] if sc else []
-        rows.append([create_danger_button("بازگشت", "admin:shortcut_menu")])
-        await q.edit_message_text("انتخاب شورت‌کات برای حذف:", reply_markup=InlineKeyboardMarkup(rows))
+        kb = build_shortcut_pick_keyboard(sc, "admin:shortcut_delete_pick", "shortcut_delete_tokens") if sc else InlineKeyboardMarkup([[create_danger_button("بازگشت", "admin:shortcut_menu")]])
+        await q.edit_message_text("انتخاب شورت‌کات برای حذف:", reply_markup=kb)
     elif q.data.startswith("admin:shortcut_delete_pick:"):
-        key = q.data.split(":", 3)[3]
+        token = q.data.split(":", 3)[3]
+        key = db.get_watch("shortcut_delete_tokens", {}).get(token)
+        if not key:
+            await q.edit_message_text("آیتم معتبر نیست. دوباره لیست را باز کنید.", reply_markup=create_shortcut_menu_keyboard()); return
         await q.edit_message_text(f"حذف «{key}» تایید می‌شود؟", reply_markup=InlineKeyboardMarkup([[create_danger_button("تایید حذف", f"admin:shortcut_delete_confirm:{key}")], [create_primary_button("انصراف", "admin:shortcut_menu")]]))
     elif q.data.startswith("admin:shortcut_delete_confirm:"):
         key = q.data.split(":", 3)[3]
@@ -333,11 +348,13 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("شورت‌کات حذف شد.", reply_markup=create_shortcut_menu_keyboard())
     elif q.data=="admin:shortcut_edit_menu":
         sc = db.load_shortcuts()
-        rows = [[create_primary_button(k, f"admin:shortcut_edit_pick:{k}")] for k in sc.keys()] if sc else []
-        rows.append([create_danger_button("بازگشت", "admin:shortcut_menu")])
-        await q.edit_message_text("انتخاب شورت‌کات برای ویرایش:", reply_markup=InlineKeyboardMarkup(rows))
+        kb = build_shortcut_pick_keyboard(sc, "admin:shortcut_edit_pick", "shortcut_edit_tokens") if sc else InlineKeyboardMarkup([[create_danger_button("بازگشت", "admin:shortcut_menu")]])
+        await q.edit_message_text("انتخاب شورت‌کات برای ویرایش:", reply_markup=kb)
     elif q.data.startswith("admin:shortcut_edit_pick:"):
-        key = q.data.split(":", 3)[3]
+        token = q.data.split(":", 3)[3]
+        key = db.get_watch("shortcut_edit_tokens", {}).get(token)
+        if not key:
+            await q.edit_message_text("آیتم معتبر نیست. دوباره لیست را باز کنید.", reply_markup=create_shortcut_menu_keyboard()); return
         STATE.flow, STATE.step, STATE.admin_id, STATE.message_id, STATE.pending_key = "shortcut_edit", "choose_field", uid, q.message.message_id, key
         await q.edit_message_text(f"شورت‌کات «{key}»\nکدام بخش ویرایش شود؟", reply_markup=InlineKeyboardMarkup([[create_primary_button("کلید", "admin:shortcut_edit_key"), create_primary_button("متن", "admin:shortcut_edit_value")], [create_danger_button("بازگشت", "admin:shortcut_menu")]]))
     elif q.data=="admin:shortcut_edit_key":
@@ -528,6 +545,33 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kb=InlineKeyboardMarkup([[create_success_button("ادامه","shortcut:continue_yes"),create_danger_button("پایان","shortcut:continue_no")]])
             await context.bot.edit_message_text(chat_id=update.effective_chat.id,message_id=STATE.message_id,text="آیا ادامه می‌دهید؟",reply_markup=kb)
             return
+    if STATE.admin_id==uid and STATE.flow=="shortcut_edit" and can_edit_flow(uid):
+        old_key = (STATE.pending_key or "").strip()
+        if not old_key:
+            STATE.flow = STATE.step = STATE.pending_key = None
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="کلید قبلی یافت نشد. دوباره از منو وارد شوید.", reply_markup=create_shortcut_menu_keyboard()); return
+        sc = db.load_shortcuts()
+        if STATE.step=="waiting_new_key":
+            new_key = txt.strip()
+            if not new_key:
+                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="کلید جدید خالی است. دوباره وارد کنید.", reply_markup=build_back_kb("admin:shortcut_menu")); return
+            if old_key not in sc:
+                STATE.flow = STATE.step = STATE.pending_key = None
+                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="شورت‌کات قبلی پیدا نشد.", reply_markup=create_shortcut_menu_keyboard()); return
+            if new_key != old_key and new_key in sc:
+                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="این کلید قبلاً وجود دارد. کلید دیگری بفرستید.", reply_markup=build_back_kb("admin:shortcut_menu")); return
+            val = sc[old_key]
+            db.delete_shortcut(old_key)
+            db.save_shortcuts({new_key: val})
+            STATE.flow = STATE.step = STATE.pending_key = None
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"کلید شورت‌کات تغییر کرد:\n{old_key} -> {new_key}", reply_markup=create_shortcut_menu_keyboard()); return
+        if STATE.step=="waiting_new_value":
+            if old_key not in sc:
+                STATE.flow = STATE.step = STATE.pending_key = None
+                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="شورت‌کات پیدا نشد.", reply_markup=create_shortcut_menu_keyboard()); return
+            db.save_shortcuts({old_key: src_txt})
+            STATE.flow = STATE.step = STATE.pending_key = None
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="متن شورت‌کات بروزرسانی شد.", reply_markup=create_shortcut_menu_keyboard()); return
     if STATE.admin_id==uid and STATE.flow=="welcome_cfg" and STATE.step=="waiting_value" and can_edit_flow(uid):
         old=data.get("welcome_text",""); data["welcome_text"]=src_txt; save_data(data); STATE.flow=STATE.step=None
         preview = f"Welcome بروزرسانی شد.\nقبلی:\n{render_html_text(old)}\n\nجدید:\n{render_html_text(src_txt)}"
