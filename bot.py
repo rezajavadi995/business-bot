@@ -145,10 +145,6 @@ def text_with_custom_emoji_markup(message) -> str:
     """Return HTML-safe text that keeps Telegram premium custom emoji tags intact."""
     if not message:
         return ""
-    text_html = getattr(message, "text_html", None)
-    if text_html:
-        return text_html
-
     txt = message.text or ""
     entities = list(getattr(message, "entities", []) or [])
     for ent in sorted(entities, key=lambda e: e.offset, reverse=True):
