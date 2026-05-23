@@ -184,7 +184,7 @@ def create_admin_keyboard(data: dict[str, Any]) -> InlineKeyboardMarkup:
     selfb = ("ON" if data.get("self_bot_enabled") else "OFF") + locked
     wel = ("ON" if data.get("welcome_enabled") else "OFF") + locked
     status_btn=create_success_button(f"وضعیت ربات: {status}","toggle:active") if data["active"] else create_danger_button(f"وضعیت ربات: {status}","toggle:active")
-    return InlineKeyboardMarkup([[status_btn],[create_primary_button("ویرایش متن‌ها","admin:texts"),create_primary_button("فیچرها","admin:features")],[create_success_button("گزارش وضعیت","admin:report"),create_danger_button("راهنمای برودکست","admin:broadcast_help")],[create_primary_button(f"Self Bot: {selfb}","admin:selfbot"),create_primary_button("مدیریت سلف بات","admin:shortcut_menu")],[create_primary_button(f"Welcome: {wel}","admin:welcome_toggle"),create_primary_button("پیکربندی Welcome","admin:welcome_cfg")],[create_primary_button("لاگ‌ها","admin:logs_menu"), create_primary_button("پیام‌های بازخورد","admin:feedback_list")],[create_danger_button("بازگشت","menu:admin")]])
+    return InlineKeyboardMarkup([[status_btn],[create_primary_button("ویرایش متن‌ها","admin:texts"),create_primary_button("فیچرها","admin:features")],[create_success_button("گزارش وضعیت","admin:report"),create_danger_button("راهنمای برودکست","admin:broadcast_help")],[create_primary_button(f"Self Bot: {selfb}","admin:selfbot"),create_primary_button("مدیریت سلف بات","admin:shortcut_menu")],[create_primary_button(f"Welcome: {wel}","admin:welcome_toggle"),create_primary_button("پیکربندی Welcome","admin:welcome_cfg")],[create_primary_button("بک‌آپ دیتابیس","admin:db_export"), create_primary_button("ایمپورت دیتابیس","admin:db_import")],[create_primary_button("لاگ‌ها","admin:logs_menu"), create_primary_button("پیام‌های بازخورد","admin:feedback_list")],[create_danger_button("بازگشت","menu:admin")]])
 
 def create_features_keyboard(data: dict[str, Any]) -> InlineKeyboardMarkup:
     rows=[[create_primary_button(f"{'✅' if data['features'].get(k) else '❌'} {k}",f"feature:{k}")] for k in ADMIN_FEATURES+USER_FEATURES]; rows.append([create_danger_button("بازگشت","menu:admin")]); return InlineKeyboardMarkup(rows)
@@ -341,9 +341,13 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         key = db.get_watch("shortcut_delete_tokens", {}).get(token)
         if not key:
             await q.edit_message_text("آیتم معتبر نیست. دوباره لیست را باز کنید.", reply_markup=create_shortcut_menu_keyboard()); return
-        await q.edit_message_text(f"حذف «{key}» تایید می‌شود؟", reply_markup=InlineKeyboardMarkup([[create_danger_button("تایید حذف", f"admin:shortcut_delete_confirm:{key}")], [create_primary_button("انصراف", "admin:shortcut_menu")]]))
+        db.set_watch("shortcut_delete_confirm_token", {"x": key})
+        await q.edit_message_text(f"حذف «{key}» تایید می‌شود؟", reply_markup=InlineKeyboardMarkup([[create_danger_button("تایید حذف", "admin:shortcut_delete_confirm:x")], [create_primary_button("انصراف", "admin:shortcut_menu")]]))
     elif q.data.startswith("admin:shortcut_delete_confirm:"):
-        key = q.data.split(":", 3)[3]
+        token = q.data.split(":", 3)[3]
+        key = db.get_watch("shortcut_delete_confirm_token", {}).get(token)
+        if not key:
+            await q.edit_message_text("آیتم معتبر نیست.", reply_markup=create_shortcut_menu_keyboard()); return
         db.delete_shortcut(key)
         await q.edit_message_text("شورت‌کات حذف شد.", reply_markup=create_shortcut_menu_keyboard())
     elif q.data=="admin:shortcut_edit_menu":
@@ -373,9 +377,17 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         STATE.flow, STATE.step, STATE.admin_id, STATE.message_id = "watch_cfg", "waiting_keywords_remove", uid, q.message.message_id
         await q.edit_message_text("کلمات جهت حذف را با ویرگول بفرستید.", reply_markup=build_back_kb("admin:shortcut_menu"))
     elif q.data=="admin:watch_keywords_stats":
-        rows = db.hit_stats()
-        out = "📈 آمار کلمات مانیتور:\n\n" + ("\n".join([f"• {r['keyword']}: {r['cnt']}" for r in rows]) if rows else "فعلا آماری ثبت نشده.")
+        configured = db.get_watch("watch_keywords", [])
+        rows = {r["keyword"]: r["cnt"] for r in db.hit_stats()}
+        out = "📚 مشاهده کلمات مانیتور:\n\n" + ("\n".join([f"• {k}: {rows.get(k, 0)} hit" for k in configured]) if configured else "کلمه‌ای ثبت نشده.")
         await q.edit_message_text(out, reply_markup=build_back_kb("admin:shortcut_menu"))
+    elif q.data=="admin:db_export":
+        stamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        await context.bot.send_document(chat_id=uid, document=DB_PATH.open("rb"), filename=f"bot-backup-{stamp}.db")
+        await q.edit_message_text("بک‌آپ دیتابیس ارسال شد.", reply_markup=create_admin_keyboard(data))
+    elif q.data=="admin:db_import":
+        STATE.flow, STATE.step, STATE.admin_id, STATE.message_id = "db_import", "waiting_document", uid, q.message.message_id
+        await q.edit_message_text("فایل دیتابیس (.db) را همینجا ارسال کنید.", reply_markup=build_back_kb("menu:admin"))
     elif q.data=="admin:logs_menu":
         await q.edit_message_text("یک لاگ را انتخاب کنید:", reply_markup=build_logs_keyboard(BASE_DIR))
     elif q.data.startswith("admin:log_file:"):
@@ -486,6 +498,22 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
 async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if getattr(update,"business_message",None): await business_message_handler(update, context); return
     if not update.message or not update.effective_user: return
+    if STATE.admin_id == (update.effective_user.id if update.effective_user else None) and STATE.flow == "db_import" and STATE.step == "waiting_document":
+        doc = update.message.document
+        if not doc:
+            await update.message.reply_text("لطفاً فایل .db ارسال کنید.")
+            return
+        file = await doc.get_file()
+        tmp = BASE_DIR / "bot.new.db"
+        await file.download_to_drive(custom_path=str(tmp))
+        backup_old = BASE_DIR / f"bot.backup.{int(time.time())}.db"
+        if DB_PATH.exists():
+            DB_PATH.replace(backup_old)
+        tmp.replace(DB_PATH)
+        STATE.flow = STATE.step = None
+        await update.message.reply_text("✅ دیتابیس جدید جایگزین شد. ربات در حال ریلود...")
+        os.execlp("python", "python", str(BASE_DIR / "bot.py"))
+        return
     if update.effective_chat and update.effective_chat.type in {"group", "supergroup"}:
         data = load_data()
         kw = db.get_watch("watch_keywords", [])
@@ -588,7 +616,13 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             db.set_watch("watch_report_chat_id", cid)
             STATE.flow = STATE.step = None
-            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"چنل گزارشات ذخیره شد: {cid}", reply_markup=create_shortcut_menu_keyboard()); return
+            test_ok = "نامشخص"
+            try:
+                me = await context.bot.get_chat_member(cid, context.bot.id)
+                test_ok = f"ok: {getattr(me, 'status', 'unknown')}"
+            except Exception as exc:
+                test_ok = f"failed: {exc}"
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"چنل گزارشات ذخیره شد: {cid}\nوضعیت دسترسی ربات: {test_ok}", reply_markup=create_shortcut_menu_keyboard()); return
         if STATE.step=="waiting_keywords_add":
             old = db.get_watch("watch_keywords", [])
             merged = list(dict.fromkeys(old + parse_keyword_csv(txt)))
@@ -624,6 +658,8 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(admin_id, f"شما یک پیام جدید دارید از طرف {update.effective_user.full_name or update.effective_user.first_name}", reply_markup=kb)
         return
 
+    if not data.get("self_bot_enabled", False):
+        return
     resp=match_shortcut(txt,shortcuts)
     if resp:
         if data.get("self_bot_enabled") and is_admin(uid,data):
