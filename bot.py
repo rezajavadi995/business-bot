@@ -170,10 +170,14 @@ def preserve_tg_emoji_markup(raw: str) -> str:
     return escaped
 
 
+
+
+def render_html_text(raw: str, bold: bool=False) -> str:
+    safe = preserve_tg_emoji_markup(raw if raw is not None else "")
+    return f"<b>{safe}</b>" if bold else safe
+
 async def send_formatted_message(target, text: str, data: dict[str, Any]):
-    safe = preserve_tg_emoji_markup(text if text is not None else "")
-    if data.get("bold_mode", True): safe = f"<b>{safe}</b>"
-    await target.reply_text(safe, parse_mode=ParseMode.HTML)
+    await target.reply_text(render_html_text(text, bold=data.get("bold_mode", True)), parse_mode=ParseMode.HTML)
 
 def is_spam(text: str, shortcuts: dict[str, str]) -> bool:
     words=re.findall(r"\w+", text.lower());
@@ -188,14 +192,13 @@ def is_spam(text: str, shortcuts: dict[str, str]) -> bool:
     return False
 
 def match_shortcut(text: str, shortcuts: dict[str, str]) -> str | None:
-    t = text.lower().strip()
-    for k, v in shortcuts.items():
-        if not k or not str(k).strip():
-            continue
-        kk = str(k).strip().lower()
-        pattern = rf"(^|[^\w]){re.escape(kk)}([^\w]|$)"
-        if re.search(pattern, t):
-            return v
+    t = (text or "").strip().lower()
+    if not t:
+        return None
+    keys = sorted((str(k).strip() for k in shortcuts.keys() if k and str(k).strip()), key=len, reverse=True)
+    for kk in keys:
+        if t == kk.lower():
+            return shortcuts.get(kk) if kk in shortcuts else next((v for k, v in shortcuts.items() if str(k).strip().lower() == kk.lower()), None)
     return None
 
 async def maybe_welcome(update: Update, data: dict[str, Any], uid: int, source: str) -> bool:
@@ -298,16 +301,25 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
     if resp:
         bc=getattr(bm,"business_connection_id",None)
         if data.get("self_bot_enabled") and is_admin(uid, data):
+            out_self = render_html_text(resp, bold=data.get("bold_mode", True))
             try:
-                del_kwargs = {"chat_id": bm.chat.id, "message_id": bm.message_id}
+                edit_kwargs = {"chat_id": bm.chat.id, "message_id": bm.message_id, "text": out_self, "parse_mode": ParseMode.HTML}
                 if bc:
-                    del_kwargs["business_connection_id"] = bc
-                await context.bot.delete_message(**del_kwargs)
-                logging.info("business_admin_shortcut_delete_ok uid=%s msg_id=%s", uid, bm.message_id)
+                    edit_kwargs["business_connection_id"] = bc
+                await context.bot.edit_message_text(**edit_kwargs)
+                logging.info("business_admin_shortcut_edit_ok uid=%s msg_id=%s", uid, bm.message_id)
+                return
             except Exception as exc:
-                logging.exception("business_admin_shortcut_delete_failed uid=%s reason=%s", uid, exc)
-        safe_resp = preserve_tg_emoji_markup(resp)
-        out_text = f"<b>{safe_resp}</b>" if data.get("bold_mode", True) else safe_resp
+                logging.warning("business_admin_shortcut_edit_failed uid=%s reason=%s", uid, exc)
+                try:
+                    del_kwargs = {"chat_id": bm.chat.id, "message_id": bm.message_id}
+                    if bc:
+                        del_kwargs["business_connection_id"] = bc
+                    await context.bot.delete_message(**del_kwargs)
+                    logging.info("business_admin_shortcut_delete_ok uid=%s msg_id=%s", uid, bm.message_id)
+                except Exception as delete_exc:
+                    logging.warning("business_admin_shortcut_delete_failed uid=%s reason=%s", uid, delete_exc)
+        out_text = render_html_text(resp, bold=data.get("bold_mode", True))
         kwargs={"chat_id":bm.chat.id,"text":out_text,"parse_mode":ParseMode.HTML}
         if bc: kwargs["business_connection_id"]=bc
         await context.bot.send_message(**kwargs)
@@ -316,8 +328,7 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
     logging.info("business_shortcut_no_match uid=%s text=%s", uid, txt)
     if data.get("welcome_enabled",True) and (prev is None or int(prev["last_seen_at"] or 0)<=0 or int(time.time())-int(prev["last_seen_at"] or 0)>=WELCOME_COOLDOWN_SECONDS):
         try:
-            safe_welcome = preserve_tg_emoji_markup(data.get("welcome_text", "خوش آمدید"))
-            out_welcome = f"<b>{safe_welcome}</b>" if data.get("bold_mode", True) else safe_welcome
+            out_welcome = render_html_text(data.get("welcome_text", "خوش آمدید"), bold=data.get("bold_mode", True))
             await context.bot.send_message(chat_id=bm.chat.id, text=out_welcome, parse_mode=ParseMode.HTML, business_connection_id=getattr(bm,"business_connection_id",None))
             logging.info("welcome_trigger_business uid=%s", uid)
         except Exception as exc:
@@ -331,9 +342,19 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if row and int(row["soft_ban_until"] or 0)>int(time.time()): return
     db.upsert_user(uid, update.effective_user.username or "", update.effective_user.full_name or update.effective_user.first_name or "", update.message.contact.phone_number if update.message.contact else None, False, "message", txt)
 
+    if txt.lower()=="panel":
+        if is_admin(uid,data):
+            await update.message.reply_text("پنل ادمین", reply_markup=create_admin_keyboard(data))
+        return
+    if txt.lower()=="menu":
+        logging.info("user_menu_open uid=%s", uid)
+        await update.message.reply_text("منوی کاربر", reply_markup=create_menu_keyboard())
+        return
+
     if STATE.admin_id==uid and STATE.flow=="text_edit" and STATE.step=="waiting_value" and STATE.pending_key and can_edit_flow(uid):
         key=STATE.pending_key; old=data.get(key,""); data[key]=src_txt; save_data(data); STATE.flow=STATE.step=STATE.pending_key=None
-        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"ذخیره شد.\nمتن قبلی:\n{old or '(خالی)'}\n\nمتن جدید:\n{txt}", reply_markup=create_texts_keyboard()); return
+        preview = f"ذخیره شد.\nمتن قبلی:\n{render_html_text(old or '(خالی)')}\n\nمتن جدید:\n{render_html_text(src_txt)}"
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=preview, parse_mode=ParseMode.HTML, reply_markup=create_texts_keyboard()); return
     if STATE.admin_id==uid and STATE.flow=="shortcut_cfg" and can_edit_flow(uid):
         if STATE.step=="waiting_name": STATE.pending_key=txt; STATE.step="waiting_value"; await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"نام شورت‌کات: {txt}\nمتن شورت‌کات را وارد کنید:", reply_markup=build_back_kb("admin:shortcut_menu")); return
         if STATE.step=="waiting_value":
@@ -348,20 +369,14 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
     if STATE.admin_id==uid and STATE.flow=="welcome_cfg" and STATE.step=="waiting_value" and can_edit_flow(uid):
         old=data.get("welcome_text",""); data["welcome_text"]=src_txt; save_data(data); STATE.flow=STATE.step=None
-        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"Welcome بروزرسانی شد.\nقبلی:\n{old}\n\nجدید:\n{txt}", reply_markup=create_admin_keyboard(data)); return
+        preview = f"Welcome بروزرسانی شد.\nقبلی:\n{render_html_text(old)}\n\nجدید:\n{render_html_text(src_txt)}"
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=preview, parse_mode=ParseMode.HTML, reply_markup=create_admin_keyboard(data)); return
 
     shortcuts=db.load_shortcuts()
     if is_spam(txt,shortcuts):
         ban_until = int(time.time())+SOFT_BAN_SECONDS
         db.set_soft_ban(uid, ban_until)
         logging.warning("anti_spam_trigger uid=%s ban_until=%s text=%s", uid, ban_until, txt)
-        return
-
-    if txt.lower()=="panel":
-        if is_admin(uid,data): await update.message.reply_text("پنل ادمین", reply_markup=create_admin_keyboard(data)); return
-    if txt.lower()=="menu":
-        logging.info("user_menu_open uid=%s", uid)
-        await update.message.reply_text("منوی کاربر", reply_markup=create_menu_keyboard())
         return
 
     if db.get_json(f"feedback_wait:{uid}", False):
