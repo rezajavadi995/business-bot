@@ -143,7 +143,7 @@ def create_texts_keyboard() -> InlineKeyboardMarkup:
 
 
 def text_with_custom_emoji_markup(message) -> str:
-    """Return HTML-safe text that keeps Telegram premium custom emoji tags intact."""
+    """Keep source text unchanged except wrapping custom emoji entities as tg-emoji HTML tags."""
     if not message:
         return ""
     txt = message.text or ""
@@ -152,7 +152,12 @@ def text_with_custom_emoji_markup(message) -> str:
         if getattr(ent, "type", None) == "custom_emoji" and getattr(ent, "custom_emoji_id", None):
             start = ent.offset
             end = ent.offset + ent.length
-            original = (txt[start:end] or "🙂").replace("\n", "").strip() or "🙂"
+            try:
+                original = message.parse_entity(ent)
+            except Exception:
+                original = txt[start:end] if 0 <= start <= end <= len(txt) else "🙂"
+            if original == "":
+                original = "🙂"
             tag = f'<tg-emoji emoji-id="{ent.custom_emoji_id}">{original}</tg-emoji>'
             txt = txt[:start] + tag + txt[end:]
     return txt
@@ -195,10 +200,10 @@ def match_shortcut(text: str, shortcuts: dict[str, str]) -> str | None:
     t = (text or "").strip().lower()
     if not t:
         return None
-    keys = sorted((str(k).strip() for k in shortcuts.keys() if k and str(k).strip()), key=len, reverse=True)
-    for kk in keys:
-        if t == kk.lower():
-            return shortcuts.get(kk) if kk in shortcuts else next((v for k, v in shortcuts.items() if str(k).strip().lower() == kk.lower()), None)
+    for key, value in shortcuts.items():
+        kk = str(key or "").strip().lower()
+        if kk and t == kk:
+            return value
     return None
 
 async def maybe_welcome(update: Update, data: dict[str, Any], uid: int, source: str) -> bool:
@@ -227,7 +232,9 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not q: return
     await q.answer(); data=load_data(); uid=q.from_user.id
     if q.data.startswith("user:"):
-        if not data["active"]: await q.message.reply_text("ربات خاموش است."); return
+        if not data.get("active", False):
+            await q.message.reply_text("ربات خاموش است.")
+            return
         if q.data=="user:feedback": db.set_json(f"feedback_wait:{uid}", True)
         mapping={"user:services":data.get("service_text") or "متن خدمات ثبت نشده.","user:hours":data.get("hours_text") or "متن ساعات کاری ثبت نشده.","user:location":data.get("location_text") or "متن آدرس ثبت نشده.","user:faq":data.get("faq_text") or "متن FAQ ثبت نشده.","user:contact":data.get("contact_text") or "متن تماس ثبت نشده.","user:feedback":data.get("feedback_prompt_text") or "لطفاً بازخورد خود را ارسال کنید."}
         msg=mapping.get(q.data)
@@ -252,8 +259,17 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif q.data=="admin:selfbot": data["self_bot_enabled"]=not data.get("self_bot_enabled",False); save_data(data); await q.edit_message_text("وضعیت Self Bot تغییر کرد.", reply_markup=create_admin_keyboard(data))
     elif q.data=="admin:shortcut_menu": await q.edit_message_text("مدیریت سلف بات", reply_markup=create_shortcut_menu_keyboard())
     elif q.data=="admin:shortcut_view":
-        sc=db.load_shortcuts(); out="📚 شورت‌کات‌های فعلی:\n\n" + ("\n".join([f"• {k} => {v}" for k,v in sc.items()]) if sc else "موردی ثبت نشده است.")
-        await q.edit_message_text(out, reply_markup=create_shortcut_menu_keyboard())
+        sc = db.load_shortcuts()
+        if sc:
+            lines = []
+            for k, v in sc.items():
+                safe_key = html.escape(str(k))
+                safe_val = preserve_tg_emoji_markup(str(v))
+                lines.append(f"• {safe_key} => {safe_val}")
+            out = "📚 شورت‌کات‌های فعلی:\n\n" + "\n".join(lines)
+        else:
+            out = "📚 شورت‌کات‌های فعلی:\n\nموردی ثبت نشده است."
+        await q.edit_message_text(out, parse_mode=ParseMode.HTML, reply_markup=create_shortcut_menu_keyboard())
     elif q.data=="admin:shortcut_cfg": STATE.flow,STATE.step,STATE.admin_id,STATE.message_id,STATE.temp_shortcuts="shortcut_cfg","waiting_name",uid,q.message.message_id,{}; await q.edit_message_text("نام شورت‌کات را وارد کنید:", reply_markup=build_back_kb("admin:shortcut_menu"))
     elif q.data=="shortcut:continue_yes": STATE.step="waiting_name"; await q.edit_message_text("نام شورت‌کات بعدی را وارد کنید:", reply_markup=build_back_kb("admin:shortcut_menu"))
     elif q.data=="shortcut:continue_no":
@@ -295,6 +311,9 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
         logging.info("business_update_skipped_stale msg_id=%s date=%s", getattr(bm, "message_id", None), getattr(bm, "date", None))
         return
     data=load_data(); src_txt=text_with_custom_emoji_markup(bm); txt=src_txt.strip(); uid=(bm.from_user.id if bm.from_user else bm.chat.id)
+    if not data.get("active", False) and not is_admin(uid, data):
+        logging.info("business_ignored_bot_inactive uid=%s", uid)
+        return
     prev=db.get_user(uid)
     db.upsert_user(uid,(bm.from_user.username if bm.from_user else "") or "",(bm.from_user.full_name if bm.from_user else bm.chat.full_name) or "",None,False,"business",src_txt)
     sc=db.load_shortcuts(); resp=match_shortcut(txt, sc)
@@ -342,11 +361,14 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if row and int(row["soft_ban_until"] or 0)>int(time.time()): return
     db.upsert_user(uid, update.effective_user.username or "", update.effective_user.full_name or update.effective_user.first_name or "", update.message.contact.phone_number if update.message.contact else None, False, "message", txt)
 
-    if txt.lower()=="panel":
-        if is_admin(uid,data):
-            await update.message.reply_text("پنل ادمین", reply_markup=create_admin_keyboard(data))
+    if txt.lower()=="panel" and is_admin(uid,data):
+        STATE.flow=STATE.step=STATE.pending_key=None
+        STATE.temp_shortcuts=None
+        await update.message.reply_text("پنل ادمین", reply_markup=create_admin_keyboard(data))
         return
     if txt.lower()=="menu":
+        if not data.get("active", False) and not is_admin(uid, data):
+            return
         logging.info("user_menu_open uid=%s", uid)
         await update.message.reply_text("منوی کاربر", reply_markup=create_menu_keyboard())
         return
@@ -372,6 +394,9 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         preview = f"Welcome بروزرسانی شد.\nقبلی:\n{render_html_text(old)}\n\nجدید:\n{render_html_text(src_txt)}"
         await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=preview, parse_mode=ParseMode.HTML, reply_markup=create_admin_keyboard(data)); return
 
+    if not data.get("active", False) and not is_admin(uid, data):
+        return
+
     shortcuts=db.load_shortcuts()
     if is_spam(txt,shortcuts):
         ban_until = int(time.time())+SOFT_BAN_SECONDS
@@ -393,8 +418,7 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     resp=match_shortcut(txt,shortcuts)
     if resp:
         if data.get("self_bot_enabled") and is_admin(uid,data):
-            safe_resp = preserve_tg_emoji_markup(resp)
-            out_text = f"<b>{safe_resp}</b>" if data.get("bold_mode", True) else safe_resp
+            out_text = render_html_text(resp, bold=data.get("bold_mode", True))
             try:
                 await update.message.edit_text(out_text, parse_mode=ParseMode.HTML)
                 logging.info("admin_shortcut_edit_ok uid=%s msg_id=%s", uid, update.message.message_id)
