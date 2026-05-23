@@ -300,7 +300,7 @@ def is_fresh_business_update(message_date) -> bool:
     if message_date is None:
         return True
     try:
-        return int(message_date.timestamp()) >= (START_TIME - BUSINESS_UPDATE_FRESHNESS_SECONDS)
+        return int(message_date.timestamp()) >= (int(time.time()) - BUSINESS_UPDATE_FRESHNESS_SECONDS)
     except Exception:
         return True
 
