@@ -7,6 +7,7 @@ import sqlite3
 import time
 from datetime import datetime
 from dataclasses import dataclass
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +16,7 @@ from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
-from features.log_export import build_logs_keyboard
+from features.log_export import build_logs_keyboard, humanize_log_text
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
@@ -349,12 +350,23 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif q.data=="admin:logs_menu":
         await q.edit_message_text("یک لاگ را انتخاب کنید:", reply_markup=build_logs_keyboard(BASE_DIR))
     elif q.data.startswith("admin:log_file:"):
-        name = q.data.split(":", 2)[2].split(":", 1)[-1]
-        fp = BASE_DIR / "logs" / name
+        name = q.data.split(":", 2)[2]
+        fp = (BASE_DIR / name).resolve()
+        logs_root = (BASE_DIR / "logs").resolve()
+        if logs_root not in fp.parents and fp != logs_root:
+            await q.edit_message_text("مسیر فایل معتبر نیست.", reply_markup=build_back_kb("admin:logs_menu"))
+            return
         if not fp.exists():
             await q.edit_message_text("فایل لاگ یافت نشد.", reply_markup=build_back_kb("admin:logs_menu"))
         else:
-            await context.bot.send_document(chat_id=uid, document=fp.open("rb"), filename=f"{name}-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}.txt")
+            with fp.open("r", encoding="utf-8", errors="replace") as f:
+                pretty = humanize_log_text(fp, f.read())
+            with tempfile.NamedTemporaryFile("w+", encoding="utf-8", suffix=".txt", delete=False) as tempf:
+                tempf.write(pretty)
+                temp_path = Path(tempf.name)
+            with temp_path.open("rb") as doc:
+                await context.bot.send_document(chat_id=uid, document=doc, filename=f"{fp.stem}-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}.txt")
+            temp_path.unlink(missing_ok=True)
             await q.edit_message_text("فایل لاگ ارسال شد.", reply_markup=build_back_kb("admin:logs_menu"))
     elif q.data=="shortcut:continue_yes": STATE.step="waiting_name"; await q.edit_message_text("نام شورت‌کات بعدی را وارد کنید:", reply_markup=build_back_kb("admin:shortcut_menu"))
     elif q.data=="shortcut:continue_no":
