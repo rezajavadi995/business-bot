@@ -14,6 +14,7 @@ from typing import Any
 import psutil
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
+from telegram import MessageEntity
 from telegram.constants import ParseMode
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 from features.log_export import build_logs_keyboard, humanize_log_text
@@ -131,7 +132,7 @@ def setup_logging() -> None:
 
 def get_default_data() -> dict[str, Any]:
     return {"admin_id": int(os.getenv("ADMIN_ID") or 0), "active": False, "force_join_channel": os.getenv("FORCE_JOIN_CHANNEL", ""), "bold_mode": True,
-            "welcome_enabled": True, "welcome_text": "سلام 🌟\nبه پیج بیزینسی ما خوش آمدید.", "self_bot_enabled": False,
+            "welcome_enabled": False, "welcome_text": "سلام 🌟\nبه پیج بیزینسی ما خوش آمدید.", "self_bot_enabled": False,
             "features": {**{k: True for k in ADMIN_FEATURES}, **{k: True for k in USER_FEATURES}}, "offline_message": "پیام شما دریافت شد. به‌زودی پاسخ می‌دهیم.",
             "service_text": "", "hours_text": "", "location_text": "", "faq_text": "", "contact_text": "", "feedback_prompt_text": "لطفاً بازخورد خود را ارسال کنید.", "feedback_success_text": "✅ بازخورد شما با موفقیت ثبت شد."}
 
@@ -157,7 +158,6 @@ def create_shortcut_menu_keyboard() -> InlineKeyboardMarkup:
         [create_success_button("افزودن/ویرایش شورت‌کات", "admin:shortcut_cfg"), create_success_button("ویرایش شورت‌کات موجود", "admin:shortcut_edit_menu")],
         [create_primary_button("تنظیم چنل گزارشات", "admin:watch_channel_cfg"), create_primary_button("افزودن کلمات مانیتور", "admin:watch_keywords_add")],
         [create_primary_button("حذف کلمات مانیتور", "admin:watch_keywords_remove"), create_primary_button("آمار کلمات مانیتور", "admin:watch_keywords_stats")],
-        [create_primary_button("لاگ‌ها", "admin:logs_menu")],
         [create_danger_button("بازگشت", "menu:admin")],
     ])
 
@@ -166,9 +166,12 @@ def parse_keyword_csv(raw: str) -> list[str]:
     return [x.strip() for x in str(raw or "").split(",") if x.strip()]
 
 def create_admin_keyboard(data: dict[str, Any]) -> InlineKeyboardMarkup:
-    status = "روشن" if data["active"] else "خاموش"; selfb="ON" if data.get("self_bot_enabled") else "OFF"; wel="ON" if data.get("welcome_enabled") else "OFF"
+    status = "روشن" if data["active"] else "خاموش"
+    locked = " ⛔️" if not data.get("active", False) else ""
+    selfb = ("ON" if data.get("self_bot_enabled") else "OFF") + locked
+    wel = ("ON" if data.get("welcome_enabled") else "OFF") + locked
     status_btn=create_success_button(f"وضعیت ربات: {status}","toggle:active") if data["active"] else create_danger_button(f"وضعیت ربات: {status}","toggle:active")
-    return InlineKeyboardMarkup([[status_btn],[create_primary_button("ویرایش متن‌ها","admin:texts"),create_primary_button("فیچرها","admin:features")],[create_success_button("گزارش وضعیت","admin:report"),create_danger_button("راهنمای برودکست","admin:broadcast_help")],[create_primary_button(f"Self Bot: {selfb}","admin:selfbot"),create_primary_button("مدیریت سلف بات","admin:shortcut_menu")],[create_primary_button(f"Welcome: {wel}","admin:welcome_toggle"),create_primary_button("پیکربندی Welcome","admin:welcome_cfg")],[create_primary_button("پیام‌های بازخورد","admin:feedback_list"),create_danger_button("بازگشت","menu:admin")]])
+    return InlineKeyboardMarkup([[status_btn],[create_primary_button("ویرایش متن‌ها","admin:texts"),create_primary_button("فیچرها","admin:features")],[create_success_button("گزارش وضعیت","admin:report"),create_danger_button("راهنمای برودکست","admin:broadcast_help")],[create_primary_button(f"Self Bot: {selfb}","admin:selfbot"),create_primary_button("مدیریت سلف بات","admin:shortcut_menu")],[create_primary_button(f"Welcome: {wel}","admin:welcome_toggle"),create_primary_button("پیکربندی Welcome","admin:welcome_cfg")],[create_primary_button("لاگ‌ها","admin:logs_menu"), create_primary_button("پیام‌های بازخورد","admin:feedback_list")],[create_danger_button("بازگشت","menu:admin")]])
 
 def create_features_keyboard(data: dict[str, Any]) -> InlineKeyboardMarkup:
     rows=[[create_primary_button(f"{'✅' if data['features'].get(k) else '❌'} {k}",f"feature:{k}")] for k in ADMIN_FEATURES+USER_FEATURES]; rows.append([create_danger_button("بازگشت","menu:admin")]); return InlineKeyboardMarkup(rows)
@@ -183,19 +186,24 @@ def text_with_custom_emoji_markup(message) -> str:
     if not message:
         return ""
     txt = message.text or ""
-    entities = list(getattr(message, "entities", []) or [])
+    entities = [e for e in (getattr(message, "entities", []) or []) if getattr(e, "type", None) == MessageEntity.CUSTOM_EMOJI and getattr(e, "custom_emoji_id", None)]
+
+    def u16_to_py_index(s: str, u16_index: int) -> int:
+        u16_count = 0
+        for i, ch in enumerate(s):
+            u16_count += 2 if ord(ch) > 0xFFFF else 1
+            if u16_count > u16_index:
+                return i
+            if u16_count == u16_index:
+                return i + 1
+        return len(s)
+
     for ent in sorted(entities, key=lambda e: e.offset, reverse=True):
-        if getattr(ent, "type", None) == "custom_emoji" and getattr(ent, "custom_emoji_id", None):
-            start = ent.offset
-            end = ent.offset + ent.length
-            try:
-                original = message.parse_entity(ent)
-            except Exception:
-                original = txt[start:end] if 0 <= start <= end <= len(txt) else "🙂"
-            if original == "":
-                original = "🙂"
-            tag = f'<tg-emoji emoji-id="{ent.custom_emoji_id}">{original}</tg-emoji>'
-            txt = txt[:start] + tag + txt[end:]
+        start = u16_to_py_index(txt, ent.offset)
+        end = u16_to_py_index(txt, ent.offset + ent.length)
+        original = txt[start:end] or "🙂"
+        tag = f'<tg-emoji emoji-id="{ent.custom_emoji_id}">{original}</tg-emoji>'
+        txt = txt[:start] + tag + txt[end:]
     return txt
 
 def preserve_tg_emoji_markup(raw: str) -> str:
@@ -292,7 +300,11 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if key in TEXT_KEYS:
             STATE.flow,STATE.step,STATE.admin_id,STATE.message_id,STATE.pending_key="text_edit","waiting_value",uid,q.message.message_id,key
             await q.edit_message_text(f"متن قبلی ({TEXT_KEYS[key]}):\n{data.get(key,'') or '(خالی)'}\n\nمتن جدید را ارسال کنید.")
-    elif q.data=="admin:selfbot": data["self_bot_enabled"]=not data.get("self_bot_enabled",False); save_data(data); await q.edit_message_text("وضعیت Self Bot تغییر کرد.", reply_markup=create_admin_keyboard(data))
+    elif q.data=="admin:selfbot":
+        if not data.get("active", False):
+            await q.answer("اول ربات را از وضعیت سراسری روشن کنید.", show_alert=True)
+            return
+        data["self_bot_enabled"]=not data.get("self_bot_enabled",False); save_data(data); await q.edit_message_text("وضعیت Self Bot تغییر کرد.", reply_markup=create_admin_keyboard(data))
     elif q.data=="admin:shortcut_menu": await q.edit_message_text("مدیریت سلف بات", reply_markup=create_shortcut_menu_keyboard())
     elif q.data=="admin:shortcut_view":
         sc = db.load_shortcuts()
@@ -375,7 +387,11 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         STATE.flow=STATE.step=STATE.pending_key=None
         STATE.temp_shortcuts=None
         await q.edit_message_text("شورت‌کات‌ها ذخیره شدند.", reply_markup=create_shortcut_menu_keyboard())
-    elif q.data=="admin:welcome_toggle": data["welcome_enabled"]=not data.get("welcome_enabled",True); save_data(data); await q.edit_message_text("وضعیت Welcome تغییر کرد.", reply_markup=create_admin_keyboard(data))
+    elif q.data=="admin:welcome_toggle":
+        if not data.get("active", False):
+            await q.answer("اول ربات را از وضعیت سراسری روشن کنید.", show_alert=True)
+            return
+        data["welcome_enabled"]=not data.get("welcome_enabled",False); save_data(data); await q.edit_message_text("وضعیت Welcome تغییر کرد.", reply_markup=create_admin_keyboard(data))
     elif q.data=="admin:welcome_cfg": STATE.flow,STATE.step,STATE.admin_id,STATE.message_id,STATE.pending_key="welcome_cfg","waiting_value",uid,q.message.message_id,"welcome_text"; await q.edit_message_text(f"متن فعلی Welcome:\n{data.get('welcome_text','')}\n\nمتن جدید را ارسال کنید.", reply_markup=build_back_kb("menu:admin"))
     elif q.data=="admin:report":
         users=db.list_users(50)
@@ -461,7 +477,7 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lower = txt_group.lower()
         for k in kw:
             kk = str(k or "").strip()
-            if kk and kk.lower() in lower and report_chat:
+            if kk and kk.lower() in lower:
                 db.add_keyword_hit(kk, update.effective_user.id, update.effective_user.username or "", update.effective_user.full_name or update.effective_user.first_name or "", update.effective_chat.id, update.effective_chat.title or "", txt_group)
                 report = (
                     f"🔎 کلید یافت شد: #{kk.replace(' ', '_')}\n"
@@ -472,10 +488,11 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"💬 گروه: {update.effective_chat.title or '-'}\n\n"
                     f"{txt_group}"
                 )
-                try:
-                    await context.bot.send_message(chat_id=report_chat, text=report)
-                except Exception as exc:
-                    logging.warning("watch_report_send_failed reason=%s", exc)
+                if report_chat:
+                    try:
+                        await context.bot.send_message(chat_id=report_chat, text=report)
+                    except Exception as exc:
+                        logging.warning("watch_report_send_failed reason=%s", exc)
                 break
         return
     data=load_data(); uid=update.effective_user.id; src_txt=text_with_custom_emoji_markup(update.message); txt=src_txt.strip()
