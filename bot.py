@@ -25,6 +25,7 @@ load_dotenv(ENV_PATH)
 START_TIME = int(time.time())
 SOFT_BAN_SECONDS = 20 * 60
 WELCOME_COOLDOWN_SECONDS = 24 * 60 * 60
+BUSINESS_UPDATE_FRESHNESS_SECONDS = 120
 
 ADMIN_FEATURES = ["admin_panel_access", "admin_broadcast", "admin_reports", "admin_edit_texts", "admin_toggle_features", "admin_user_stats", "admin_system_info", "admin_public_ip", "admin_export_users", "admin_bold_mode"]
 USER_FEATURES = ["user_auto_reply", "user_services", "user_hours", "user_location", "user_faq", "user_contact", "user_request_callback", "user_feedback", "user_join_channel", "user_business_test_reply"]
@@ -274,9 +275,22 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         vid=q.data.split(":",2)[2]; msg=db.get_json(f"feedback_last:{vid}","(یافت نشد)")
         await q.edit_message_text(f"متن پیام بازخورد:\n{msg}", reply_markup=build_back_kb("menu:admin"))
 
+
+
+def is_fresh_business_update(message_date) -> bool:
+    if message_date is None:
+        return True
+    try:
+        return int(message_date.timestamp()) >= (START_TIME - BUSINESS_UPDATE_FRESHNESS_SECONDS)
+    except Exception:
+        return True
+
 async def business_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bm=getattr(update,"business_message",None)
     if not bm or not bm.text: return
+    if not is_fresh_business_update(getattr(bm, "date", None)):
+        logging.info("business_update_skipped_stale msg_id=%s date=%s", getattr(bm, "message_id", None), getattr(bm, "date", None))
+        return
     data=load_data(); src_txt=text_with_custom_emoji_markup(bm); txt=src_txt.strip(); uid=(bm.from_user.id if bm.from_user else bm.chat.id)
     prev=db.get_user(uid)
     db.upsert_user(uid,(bm.from_user.username if bm.from_user else "") or "",(bm.from_user.full_name if bm.from_user else bm.chat.full_name) or "",None,False,"business",src_txt)
@@ -412,6 +426,6 @@ def main() -> None:
     app=Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", start)); app.add_handler(CommandHandler("panel", panel)); app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CallbackQueryHandler(callbacks)); app.add_handler(MessageHandler(filters.ALL, all_messages)); app.add_error_handler(on_error)
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__": main()
