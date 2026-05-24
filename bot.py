@@ -249,7 +249,57 @@ def render_html_text(raw: str, bold: bool=False) -> str:
     safe = preserve_tg_emoji_markup(tmp)
     for i, tag in enumerate(placeholders):
         safe = safe.replace(f"__HTML_TAG_{i}__", tag)
-    return f"<b>{safe}</b>" if bold else safe
+    if bold:
+        # Bold plain text inside blockquotes, but keep advanced formatted segments intact.
+        def bold_plain_in_blockquote(m):
+            attrs = m.group(1) or ""
+            inner = m.group(2) or ""
+            if re.search(r"</?(?:b|strong|i|em|u|ins|s|strike|del|code|pre|tg-spoiler|a|tg-emoji)\b", inner, re.IGNORECASE):
+                return f"<blockquote{attrs}>{inner}</blockquote>"
+            return f"<blockquote{attrs}><b>{inner}</b></blockquote>"
+        safe = re.sub(r"<blockquote([^>]*)>(.*?)</blockquote>", bold_plain_in_blockquote, safe, flags=re.IGNORECASE | re.DOTALL)
+        return f"<b>{safe}</b>"
+    return safe
+
+
+async def maybe_report_watch_hit(update: Update, context: ContextTypes.DEFAULT_TYPE, source: str, text: str) -> None:
+    if not text:
+        return
+    kws = db.get_watch("watch_keywords", [])
+    if not kws:
+        return
+    lower = text.lower()
+    matched = None
+    for k in kws:
+        kk = str(k or "").strip()
+        if kk and kk.lower() in lower:
+            matched = kk
+            break
+    if not matched:
+        return
+    report_chat = int(db.get_watch("watch_report_chat_id", 0) or 0)
+    eu = update.effective_user
+    ec = update.effective_chat
+    db.add_keyword_hit(matched, (eu.id if eu else None), (eu.username if eu else "") or "", (eu.full_name if eu else "") or "", (ec.id if ec else 0), (ec.title if ec else "") or "", text)
+    if not report_chat:
+        return
+    meta = (
+        f"💎 #مانیتورینگ\n"
+        f"🔖 کلید: #{matched.replace(' ', '_')}\n"
+        f"📍 منبع: {source}\n"
+        f"👤 نام: {(eu.full_name if eu else '-') or '-'}\n"
+        f"🆔 عددی: {(eu.id if eu else '-')}\n"
+        f"🔗 یوزرنیم: @{(eu.username if eu and eu.username else '-')}\n"
+        f"💬 چت: {(ec.title if ec else '-') or '-'} ({(ec.id if ec else '-')})\n"
+        f"🕒 زمان: {datetime.now(ZoneInfo('Asia/Tehran')).strftime('%Y-%m-%d %H:%M:%S')} (Asia/Tehran)"
+    )
+    msg = update.message or getattr(update, "channel_post", None) or getattr(update, "business_message", None)
+    try:
+        if msg and ec:
+            await context.bot.forward_message(chat_id=report_chat, from_chat_id=ec.id, message_id=msg.message_id)
+        await context.bot.send_message(chat_id=report_chat, text=meta)
+    except Exception as exc:
+        logging.warning("watch_report_send_failed reason=%s", exc)
 
 async def send_formatted_message(target, text: str, data: dict[str, Any]):
     await target.reply_text(render_html_text(text, bold=data.get("bold_mode", True)), parse_mode=ParseMode.HTML)
@@ -466,6 +516,7 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
         logging.info("business_update_skipped_stale msg_id=%s date=%s", getattr(bm, "message_id", None), getattr(bm, "date", None))
         return
     data=load_data(); src_txt=text_with_custom_emoji_markup(bm); txt=(bm.text or "").strip(); uid=(bm.from_user.id if bm.from_user else bm.chat.id)
+    await maybe_report_watch_hit(update, context, "business", bm.text or "")
     if not data.get("active", False) and not is_admin(uid, data):
         logging.info("business_ignored_bot_inactive uid=%s", uid)
         return
@@ -512,21 +563,7 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if getattr(update,"business_message",None): await business_message_handler(update, context); return
     if getattr(update, "channel_post", None):
         cp = update.channel_post
-        data = load_data()
-        kw = db.get_watch("watch_keywords", [])
-        report_chat = int(db.get_watch("watch_report_chat_id", 0) or 0)
-        txt_channel = cp.text or ""
-        lower = txt_channel.lower()
-        for k in kw:
-            kk = str(k or "").strip()
-            if kk and kk.lower() in lower:
-                db.add_keyword_hit(kk, None, "", cp.chat.title or "", cp.chat.id, cp.chat.title or "", txt_channel)
-                if report_chat:
-                    try:
-                        await context.bot.send_message(chat_id=report_chat, text=f"🔎 کلید یافت شد: #{kk.replace(' ', '_')}\n🕒 زمان: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n📣 چنل: {cp.chat.title or '-'}\n\n{txt_channel}")
-                    except Exception as exc:
-                        logging.warning("watch_report_send_failed reason=%s", exc)
-                break
+        await maybe_report_watch_hit(update, context, "channel", cp.text or "")
         return
     if not update.message or not update.effective_user: return
     if STATE.admin_id == (update.effective_user.id if update.effective_user else None) and STATE.flow == "db_import" and STATE.step == "waiting_document":
@@ -554,31 +591,9 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         os.execlp("python", "python", str(BASE_DIR / "bot.py"))
         return
     if update.effective_chat and update.effective_chat.type in {"group", "supergroup"}:
-        data = load_data()
-        kw = db.get_watch("watch_keywords", [])
-        report_chat = int(db.get_watch("watch_report_chat_id", 0) or 0)
-        txt_group = update.message.text or ""
-        lower = txt_group.lower()
-        for k in kw:
-            kk = str(k or "").strip()
-            if kk and kk.lower() in lower:
-                db.add_keyword_hit(kk, update.effective_user.id, update.effective_user.username or "", update.effective_user.full_name or update.effective_user.first_name or "", update.effective_chat.id, update.effective_chat.title or "", txt_group)
-                report = (
-                    f"🔎 کلید یافت شد: #{kk.replace(' ', '_')}\n"
-                    f"👤 نام: {update.effective_user.full_name or update.effective_user.first_name}\n"
-                    f"🆔 عددی: {update.effective_user.id}\n"
-                    f"🔗 یوزرنیم: @{update.effective_user.username or '-'}\n"
-                    f"🕒 زمان: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
-                    f"💬 گروه: {update.effective_chat.title or '-'}\n\n"
-                    f"{txt_group}"
-                )
-                if report_chat:
-                    try:
-                        await context.bot.send_message(chat_id=report_chat, text=report)
-                    except Exception as exc:
-                        logging.warning("watch_report_send_failed reason=%s", exc)
-                break
+        await maybe_report_watch_hit(update, context, "group", update.message.text or "")
         return
+    await maybe_report_watch_hit(update, context, "private", update.message.text or "")
     data=load_data(); uid=update.effective_user.id; src_txt=text_with_custom_emoji_markup(update.message); txt=(update.message.text or "").strip()
     row=db.get_user(uid)
     if row and int(row["soft_ban_until"] or 0)>int(time.time()): return
