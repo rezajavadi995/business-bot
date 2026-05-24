@@ -8,6 +8,7 @@ import time
 from datetime import datetime
 from dataclasses import dataclass
 import tempfile
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any
 
@@ -238,7 +239,16 @@ def preserve_tg_emoji_markup(raw: str) -> str:
 
 
 def render_html_text(raw: str, bold: bool=False) -> str:
-    safe = preserve_tg_emoji_markup(raw if raw is not None else "")
+    raw = raw if raw is not None else ""
+    placeholders: list[str] = []
+    pattern = re.compile(r"</?(?:b|strong|i|em|u|ins|s|strike|del|code|pre|blockquote|tg-spoiler|a)(?:\s+[^>]*)?>", re.IGNORECASE)
+    def repl(m):
+        placeholders.append(m.group(0))
+        return f"__HTML_TAG_{len(placeholders)-1}__"
+    tmp = pattern.sub(repl, raw)
+    safe = preserve_tg_emoji_markup(tmp)
+    for i, tag in enumerate(placeholders):
+        safe = safe.replace(f"__HTML_TAG_{i}__", tag)
     return f"<b>{safe}</b>" if bold else safe
 
 async def send_formatted_message(target, text: str, data: dict[str, Any]):
@@ -461,10 +471,8 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
         return
     prev=db.get_user(uid)
     db.upsert_user(uid,(bm.from_user.username if bm.from_user else "") or "",(bm.from_user.full_name if bm.from_user else bm.chat.full_name) or "",None,False,"business",src_txt)
-    if not data.get("self_bot_enabled", False):
-        return
     sc=db.load_shortcuts(); resp=match_shortcut(txt, sc)
-    if resp:
+    if resp and data.get("self_bot_enabled", False):
         bc=getattr(bm,"business_connection_id",None)
         if data.get("self_bot_enabled") and is_admin(uid, data):
             out_self = render_html_text(resp, bold=data.get("bold_mode", True))
@@ -522,6 +530,14 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if not update.message or not update.effective_user: return
     if STATE.admin_id == (update.effective_user.id if update.effective_user else None) and STATE.flow == "db_import" and STATE.step == "waiting_document":
+        txt_cmd = (update.message.text or "").strip().lower() if update.message else ""
+        if txt_cmd in {"panel", "/panel", "menu"}:
+            STATE.flow = STATE.step = None
+            if txt_cmd in {"panel", "/panel"} and update.effective_user and is_admin(update.effective_user.id, load_data()):
+                await update.message.reply_text("پنل ادمین", reply_markup=create_admin_keyboard(load_data()))
+            elif txt_cmd == "menu":
+                await update.message.reply_text("منوی کاربر", reply_markup=create_menu_keyboard())
+            return
         doc = update.message.document
         if not doc:
             await update.message.reply_text("لطفاً فایل .db ارسال کنید.")
@@ -643,6 +659,9 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 me = await context.bot.get_chat_member(cid, context.bot.id)
                 test_ok = f"ok: {getattr(me, 'status', 'unknown')}"
+                utc_now = datetime.utcnow()
+                tehran_now = datetime.now(ZoneInfo("Asia/Tehran"))
+                await context.bot.send_message(chat_id=cid, text=f"✅ اتصال ربات به چنل گزارشات موفق بود.\nUTC: {utc_now.strftime('%Y-%m-%d %H:%M:%S')}\nAsia/Tehran: {tehran_now.strftime('%Y-%m-%d %H:%M:%S')}")
             except Exception as exc:
                 test_ok = f"failed: {exc}"
             await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"چنل گزارشات ذخیره شد: {cid}\nوضعیت دسترسی ربات: {test_ok}", reply_markup=create_shortcut_menu_keyboard()); return
