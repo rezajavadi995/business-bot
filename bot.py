@@ -198,6 +198,9 @@ def text_with_custom_emoji_markup(message) -> str:
     """Keep source text unchanged except wrapping custom emoji entities as tg-emoji HTML tags."""
     if not message:
         return ""
+    text_html = getattr(message, "text_html", None)
+    if text_html:
+        return text_html
     txt = message.text or ""
     entities = [e for e in (getattr(message, "entities", []) or []) if getattr(e, "type", None) == MessageEntity.CUSTOM_EMOJI and getattr(e, "custom_emoji_id", None)]
 
@@ -337,14 +340,14 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = build_shortcut_pick_keyboard(sc, "admin:shortcut_delete_pick", "shortcut_delete_tokens") if sc else InlineKeyboardMarkup([[create_danger_button("بازگشت", "admin:shortcut_menu")]])
         await q.edit_message_text("انتخاب شورت‌کات برای حذف:", reply_markup=kb)
     elif q.data.startswith("admin:shortcut_delete_pick:"):
-        token = q.data.split(":", 3)[3]
+        token = q.data.split(":", 2)[2]
         key = db.get_watch("shortcut_delete_tokens", {}).get(token)
         if not key:
             await q.edit_message_text("آیتم معتبر نیست. دوباره لیست را باز کنید.", reply_markup=create_shortcut_menu_keyboard()); return
         db.set_watch("shortcut_delete_confirm_token", {"x": key})
         await q.edit_message_text(f"حذف «{key}» تایید می‌شود؟", reply_markup=InlineKeyboardMarkup([[create_danger_button("تایید حذف", "admin:shortcut_delete_confirm:x")], [create_primary_button("انصراف", "admin:shortcut_menu")]]))
     elif q.data.startswith("admin:shortcut_delete_confirm:"):
-        token = q.data.split(":", 3)[3]
+        token = q.data.split(":", 2)[2]
         key = db.get_watch("shortcut_delete_confirm_token", {}).get(token)
         if not key:
             await q.edit_message_text("آیتم معتبر نیست.", reply_markup=create_shortcut_menu_keyboard()); return
@@ -355,7 +358,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = build_shortcut_pick_keyboard(sc, "admin:shortcut_edit_pick", "shortcut_edit_tokens") if sc else InlineKeyboardMarkup([[create_danger_button("بازگشت", "admin:shortcut_menu")]])
         await q.edit_message_text("انتخاب شورت‌کات برای ویرایش:", reply_markup=kb)
     elif q.data.startswith("admin:shortcut_edit_pick:"):
-        token = q.data.split(":", 3)[3]
+        token = q.data.split(":", 2)[2]
         key = db.get_watch("shortcut_edit_tokens", {}).get(token)
         if not key:
             await q.edit_message_text("آیتم معتبر نیست. دوباره لیست را باز کنید.", reply_markup=create_shortcut_menu_keyboard()); return
@@ -452,12 +455,14 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
     if not is_fresh_business_update(getattr(bm, "date", None)):
         logging.info("business_update_skipped_stale msg_id=%s date=%s", getattr(bm, "message_id", None), getattr(bm, "date", None))
         return
-    data=load_data(); src_txt=text_with_custom_emoji_markup(bm); txt=src_txt.strip(); uid=(bm.from_user.id if bm.from_user else bm.chat.id)
+    data=load_data(); src_txt=text_with_custom_emoji_markup(bm); txt=(bm.text or "").strip(); uid=(bm.from_user.id if bm.from_user else bm.chat.id)
     if not data.get("active", False) and not is_admin(uid, data):
         logging.info("business_ignored_bot_inactive uid=%s", uid)
         return
     prev=db.get_user(uid)
     db.upsert_user(uid,(bm.from_user.username if bm.from_user else "") or "",(bm.from_user.full_name if bm.from_user else bm.chat.full_name) or "",None,False,"business",src_txt)
+    if not data.get("self_bot_enabled", False):
+        return
     sc=db.load_shortcuts(); resp=match_shortcut(txt, sc)
     if resp:
         bc=getattr(bm,"business_connection_id",None)
@@ -497,6 +502,24 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
 
 async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if getattr(update,"business_message",None): await business_message_handler(update, context); return
+    if getattr(update, "channel_post", None):
+        cp = update.channel_post
+        data = load_data()
+        kw = db.get_watch("watch_keywords", [])
+        report_chat = int(db.get_watch("watch_report_chat_id", 0) or 0)
+        txt_channel = cp.text or ""
+        lower = txt_channel.lower()
+        for k in kw:
+            kk = str(k or "").strip()
+            if kk and kk.lower() in lower:
+                db.add_keyword_hit(kk, None, "", cp.chat.title or "", cp.chat.id, cp.chat.title or "", txt_channel)
+                if report_chat:
+                    try:
+                        await context.bot.send_message(chat_id=report_chat, text=f"🔎 کلید یافت شد: #{kk.replace(' ', '_')}\n🕒 زمان: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n📣 چنل: {cp.chat.title or '-'}\n\n{txt_channel}")
+                    except Exception as exc:
+                        logging.warning("watch_report_send_failed reason=%s", exc)
+                break
+        return
     if not update.message or not update.effective_user: return
     if STATE.admin_id == (update.effective_user.id if update.effective_user else None) and STATE.flow == "db_import" and STATE.step == "waiting_document":
         doc = update.message.document
@@ -540,7 +563,7 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         logging.warning("watch_report_send_failed reason=%s", exc)
                 break
         return
-    data=load_data(); uid=update.effective_user.id; src_txt=text_with_custom_emoji_markup(update.message); txt=src_txt.strip()
+    data=load_data(); uid=update.effective_user.id; src_txt=text_with_custom_emoji_markup(update.message); txt=(update.message.text or "").strip()
     row=db.get_user(uid)
     if row and int(row["soft_ban_until"] or 0)>int(time.time()): return
     db.upsert_user(uid, update.effective_user.username or "", update.effective_user.full_name or update.effective_user.first_name or "", update.message.contact.phone_number if update.message.contact else None, False, "message", txt)
