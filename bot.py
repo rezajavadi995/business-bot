@@ -20,6 +20,7 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 from features.log_export import build_logs_keyboard, humanize_log_text
 from features.inline_menu import build_inline_menu_admin_kb, paged_rows, CB as IMCB
+from features.inline_actions import ACTION_REGISTRY
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
@@ -199,6 +200,16 @@ class DB:
         with self.conn() as c: return c.execute("SELECT * FROM menus WHERE command=? AND is_active=1",(command,)).fetchone()
     def menu_buttons(self, menu_id:int):
         with self.conn() as c: return c.execute("SELECT * FROM menu_buttons WHERE menu_id=? AND is_active=1 ORDER BY sort_order,id",(menu_id,)).fetchall()
+    def update_menu_preview(self, menu_id:int, preview:str):
+        with self.conn() as c: c.execute("UPDATE menus SET preview_text=?, updated_at=? WHERE id=?", (preview, int(time.time()), menu_id))
+    def update_menu_command(self, menu_id:int, command:str):
+        with self.conn() as c: c.execute("UPDATE menus SET command=?, updated_at=? WHERE id=?", (command, int(time.time()), menu_id))
+    def button_by_id(self, button_id:int):
+        with self.conn() as c: return c.execute("SELECT * FROM menu_buttons WHERE id=?", (button_id,)).fetchone()
+    def update_button_name(self, button_id:int, name:str):
+        with self.conn() as c: c.execute("UPDATE menu_buttons SET button_text=?, updated_at=? WHERE id=?", (name, int(time.time()), button_id))
+    def update_button_output(self, button_id:int, output:str):
+        with self.conn() as c: c.execute("UPDATE menu_buttons SET action_payload=?, updated_at=? WHERE id=?", (output, int(time.time()), button_id))
 
 db = DB(DB_PATH)
 
@@ -463,6 +474,11 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if q.data == IMCB["ADD_BTN"]:
             menus=[{"id":m["id"],"label":f"{m['command']}"} for m in db.list_menus()]
             await q.edit_message_text("انتخاب منو:", reply_markup=paged_rows(menus,"im:addbtnpick",0)); return
+        if ":page:" in q.data and q.data.startswith(("im:addbtnpick","im:mgrpick","im:editpick")):
+            parts=q.data.split(":")
+            prefix=":".join(parts[:2]); page=int(parts[-1])
+            menus=[{"id":m["id"],"label":f"{m['command']}"} for m in db.list_menus()]
+            await q.edit_message_text("انتخاب منو:", reply_markup=paged_rows(menus,prefix,page)); return
         if q.data.startswith("im:addbtnpick:"):
             mid=int(q.data.split(":")[2]); db.set_admin_state(uid,"im_add_btn_text",{"menu_id":mid})
             await q.edit_message_text("متن دکمه جدید را ارسال کنید.", reply_markup=build_back_kb("im:root")); return
@@ -477,6 +493,33 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for b in btns: rows.append([InlineKeyboardButton(f"🧨 حذف {b['button_text']}",callback_data=f"im:delbtn:{b['id']}")])
             rows.append([InlineKeyboardButton("🧨 Cancel",callback_data="im:root")])
             await q.edit_message_text("Menu Manager", reply_markup=InlineKeyboardMarkup(rows)); return
+        if q.data.startswith("im:editpick:"):
+            mid=int(q.data.split(":")[2])
+            db.set_admin_state(uid,"im_edit_choose",{"menu_id":mid})
+            await q.edit_message_text("Edit Menu", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("1) Edit Preview Text",callback_data="im:edit:preview")],
+                [InlineKeyboardButton("2) Edit Menu Command",callback_data="im:edit:command")],
+                [InlineKeyboardButton("3) Edit Button Name",callback_data="im:edit:btnname")],
+                [InlineKeyboardButton("4) Edit Button Output",callback_data="im:edit:btnout")],
+                [InlineKeyboardButton("🧨 Cancel",callback_data="im:cancel")]
+            ])); return
+        if q.data.startswith("im:edit:"):
+            st=db.get_admin_state(uid) or {}
+            mid=int((st.get("payload") or {}).get("menu_id",0))
+            if not mid: await q.edit_message_text("State invalid", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled",False), data.get("active",False))); return
+            op=q.data.split(":")[2]
+            if op=="preview":
+                db.set_admin_state(uid,"im_edit_preview_text",{"menu_id":mid}); await q.edit_message_text("Preview جدید را بفرستید."); return
+            if op=="command":
+                db.set_admin_state(uid,"im_edit_command_text",{"menu_id":mid}); await q.edit_message_text("Command جدید را بفرستید."); return
+            btns=db.menu_buttons(mid)
+            rows=[[InlineKeyboardButton(b["button_text"],callback_data=f"im:editpickbtn:{op}:{b['id']}")] for b in btns]
+            rows.append([InlineKeyboardButton("🧨 Cancel",callback_data="im:cancel")])
+            await q.edit_message_text("Button را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(rows)); return
+        if q.data.startswith("im:editpickbtn:"):
+            _,_,op,bid=q.data.split(":")
+            db.set_admin_state(uid, "im_edit_button_name" if op=="btnname" else "im_edit_button_output", {"button_id":int(bid)})
+            await q.edit_message_text("مقدار جدید را بفرستید.", reply_markup=build_back_kb("im:root")); return
         if q.data.startswith("im:delmenu:"):
             mid=int(q.data.split(":")[2]); db.set_admin_state(uid,"im_confirm_del_menu",{"menu_id":mid})
             await q.edit_message_text("تایید حذف کامل منو؟", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("YES",callback_data="im:confirm:yes"),InlineKeyboardButton("NO",callback_data="im:confirm:no")]])); return
@@ -529,8 +572,11 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with db.conn() as c:
             row=c.execute("SELECT action_type, action_payload FROM menu_buttons WHERE id=? AND is_active=1",(bid,)).fetchone()
         if not row: return
-        if row["action_type"]=="just_text":
-            await send_formatted_message(q.message, row["action_payload"], data)
+        handler = ACTION_REGISTRY.get(row["action_type"])
+        if not handler: return
+        async def send_fn(payload: str):
+            await send_formatted_message(q.message, payload, data)
+        await handler.execute(send_fn, row["action_payload"])
         return
     if not is_admin(uid,data): return
     if q.data=="menu:admin": await q.edit_message_text("پنل ادمین", reply_markup=create_admin_keyboard(data))
@@ -823,6 +869,17 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             p["button_text"]=src_txt; db.set_admin_state(uid,"im_add_btn_output",p); await update.message.reply_text("Output text را بفرستید."); return
         if s=="im_add_btn_output":
             db.add_menu_button(int(p["menu_id"]), p["button_text"], "just_text", src_txt); db.clear_admin_state(uid); await update.message.reply_text("دکمه اضافه شد."); return
+        if s=="im_edit_preview_text":
+            mid=int(p["menu_id"]); db.update_menu_preview(mid, src_txt); db.log_admin(uid,"edit","menu_preview",mid,None,src_txt); db.clear_admin_state(uid); await update.message.reply_text("Preview بروزرسانی شد."); return
+        if s=="im_edit_command_text":
+            mid=int(p["menu_id"])
+            if db.menu_by_command(txt):
+                await update.message.reply_text("این command تکراری است."); return
+            db.update_menu_command(mid, txt); db.log_admin(uid,"edit","menu_command",mid,None,txt); db.clear_admin_state(uid); await update.message.reply_text("Command بروزرسانی شد."); return
+        if s=="im_edit_button_name":
+            bid=int(p["button_id"]); db.update_button_name(bid, src_txt); db.log_admin(uid,"edit","menu_button_name",bid,None,src_txt); db.clear_admin_state(uid); await update.message.reply_text("نام دکمه بروزرسانی شد."); return
+        if s=="im_edit_button_output":
+            bid=int(p["button_id"]); db.update_button_output(bid, src_txt); db.log_admin(uid,"edit","menu_button_output",bid,None,src_txt); db.clear_admin_state(uid); await update.message.reply_text("خروجی دکمه بروزرسانی شد."); return
     row=db.get_user(uid)
     if row and int(row["soft_ban_until"] or 0)>int(time.time()): return
     db.upsert_user(uid, update.effective_user.username or "", update.effective_user.full_name or update.effective_user.first_name or "", update.message.contact.phone_number if update.message.contact else None, False, "message", txt)
