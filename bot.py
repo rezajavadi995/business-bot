@@ -150,9 +150,9 @@ def load_data() -> dict[str, Any]:
 
 def save_data(data: dict[str, Any]) -> None: db.set_json("settings", data)
 def is_admin(user_id: int, data: dict[str, Any]) -> bool: return user_id == int(data.get("admin_id") or os.getenv("ADMIN_ID") or 0)
-def create_primary_button(text: str, callback: str) -> InlineKeyboardButton: return InlineKeyboardButton(f"🔵 {text}", callback_data=callback)
-def create_success_button(text: str, callback: str) -> InlineKeyboardButton: return InlineKeyboardButton(f"🟢 {text}", callback_data=callback)
-def create_danger_button(text: str, callback: str) -> InlineKeyboardButton: return InlineKeyboardButton(f"🔴 {text}", callback_data=callback)
+def create_primary_button(text: str, callback: str) -> InlineKeyboardButton: return InlineKeyboardButton(f"✨ {text}", callback_data=callback)
+def create_success_button(text: str, callback: str) -> InlineKeyboardButton: return InlineKeyboardButton(f"🚀 {text}", callback_data=callback)
+def create_danger_button(text: str, callback: str) -> InlineKeyboardButton: return InlineKeyboardButton(f"🧨 {text}", callback_data=callback)
 
 def create_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[create_success_button("خدمات","user:services"),create_primary_button("ساعات کاری","user:hours")],[create_primary_button("آدرس","user:location"),create_success_button("پرسش‌های پرتکرار","user:faq")],[create_danger_button("تماس","user:contact"),create_primary_button("ارسال بازخورد","user:feedback")]])
