@@ -228,6 +228,7 @@ class DB:
         with self.conn() as c: c.execute("UPDATE menu_buttons SET action_payload=?, updated_at=? WHERE id=?", (output, int(time.time()), button_id))
 
 db = DB(DB_PATH)
+FSM_TTL_SECONDS = 15 * 60
 
 def setup_logging() -> None:
     LOG_DIR.mkdir(exist_ok=True)
@@ -414,6 +415,11 @@ async def maybe_report_watch_hit(update: Update, context: ContextTypes.DEFAULT_T
     )
     meta = f"<pre><code class=\"language-ruby\">{html.escape(meta_raw)}</code></pre>"
     msg = update.message or getattr(update, "channel_post", None) or getattr(update, "business_message", None)
+    dedupe_key = f"watch_dedupe:{source}:{(ec.id if ec else 0)}:{(msg.message_id if msg else 0)}:{matched}"
+    if db.get_watch(dedupe_key, False):
+        logging.info("watch_hit_duplicate_ignored key=%s", dedupe_key)
+        return
+    db.set_watch(dedupe_key, True)
     try:
         if msg and ec:
             await context.bot.forward_message(chat_id=report_chat, from_chat_id=ec.id, message_id=msg.message_id)
@@ -476,6 +482,10 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_valid_im_callback(q.data):
             logging.warning("im_callback_rejected_invalid uid=%s data=%r", uid, q.data)
             return
+        if is_state_stale(uid):
+            db.clear_admin_state(uid)
+            await q.edit_message_text("State منقضی شد. دوباره از منو شروع کنید.", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False)))
+            return
         if not is_admin(uid, data): return
         if q.data == IMCB["ROOT"]:
             await q.edit_message_text("Inline Menu Engine", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False)))
@@ -499,21 +509,27 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             menus=[{"id":m["id"],"label":f"{m['command']}"} for m in db.list_menus()]
             await q.edit_message_text("انتخاب منو:", reply_markup=paged_rows(menus,prefix,page)); return
         if q.data.startswith("im:addbtnpick:"):
-            mid=int(q.data.split(":")[2]); db.set_admin_state(uid,"im_add_btn_text",{"menu_id":mid})
+            try: mid=int(q.data.split(":")[2])
+            except Exception: logging.warning("im_invalid_payload uid=%s data=%r", uid, q.data); return
+            if not any(int(m["id"])==mid for m in db.list_menus()):
+                logging.warning("im_stale_menu_pick uid=%s menu_id=%s", uid, mid); await q.edit_message_text("منو دیگر وجود ندارد."); return
+            db.set_admin_state(uid,"im_add_btn_text",{"menu_id":mid})
             await q.edit_message_text("متن دکمه جدید را ارسال کنید.", reply_markup=build_back_kb("im:root")); return
         if q.data == IMCB["MGR"] or q.data == IMCB["EDIT"]:
             menus=[{"id":m["id"],"label":f"{m['command']}"} for m in db.list_menus()]
             pref="im:mgrpick" if q.data==IMCB["MGR"] else "im:editpick"
             await q.edit_message_text("انتخاب منو:", reply_markup=paged_rows(menus,pref,0)); return
         if q.data.startswith("im:mgrpick:"):
-            mid=int(q.data.split(":")[2])
+            try: mid=int(q.data.split(":")[2])
+            except Exception: logging.warning("im_invalid_payload uid=%s data=%r", uid, q.data); return
             btns=db.menu_buttons(mid)
             rows=[[InlineKeyboardButton("❌ Delete Entire Menu",callback_data=f"im:delmenu:{mid}")]]
             for b in btns: rows.append([InlineKeyboardButton(f"🧨 حذف {b['button_text']}",callback_data=f"im:delbtn:{b['id']}")])
             rows.append([InlineKeyboardButton("🧨 Cancel",callback_data="im:root")])
             await q.edit_message_text("Menu Manager", reply_markup=InlineKeyboardMarkup(rows)); return
         if q.data.startswith("im:editpick:"):
-            mid=int(q.data.split(":")[2])
+            try: mid=int(q.data.split(":")[2])
+            except Exception: logging.warning("im_invalid_payload uid=%s data=%r", uid, q.data); return
             db.set_admin_state(uid,"im_edit_choose",{"menu_id":mid})
             await q.edit_message_text("Edit Menu", reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("1) Edit Preview Text",callback_data="im:edit:preview")],
@@ -878,16 +894,22 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if st:
         s=st.get("state"); p=st.get("payload",{})
         if s=="im_create_command":
+            if len(txt) > 64 or not txt.strip():
+                await update.message.reply_text("command نامعتبر است."); return
             if db.menu_by_command(txt):
                 await update.message.reply_text("این command تکراری است. دوباره بفرستید."); return
             p["command"]=txt; db.set_admin_state(uid,"im_create_button_text",p); await update.message.reply_text("Step 2/6: متن دکمه را بفرستید."); return
         if s=="im_create_button_text":
+            if len((update.message.text or "")) > 120:
+                await update.message.reply_text("متن دکمه بیش از حد طولانی است."); return
             p["button_text"]=src_txt; db.set_admin_state(uid,"im_create_action_type",p); await update.message.reply_text("Step 3/6: نوع اکشن", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("just_text",callback_data="im:act:just_text")],[InlineKeyboardButton("Cancel",callback_data="im:cancel")]])); return
         if s=="im_create_preview_text":
             p["preview_text"]=src_txt; db.set_admin_state(uid,"im_create_output_text",p); await update.message.reply_text("Step 5/6: output text را بفرستید."); return
         if s=="im_create_output_text":
             p["output_text"]=src_txt; db.set_admin_state(uid,"im_create_confirm",p); await update.message.reply_text("Confirm?", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("YES",callback_data="im:create:confirm:yes"),InlineKeyboardButton("NO",callback_data="im:create:confirm:no")]])); return
         if s=="im_add_btn_text":
+            if len((update.message.text or "")) > 120:
+                await update.message.reply_text("متن دکمه بیش از حد طولانی است."); return
             p["button_text"]=src_txt; db.set_admin_state(uid,"im_add_btn_output",p); await update.message.reply_text("Output text را بفرستید."); return
         if s=="im_add_btn_output":
             db.add_menu_button(int(p["menu_id"]), p["button_text"], "just_text", src_txt); db.clear_admin_state(uid); await update.message.reply_text("دکمه اضافه شد."); return
@@ -1072,6 +1094,14 @@ def build_back_kb(target: str="menu:admin") -> InlineKeyboardMarkup:
 
 def can_edit_flow(uid: int) -> bool:
     return STATE.admin_id == uid and STATE.message_id is not None and STATE.flow is not None
+
+
+def is_state_stale(admin_id: int) -> bool:
+    with db.conn() as c:
+        row = c.execute("SELECT updated_at FROM admin_states WHERE admin_id=?", (admin_id,)).fetchone()
+    if not row:
+        return False
+    return int(time.time()) - int(row["updated_at"] or 0) > FSM_TTL_SECONDS
 
 
 def main() -> None:
