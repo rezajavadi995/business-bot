@@ -19,6 +19,7 @@ from telegram import MessageEntity
 from telegram.constants import ParseMode
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 from features.log_export import build_logs_keyboard, humanize_log_text
+from features.inline_menu import build_inline_menu_admin_kb, paged_rows, CB as IMCB
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
@@ -67,6 +68,43 @@ class DB:
             c.execute("""CREATE TABLE IF NOT EXISTS keyword_hits (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, keyword TEXT NOT NULL, user_id INTEGER, username TEXT, full_name TEXT,
                 chat_id INTEGER, chat_title TEXT, text TEXT, created_at INTEGER
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS menus (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                command TEXT UNIQUE NOT NULL,
+                preview_text TEXT NOT NULL,
+                is_active INTEGER DEFAULT 1,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS menu_buttons (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                menu_id INTEGER NOT NULL,
+                button_text TEXT NOT NULL,
+                sort_order INTEGER DEFAULT 0,
+                action_type TEXT NOT NULL,
+                action_payload TEXT NOT NULL,
+                is_active INTEGER DEFAULT 1,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                FOREIGN KEY(menu_id) REFERENCES menus(id) ON DELETE CASCADE
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS admin_states (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_id INTEGER UNIQUE NOT NULL,
+                state TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            )""")
+            c.execute("""CREATE TABLE IF NOT EXISTS admin_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                target_type TEXT NOT NULL,
+                target_id INTEGER,
+                old_value TEXT,
+                new_value TEXT,
+                created_at INTEGER NOT NULL
             )""")
     def get_json(self, key: str, default: Any) -> Any:
         with self.conn() as c:
@@ -128,6 +166,39 @@ class DB:
     def delete_shortcut(self, key: str):
         with self.conn() as c:
             c.execute("DELETE FROM shortcuts WHERE name=?", (key,))
+    def set_admin_state(self, admin_id: int, state: str, payload: dict[str, Any]):
+        with self.conn() as c:
+            c.execute("INSERT INTO admin_states(admin_id,state,payload,updated_at) VALUES(?,?,?,?) ON CONFLICT(admin_id) DO UPDATE SET state=excluded.state,payload=excluded.payload,updated_at=excluded.updated_at",
+                      (admin_id, state, json.dumps(payload, ensure_ascii=False), int(time.time())))
+    def get_admin_state(self, admin_id: int):
+        with self.conn() as c:
+            r = c.execute("SELECT * FROM admin_states WHERE admin_id=?", (admin_id,)).fetchone()
+            if not r: return None
+            return {"state": r["state"], "payload": json.loads(r["payload"] or "{}")}
+    def clear_admin_state(self, admin_id: int):
+        with self.conn() as c: c.execute("DELETE FROM admin_states WHERE admin_id=?", (admin_id,))
+    def log_admin(self, admin_id:int, action:str, target_type:str, target_id:int|None, old_value:str|None, new_value:str|None):
+        with self.conn() as c:
+            c.execute("INSERT INTO admin_logs(admin_id,action,target_type,target_id,old_value,new_value,created_at) VALUES(?,?,?,?,?,?,?)",
+                      (admin_id, action, target_type, target_id, old_value, new_value, int(time.time())))
+    def create_menu(self, command:str, preview_text:str):
+        now=int(time.time())
+        with self.conn() as c:
+            cur=c.execute("INSERT INTO menus(command,preview_text,is_active,created_at,updated_at) VALUES(?,?,?,?,?)",(command,preview_text,1,now,now))
+            return cur.lastrowid
+    def add_menu_button(self, menu_id:int, button_text:str, action_type:str, action_payload:str):
+        now=int(time.time())
+        with self.conn() as c:
+            sort=int(c.execute("SELECT COALESCE(MAX(sort_order),0)+1 v FROM menu_buttons WHERE menu_id=?",(menu_id,)).fetchone()["v"])
+            cur=c.execute("INSERT INTO menu_buttons(menu_id,button_text,sort_order,action_type,action_payload,is_active,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                          (menu_id,button_text,sort,action_type,action_payload,1,now,now))
+            return cur.lastrowid
+    def list_menus(self):
+        with self.conn() as c: return c.execute("SELECT * FROM menus ORDER BY id DESC").fetchall()
+    def menu_by_command(self, command:str):
+        with self.conn() as c: return c.execute("SELECT * FROM menus WHERE command=? AND is_active=1",(command,)).fetchone()
+    def menu_buttons(self, menu_id:int):
+        with self.conn() as c: return c.execute("SELECT * FROM menu_buttons WHERE menu_id=? AND is_active=1 ORDER BY sort_order,id",(menu_id,)).fetchall()
 
 db = DB(DB_PATH)
 
@@ -137,7 +208,7 @@ def setup_logging() -> None:
 
 def get_default_data() -> dict[str, Any]:
     return {"admin_id": int(os.getenv("ADMIN_ID") or 0), "active": False, "force_join_channel": os.getenv("FORCE_JOIN_CHANNEL", ""), "bold_mode": True,
-            "welcome_enabled": False, "welcome_text": "سلام 🌟\nبه پیج بیزینسی ما خوش آمدید.", "self_bot_enabled": False,
+            "welcome_enabled": False, "welcome_text": "سلام 🌟\nبه پیج بیزینسی ما خوش آمدید.", "self_bot_enabled": False, "inline_menu_enabled": False,
             "features": {**{k: True for k in ADMIN_FEATURES}, **{k: True for k in USER_FEATURES}}, "offline_message": "پیام شما دریافت شد. به‌زودی پاسخ می‌دهیم.",
             "service_text": "", "hours_text": "", "location_text": "", "faq_text": "", "contact_text": "", "feedback_prompt_text": "لطفاً بازخورد خود را ارسال کنید.", "feedback_success_text": "✅ بازخورد شما با موفقیت ثبت شد."}
 
@@ -203,7 +274,7 @@ def create_admin_keyboard(data: dict[str, Any]) -> InlineKeyboardMarkup:
     selfb = ("ON" if data.get("self_bot_enabled") else "OFF") + locked
     wel = ("ON" if data.get("welcome_enabled") else "OFF") + locked
     status_btn=create_success_button(f"وضعیت ربات: {status}","toggle:active") if data["active"] else create_danger_button(f"وضعیت ربات: {status}","toggle:active")
-    return InlineKeyboardMarkup([[status_btn],[create_primary_button("ویرایش متن‌ها","admin:texts"),create_primary_button("فیچرها","admin:features")],[create_success_button("گزارش وضعیت","admin:report"),create_danger_button("راهنمای برودکست","admin:broadcast_help")],[create_primary_button(f"Self Bot: {selfb}","admin:selfbot"),create_primary_button("مدیریت سلف بات","admin:shortcut_menu")],[create_primary_button(f"Welcome: {wel}","admin:welcome_toggle"),create_primary_button("پیکربندی Welcome","admin:welcome_cfg")],[create_primary_button("بک‌آپ دیتابیس","admin:db_export"), create_primary_button("ایمپورت دیتابیس","admin:db_import")],[create_primary_button("لاگ‌ها","admin:logs_menu"), create_primary_button("پیام‌های بازخورد","admin:feedback_list")],[create_danger_button("بازگشت","menu:admin")]])
+    return InlineKeyboardMarkup([[status_btn],[create_primary_button("ویرایش متن‌ها","admin:texts"),create_primary_button("فیچرها","admin:features")],[create_success_button("گزارش وضعیت","admin:report"),create_danger_button("راهنمای برودکست","admin:broadcast_help")],[create_primary_button(f"Self Bot: {selfb}","admin:selfbot"),create_primary_button("مدیریت سلف بات","admin:shortcut_menu")],[create_primary_button(f"Welcome: {wel}","admin:welcome_toggle"),create_primary_button("پیکربندی Welcome","admin:welcome_cfg")],[create_primary_button("Inline Menu Engine","im:root"), create_primary_button("بک‌آپ دیتابیس","admin:db_export")],[create_primary_button("ایمپورت دیتابیس","admin:db_import"), create_primary_button("لاگ‌ها","admin:logs_menu")],[create_primary_button("پیام‌های بازخورد","admin:feedback_list")],[create_danger_button("بازگشت","menu:admin")]])
 
 def create_features_keyboard(data: dict[str, Any]) -> InlineKeyboardMarkup:
     rows=[[create_primary_button(f"{'✅' if data['features'].get(k) else '❌'} {k}",f"feature:{k}")] for k in ADMIN_FEATURES+USER_FEATURES]; rows.append([create_danger_button("بازگشت","menu:admin")]); return InlineKeyboardMarkup(rows)
@@ -374,6 +445,76 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query
     if not q: return
     await q.answer(); data=load_data(); uid=q.from_user.id
+    if q.data and q.data.startswith("im:"):
+        if not is_admin(uid, data): return
+        if q.data == IMCB["ROOT"]:
+            await q.edit_message_text("Inline Menu Engine", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False)))
+            return
+        if q.data == IMCB["TOGGLE"]:
+            if not data.get("active", False):
+                await q.answer("اول ربات را روشن کنید.", show_alert=True); return
+            data["inline_menu_enabled"] = not data.get("inline_menu_enabled", False); save_data(data)
+            db.log_admin(uid, "toggle", "inline_menu", None, None, str(data["inline_menu_enabled"]))
+            await q.edit_message_text("Inline Menu Engine", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False)))
+            return
+        if q.data == IMCB["CREATE"]:
+            db.set_admin_state(uid, "im_create_command", {})
+            await q.edit_message_text("Step 1/6: command menu را ارسال کنید.", reply_markup=build_back_kb("im:root")); return
+        if q.data == IMCB["ADD_BTN"]:
+            menus=[{"id":m["id"],"label":f"{m['command']}"} for m in db.list_menus()]
+            await q.edit_message_text("انتخاب منو:", reply_markup=paged_rows(menus,"im:addbtnpick",0)); return
+        if q.data.startswith("im:addbtnpick:"):
+            mid=int(q.data.split(":")[2]); db.set_admin_state(uid,"im_add_btn_text",{"menu_id":mid})
+            await q.edit_message_text("متن دکمه جدید را ارسال کنید.", reply_markup=build_back_kb("im:root")); return
+        if q.data == IMCB["MGR"] or q.data == IMCB["EDIT"]:
+            menus=[{"id":m["id"],"label":f"{m['command']}"} for m in db.list_menus()]
+            pref="im:mgrpick" if q.data==IMCB["MGR"] else "im:editpick"
+            await q.edit_message_text("انتخاب منو:", reply_markup=paged_rows(menus,pref,0)); return
+        if q.data.startswith("im:mgrpick:"):
+            mid=int(q.data.split(":")[2])
+            btns=db.menu_buttons(mid)
+            rows=[[InlineKeyboardButton("❌ Delete Entire Menu",callback_data=f"im:delmenu:{mid}")]]
+            for b in btns: rows.append([InlineKeyboardButton(f"🧨 حذف {b['button_text']}",callback_data=f"im:delbtn:{b['id']}")])
+            rows.append([InlineKeyboardButton("🧨 Cancel",callback_data="im:root")])
+            await q.edit_message_text("Menu Manager", reply_markup=InlineKeyboardMarkup(rows)); return
+        if q.data.startswith("im:delmenu:"):
+            mid=int(q.data.split(":")[2]); db.set_admin_state(uid,"im_confirm_del_menu",{"menu_id":mid})
+            await q.edit_message_text("تایید حذف کامل منو؟", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("YES",callback_data="im:confirm:yes"),InlineKeyboardButton("NO",callback_data="im:confirm:no")]])); return
+        if q.data.startswith("im:delbtn:"):
+            bid=int(q.data.split(":")[2]); db.set_admin_state(uid,"im_confirm_del_btn",{"button_id":bid})
+            await q.edit_message_text("تایید حذف دکمه؟", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("YES",callback_data="im:confirm:yes"),InlineKeyboardButton("NO",callback_data="im:confirm:no")]])); return
+        if q.data == IMCB["CONFIRM_NO"] or q.data == IMCB["CANCEL"]:
+            db.clear_admin_state(uid); await q.edit_message_text("لغو شد.", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False))); return
+        if q.data == IMCB["CONFIRM_YES"]:
+            st=db.get_admin_state(uid) or {}
+            if st.get("state")=="im_confirm_del_menu":
+                mid=int(st["payload"]["menu_id"])
+                with db.conn() as c: c.execute("DELETE FROM menus WHERE id=?", (mid,))
+                db.log_admin(uid,"delete","menu",mid,None,None)
+            elif st.get("state")=="im_confirm_del_btn":
+                bid=int(st["payload"]["button_id"])
+                with db.conn() as c: c.execute("DELETE FROM menu_buttons WHERE id=?", (bid,))
+                db.log_admin(uid,"delete","menu_button",bid,None,None)
+            db.clear_admin_state(uid); await q.edit_message_text("انجام شد.", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False))); return
+        if q.data=="im:act:just_text":
+            st=db.get_admin_state(uid) or {}
+            if st.get("state")=="im_create_action_type":
+                p=st.get("payload",{}); p["action_type"]="just_text"; db.set_admin_state(uid,"im_create_preview_text",p)
+                await q.edit_message_text("Step 4/6: preview text را بفرستید."); return
+        if q.data=="im:create:confirm:yes":
+            st=db.get_admin_state(uid) or {}
+            if st.get("state")=="im_create_confirm":
+                p=st["payload"]
+                mid=db.create_menu(p["command"], p["preview_text"])
+                bid=db.add_menu_button(mid, p["button_text"], p.get("action_type","just_text"), p["output_text"])
+                db.log_admin(uid,"create","menu",mid,None,json.dumps(p,ensure_ascii=False))
+                db.clear_admin_state(uid)
+                await q.edit_message_text(f"✅ Menu created (menu_id={mid}, button_id={bid})", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False))); return
+        if q.data=="im:create:confirm:no":
+            st=db.get_admin_state(uid) or {}
+            if st.get("state")=="im_create_confirm":
+                p=st.get("payload",{}); db.set_admin_state(uid,"im_create_output_text",p)
+                await q.edit_message_text("Output را دوباره بفرستید.", reply_markup=build_back_kb("im:root")); return
     if q.data.startswith("user:"):
         if not data.get("active", False):
             await q.message.reply_text("ربات خاموش است.")
@@ -382,6 +523,14 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mapping={"user:services":data.get("service_text") or "متن خدمات ثبت نشده.","user:hours":data.get("hours_text") or "متن ساعات کاری ثبت نشده.","user:location":data.get("location_text") or "متن آدرس ثبت نشده.","user:faq":data.get("faq_text") or "متن FAQ ثبت نشده.","user:contact":data.get("contact_text") or "متن تماس ثبت نشده.","user:feedback":data.get("feedback_prompt_text") or "لطفاً بازخورد خود را ارسال کنید."}
         msg=mapping.get(q.data)
         if msg: await send_formatted_message(q.message, msg, data)
+        return
+    if q.data.startswith("im:btn:"):
+        bid=int(q.data.split(":")[2])
+        with db.conn() as c:
+            row=c.execute("SELECT action_type, action_payload FROM menu_buttons WHERE id=? AND is_active=1",(bid,)).fetchone()
+        if not row: return
+        if row["action_type"]=="just_text":
+            await send_formatted_message(q.message, row["action_payload"], data)
         return
     if not is_admin(uid,data): return
     if q.data=="menu:admin": await q.edit_message_text("پنل ادمین", reply_markup=create_admin_keyboard(data))
@@ -562,6 +711,17 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
         return
     prev=db.get_user(uid)
     db.upsert_user(uid,(bm.from_user.username if bm.from_user else "") or "",(bm.from_user.full_name if bm.from_user else bm.chat.full_name) or "",None,False,"business",src_txt)
+    if data.get("inline_menu_enabled", False):
+        menu = db.menu_by_command(txt)
+        if menu:
+            buttons = db.menu_buttons(menu["id"])
+            rows = [[InlineKeyboardButton(b["button_text"], callback_data=f"im:btn:{b['id']}")] for b in buttons]
+            out = render_html_text(menu["preview_text"], bold=data.get("bold_mode", True))
+            kwargs = {"chat_id": bm.chat.id, "text": out, "parse_mode": ParseMode.HTML, "reply_markup": InlineKeyboardMarkup(rows)}
+            bc = getattr(bm, "business_connection_id", None)
+            if bc: kwargs["business_connection_id"] = bc
+            await context.bot.send_message(**kwargs)
+            return
     sc=db.load_shortcuts(); resp=match_shortcut(txt, sc)
     if resp and data.get("self_bot_enabled", False):
         bc=getattr(bm,"business_connection_id",None)
@@ -646,6 +806,23 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     # Monitoring is event-driven from business/channel/group updates.
     data=load_data(); uid=update.effective_user.id; src_txt=text_with_custom_emoji_markup(update.message); txt=(update.message.text or "").strip()
+    st=db.get_admin_state(uid) if is_admin(uid, data) else None
+    if st:
+        s=st.get("state"); p=st.get("payload",{})
+        if s=="im_create_command":
+            if db.menu_by_command(txt):
+                await update.message.reply_text("این command تکراری است. دوباره بفرستید."); return
+            p["command"]=txt; db.set_admin_state(uid,"im_create_button_text",p); await update.message.reply_text("Step 2/6: متن دکمه را بفرستید."); return
+        if s=="im_create_button_text":
+            p["button_text"]=src_txt; db.set_admin_state(uid,"im_create_action_type",p); await update.message.reply_text("Step 3/6: نوع اکشن", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("just_text",callback_data="im:act:just_text")],[InlineKeyboardButton("Cancel",callback_data="im:cancel")]])); return
+        if s=="im_create_preview_text":
+            p["preview_text"]=src_txt; db.set_admin_state(uid,"im_create_output_text",p); await update.message.reply_text("Step 5/6: output text را بفرستید."); return
+        if s=="im_create_output_text":
+            p["output_text"]=src_txt; db.set_admin_state(uid,"im_create_confirm",p); await update.message.reply_text("Confirm?", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("YES",callback_data="im:create:confirm:yes"),InlineKeyboardButton("NO",callback_data="im:create:confirm:no")]])); return
+        if s=="im_add_btn_text":
+            p["button_text"]=src_txt; db.set_admin_state(uid,"im_add_btn_output",p); await update.message.reply_text("Output text را بفرستید."); return
+        if s=="im_add_btn_output":
+            db.add_menu_button(int(p["menu_id"]), p["button_text"], "just_text", src_txt); db.clear_admin_state(uid); await update.message.reply_text("دکمه اضافه شد."); return
     row=db.get_user(uid)
     if row and int(row["soft_ban_until"] or 0)>int(time.time()): return
     db.upsert_user(uid, update.effective_user.username or "", update.effective_user.full_name or update.effective_user.first_name or "", update.message.contact.phone_number if update.message.contact else None, False, "message", txt)
@@ -655,6 +832,13 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         STATE.temp_shortcuts=None
         await update.message.reply_text("پنل ادمین", reply_markup=create_admin_keyboard(data))
         return
+    if data.get("inline_menu_enabled", False):
+        m = db.menu_by_command(txt)
+        if m:
+            btns=db.menu_buttons(m["id"])
+            rows=[[InlineKeyboardButton(b["button_text"], callback_data=f"im:btn:{b['id']}")] for b in btns]
+            await update.message.reply_text(render_html_text(m["preview_text"], bold=data.get("bold_mode", True)), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
+            return
     if txt.lower()=="menu":
         if not data.get("active", False) and not is_admin(uid, data):
             return
