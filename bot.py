@@ -168,7 +168,8 @@ def create_shortcut_menu_keyboard() -> InlineKeyboardMarkup:
 
 
 def parse_keyword_csv(raw: str) -> list[str]:
-    return [x.strip() for x in str(raw or "").split(",") if x.strip()]
+    normalized = str(raw or "").replace("،", ",")
+    return [x.strip() for x in normalized.split(",") if x.strip()]
 
 
 def build_shortcut_pick_keyboard(shortcuts: dict[str, str], prefix: str, map_key: str) -> InlineKeyboardMarkup:
@@ -176,6 +177,19 @@ def build_shortcut_pick_keyboard(shortcuts: dict[str, str], prefix: str, map_key
     rows = []
     for idx, key in enumerate(shortcuts.keys(), start=1):
         token = f"s{idx}"
+        token_map[token] = key
+        label = key if len(key) <= 40 else f"{key[:37]}..."
+        rows.append([create_primary_button(label, f"{prefix}:{token}")])
+    db.set_watch(map_key, token_map)
+    rows.append([create_danger_button("بازگشت", "admin:shortcut_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_watch_keyword_pick_keyboard(keywords: list[str], prefix: str, map_key: str) -> InlineKeyboardMarkup:
+    token_map: dict[str, str] = {}
+    rows = []
+    for idx, key in enumerate(keywords, start=1):
+        token = f"w{idx}"
         token_map[token] = key
         label = key if len(key) <= 40 else f"{key[:37]}..."
         rows.append([create_primary_button(label, f"{prefix}:{token}")])
@@ -288,22 +302,24 @@ async def maybe_report_watch_hit(update: Update, context: ContextTypes.DEFAULT_T
     hit_count = db.keyword_count(matched)
     if not report_chat:
         return
+    source_map = {"business": "Business PV", "channel": "Channel", "channel_edit": "Channel Edit", "group": "Group"}
     meta_raw = (
-        f"# مانیتورینگ_کلمه\n"
-        f"کلید: #{matched.replace(' ', '_')}\n"
-        f"تعداد_کل_تشخیص: {hit_count}\n"
-        f"منبع: {source}\n"
-        f"نام: {(eu.full_name if eu else '-') or '-'}\n"
-        f"id_عددی: {(eu.id if eu else '-')}\n"
-        f"username: @{(eu.username if eu and eu.username else '-')}\n"
-        f"چت: {(ec.title if ec else '-') or '-'} ({(ec.id if ec else '-')})\n"
-        f"زمان: {datetime.now(ZoneInfo('Asia/Tehran')).strftime('%Y-%m-%d %H:%M:%S')} (Asia/Tehran)"
+        f"Info: monitored message details\n"
+        f"Keyword: #{matched.replace(' ', '_')}\n"
+        f"TotalHits: {hit_count}\n"
+        f"Source: {source_map.get(source, source)}\n"
+        f"FullName: {(eu.full_name if eu else '-') or '-'}\n"
+        f"UserID: {(eu.id if eu else '-')}\n"
+        f"Username: @{(eu.username if eu and eu.username else '-')}\n"
+        f"Chat: {(ec.title if ec else '-') or '-'} ({(ec.id if ec else '-')})\n"
+        f"Time: {datetime.now(ZoneInfo('Asia/Tehran')).strftime('%Y-%m-%d %H:%M:%S')} Asia/Tehran"
     )
     meta = f"<pre><code class=\"language-ruby\">{html.escape(meta_raw)}</code></pre>"
     msg = update.message or getattr(update, "channel_post", None) or getattr(update, "business_message", None)
     try:
         if msg and ec:
             await context.bot.forward_message(chat_id=report_chat, from_chat_id=ec.id, message_id=msg.message_id)
+        await context.bot.send_message(chat_id=report_chat, text="💠 اطلاعات بیشتر از پیام مانیتور شده:", parse_mode=ParseMode.HTML)
         await context.bot.send_message(chat_id=report_chat, text=meta, parse_mode=ParseMode.HTML)
     except Exception as exc:
         logging.warning("watch_report_send_failed reason=%s", exc)
@@ -444,12 +460,29 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         STATE.flow, STATE.step, STATE.admin_id, STATE.message_id = "watch_cfg", "waiting_keywords_add", uid, q.message.message_id
         await q.edit_message_text("کلمات مانیتور را با ویرگول بفرستید.\nمثال: نامحدود,تست,ربات سلف", reply_markup=build_back_kb("admin:shortcut_menu"))
     elif q.data=="admin:watch_keywords_remove":
-        STATE.flow, STATE.step, STATE.admin_id, STATE.message_id = "watch_cfg", "waiting_keywords_remove", uid, q.message.message_id
-        await q.edit_message_text("کلمات جهت حذف را با ویرگول بفرستید.", reply_markup=build_back_kb("admin:shortcut_menu"))
+        current = db.get_watch("watch_keywords", [])
+        kb = build_watch_keyword_pick_keyboard(current, "admin:watch_kw_remove_pick", "watch_kw_remove_tokens") if current else InlineKeyboardMarkup([[create_danger_button("بازگشت", "admin:shortcut_menu")]])
+        await q.edit_message_text("انتخاب کلمه مانیتور برای حذف:", reply_markup=kb)
+    elif q.data.startswith("admin:watch_kw_remove_pick:"):
+        token = q.data.split(":", 2)[2]
+        key = db.get_watch("watch_kw_remove_tokens", {}).get(token)
+        if not key:
+            await q.edit_message_text("آیتم معتبر نیست.", reply_markup=create_shortcut_menu_keyboard()); return
+        db.set_watch("watch_kw_remove_confirm", {"x": key})
+        await q.edit_message_text(f"حذف کلمه «{key}» تایید می‌شود؟", reply_markup=InlineKeyboardMarkup([[create_danger_button("تایید حذف", "admin:watch_kw_remove_confirm:x")], [create_primary_button("انصراف", "admin:shortcut_menu")]]))
+    elif q.data.startswith("admin:watch_kw_remove_confirm:"):
+        token = q.data.split(":", 2)[2]
+        key = db.get_watch("watch_kw_remove_confirm", {}).get(token)
+        if not key:
+            await q.edit_message_text("آیتم معتبر نیست.", reply_markup=create_shortcut_menu_keyboard()); return
+        old = db.get_watch("watch_keywords", [])
+        left = [x for x in old if str(x).strip().lower() != str(key).strip().lower()]
+        db.set_watch("watch_keywords", left)
+        await q.edit_message_text("کلمه مانیتور حذف شد.", reply_markup=create_shortcut_menu_keyboard())
     elif q.data=="admin:watch_keywords_stats":
         configured = db.get_watch("watch_keywords", [])
         rows = {r["keyword"]: r["cnt"] for r in db.hit_stats()}
-        out = "📚 مشاهده کلمات مانیتور:\n\n" + ("\n".join([f"• {k}: {rows.get(k, 0)} hit" for k in configured]) if configured else "کلمه‌ای ثبت نشده.")
+        out = "📚 مشاهده کلمات مانیتور:\n\n" + ("\n".join([f"• {k}: {rows.get(k, 0)}" for k in configured]) if configured else "کلمه‌ای ثبت نشده.")
         await q.edit_message_text(out, reply_markup=build_back_kb("admin:shortcut_menu"))
     elif q.data=="admin:db_export":
         stamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
@@ -611,7 +644,7 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat and update.effective_chat.type in {"group", "supergroup"}:
         await maybe_report_watch_hit(update, context, "group", update.message.text or update.message.caption or "")
         return
-    await maybe_report_watch_hit(update, context, "private", update.message.text or update.message.caption or "")
+    # Monitoring is event-driven from business/channel/group updates.
     data=load_data(); uid=update.effective_user.id; src_txt=text_with_custom_emoji_markup(update.message); txt=(update.message.text or "").strip()
     row=db.get_user(uid)
     if row and int(row["soft_ban_until"] or 0)>int(time.time()): return
