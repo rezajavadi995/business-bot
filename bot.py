@@ -121,6 +121,10 @@ class DB:
     def hit_stats(self):
         with self.conn() as c:
             return c.execute("SELECT keyword, COUNT(*) AS cnt FROM keyword_hits GROUP BY keyword ORDER BY cnt DESC, keyword ASC").fetchall()
+    def keyword_count(self, keyword: str) -> int:
+        with self.conn() as c:
+            row = c.execute("SELECT COUNT(*) AS cnt FROM keyword_hits WHERE keyword=?", (keyword,)).fetchone()
+            return int(row["cnt"] if row else 0)
     def delete_shortcut(self, key: str):
         with self.conn() as c:
             c.execute("DELETE FROM shortcuts WHERE name=?", (key,))
@@ -281,23 +285,26 @@ async def maybe_report_watch_hit(update: Update, context: ContextTypes.DEFAULT_T
     eu = update.effective_user
     ec = update.effective_chat
     db.add_keyword_hit(matched, (eu.id if eu else None), (eu.username if eu else "") or "", (eu.full_name if eu else "") or "", (ec.id if ec else 0), (ec.title if ec else "") or "", text)
+    hit_count = db.keyword_count(matched)
     if not report_chat:
         return
-    meta = (
-        f"💎 #مانیتورینگ\n"
-        f"🔖 کلید: #{matched.replace(' ', '_')}\n"
-        f"📍 منبع: {source}\n"
-        f"👤 نام: {(eu.full_name if eu else '-') or '-'}\n"
-        f"🆔 عددی: {(eu.id if eu else '-')}\n"
-        f"🔗 یوزرنیم: @{(eu.username if eu and eu.username else '-')}\n"
-        f"💬 چت: {(ec.title if ec else '-') or '-'} ({(ec.id if ec else '-')})\n"
-        f"🕒 زمان: {datetime.now(ZoneInfo('Asia/Tehran')).strftime('%Y-%m-%d %H:%M:%S')} (Asia/Tehran)"
+    meta_raw = (
+        f"# مانیتورینگ_کلمه\n"
+        f"کلید: #{matched.replace(' ', '_')}\n"
+        f"تعداد_کل_تشخیص: {hit_count}\n"
+        f"منبع: {source}\n"
+        f"نام: {(eu.full_name if eu else '-') or '-'}\n"
+        f"id_عددی: {(eu.id if eu else '-')}\n"
+        f"username: @{(eu.username if eu and eu.username else '-')}\n"
+        f"چت: {(ec.title if ec else '-') or '-'} ({(ec.id if ec else '-')})\n"
+        f"زمان: {datetime.now(ZoneInfo('Asia/Tehran')).strftime('%Y-%m-%d %H:%M:%S')} (Asia/Tehran)"
     )
+    meta = f"<pre><code class=\"language-ruby\">{html.escape(meta_raw)}</code></pre>"
     msg = update.message or getattr(update, "channel_post", None) or getattr(update, "business_message", None)
     try:
         if msg and ec:
             await context.bot.forward_message(chat_id=report_chat, from_chat_id=ec.id, message_id=msg.message_id)
-        await context.bot.send_message(chat_id=report_chat, text=meta)
+        await context.bot.send_message(chat_id=report_chat, text=meta, parse_mode=ParseMode.HTML)
     except Exception as exc:
         logging.warning("watch_report_send_failed reason=%s", exc)
 
@@ -561,10 +568,21 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
 
 async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if getattr(update,"business_message",None): await business_message_handler(update, context); return
+    if getattr(update, "edited_business_message", None):
+        update.business_message = update.edited_business_message
+        await business_message_handler(update, context)
+        return
     if getattr(update, "channel_post", None):
         cp = update.channel_post
-        await maybe_report_watch_hit(update, context, "channel", cp.text or "")
+        await maybe_report_watch_hit(update, context, "channel", cp.text or cp.caption or "")
         return
+    if getattr(update, "edited_channel_post", None):
+        update.channel_post = update.edited_channel_post
+        cp = update.channel_post
+        await maybe_report_watch_hit(update, context, "channel_edit", cp.text or cp.caption or "")
+        return
+    if getattr(update, "edited_message", None):
+        update.message = update.edited_message
     if not update.message or not update.effective_user: return
     if STATE.admin_id == (update.effective_user.id if update.effective_user else None) and STATE.flow == "db_import" and STATE.step == "waiting_document":
         txt_cmd = (update.message.text or "").strip().lower() if update.message else ""
@@ -591,9 +609,9 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         os.execlp("python", "python", str(BASE_DIR / "bot.py"))
         return
     if update.effective_chat and update.effective_chat.type in {"group", "supergroup"}:
-        await maybe_report_watch_hit(update, context, "group", update.message.text or "")
+        await maybe_report_watch_hit(update, context, "group", update.message.text or update.message.caption or "")
         return
-    await maybe_report_watch_hit(update, context, "private", update.message.text or "")
+    await maybe_report_watch_hit(update, context, "private", update.message.text or update.message.caption or "")
     data=load_data(); uid=update.effective_user.id; src_txt=text_with_custom_emoji_markup(update.message); txt=(update.message.text or "").strip()
     row=db.get_user(uid)
     if row and int(row["soft_ban_until"] or 0)>int(time.time()): return
