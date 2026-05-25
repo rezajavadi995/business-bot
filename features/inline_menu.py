@@ -4,6 +4,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from features.inline_callback import cb
 
 CB = {
     "ROOT": "im:root",
@@ -32,12 +33,12 @@ def build_inline_menu_admin_kb(enabled: bool, global_active: bool) -> InlineKeyb
 def paged_rows(items: list[dict[str, Any]], prefix: str, page: int, page_size: int = 8):
     start = page * page_size
     chunk = items[start:start + page_size]
-    rows = [[InlineKeyboardButton(x["label"], callback_data=f"{prefix}:{x['id']}")] for x in chunk]
+    rows = [[InlineKeyboardButton(x["label"], callback_data=cb(prefix, str(x["id"])))] for x in chunk]
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton("⬅️", callback_data=f"{prefix}:page:{page-1}"))
+        nav.append(InlineKeyboardButton("⬅️", callback_data=cb(prefix, "page", str(page-1))))
     if start + page_size < len(items):
-        nav.append(InlineKeyboardButton("➡️", callback_data=f"{prefix}:page:{page+1}"))
+        nav.append(InlineKeyboardButton("➡️", callback_data=cb(prefix, "page", str(page+1))))
     if nav:
         rows.append(nav)
     rows.append([InlineKeyboardButton("🧨 Cancel", callback_data=CB["CANCEL"])])

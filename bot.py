@@ -21,6 +21,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 from features.log_export import build_logs_keyboard, humanize_log_text
 from features.inline_menu import build_inline_menu_admin_kb, paged_rows, CB as IMCB
 from features.inline_actions import ACTION_REGISTRY
+from features.inline_callback import parse as parse_cb, is_valid_im_callback
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
@@ -178,6 +179,8 @@ class DB:
             return {"state": r["state"], "payload": json.loads(r["payload"] or "{}")}
     def clear_admin_state(self, admin_id: int):
         with self.conn() as c: c.execute("DELETE FROM admin_states WHERE admin_id=?", (admin_id,))
+    def clear_admin_state_if(self, admin_id: int, state: str):
+        with self.conn() as c: c.execute("DELETE FROM admin_states WHERE admin_id=? AND state=?", (admin_id, state))
     def log_admin(self, admin_id:int, action:str, target_type:str, target_id:int|None, old_value:str|None, new_value:str|None):
         with self.conn() as c:
             c.execute("INSERT INTO admin_logs(admin_id,action,target_type,target_id,old_value,new_value,created_at) VALUES(?,?,?,?,?,?,?)",
@@ -200,6 +203,19 @@ class DB:
         with self.conn() as c: return c.execute("SELECT * FROM menus WHERE command=? AND is_active=1",(command,)).fetchone()
     def menu_buttons(self, menu_id:int):
         with self.conn() as c: return c.execute("SELECT * FROM menu_buttons WHERE menu_id=? AND is_active=1 ORDER BY sort_order,id",(menu_id,)).fetchall()
+    def delete_menu_atomic(self, menu_id: int) -> bool:
+        with self.conn() as c:
+            cur = c.execute("DELETE FROM menus WHERE id=?", (menu_id,))
+            return cur.rowcount > 0
+    def delete_button_atomic(self, button_id: int) -> bool:
+        with self.conn() as c:
+            row = c.execute("SELECT menu_id, sort_order FROM menu_buttons WHERE id=?", (button_id,)).fetchone()
+            if not row: return False
+            menu_id = int(row["menu_id"]); sort_order = int(row["sort_order"])
+            c.execute("DELETE FROM menu_buttons WHERE id=?", (button_id,))
+            c.execute("UPDATE menu_buttons SET sort_order = sort_order - 1, updated_at=? WHERE menu_id=? AND sort_order>?",
+                      (int(time.time()), menu_id, sort_order))
+            return True
     def update_menu_preview(self, menu_id:int, preview:str):
         with self.conn() as c: c.execute("UPDATE menus SET preview_text=?, updated_at=? WHERE id=?", (preview, int(time.time()), menu_id))
     def update_menu_command(self, menu_id:int, command:str):
@@ -457,6 +473,9 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not q: return
     await q.answer(); data=load_data(); uid=q.from_user.id
     if q.data and q.data.startswith("im:"):
+        if not is_valid_im_callback(q.data):
+            logging.warning("im_callback_rejected_invalid uid=%s data=%r", uid, q.data)
+            return
         if not is_admin(uid, data): return
         if q.data == IMCB["ROOT"]:
             await q.edit_message_text("Inline Menu Engine", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False)))
@@ -518,6 +537,9 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text("Button را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(rows)); return
         if q.data.startswith("im:editpickbtn:"):
             _,_,op,bid=q.data.split(":")
+            if not db.button_by_id(int(bid)):
+                logging.warning("im_stale_callback_button_missing uid=%s button_id=%s", uid, bid)
+                await q.edit_message_text("آیتم دیگر وجود ندارد.", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False))); return
             db.set_admin_state(uid, "im_edit_button_name" if op=="btnname" else "im_edit_button_output", {"button_id":int(bid)})
             await q.edit_message_text("مقدار جدید را بفرستید.", reply_markup=build_back_kb("im:root")); return
         if q.data.startswith("im:delmenu:"):
@@ -532,12 +554,12 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             st=db.get_admin_state(uid) or {}
             if st.get("state")=="im_confirm_del_menu":
                 mid=int(st["payload"]["menu_id"])
-                with db.conn() as c: c.execute("DELETE FROM menus WHERE id=?", (mid,))
-                db.log_admin(uid,"delete","menu",mid,None,None)
+                ok = db.delete_menu_atomic(mid)
+                db.log_admin(uid,"delete_menu","menu",mid,None,json.dumps({"status":"ok" if ok else "missing"}, ensure_ascii=False))
             elif st.get("state")=="im_confirm_del_btn":
                 bid=int(st["payload"]["button_id"])
-                with db.conn() as c: c.execute("DELETE FROM menu_buttons WHERE id=?", (bid,))
-                db.log_admin(uid,"delete","menu_button",bid,None,None)
+                ok = db.delete_button_atomic(bid)
+                db.log_admin(uid,"delete_button","menu_button",bid,None,json.dumps({"status":"ok" if ok else "missing"}, ensure_ascii=False))
             db.clear_admin_state(uid); await q.edit_message_text("انجام شد.", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False))); return
         if q.data=="im:act:just_text":
             st=db.get_admin_state(uid) or {}
