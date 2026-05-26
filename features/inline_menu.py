@@ -13,6 +13,7 @@ CB = {
     "ADD_BTN": "im:addbtn",
     "MGR": "im:mgr",
     "EDIT": "im:edit",
+    "LIVE": "im:live",
     "CANCEL": "im:cancel",
     "CONFIRM_YES": "im:confirm:yes",
     "CONFIRM_NO": "im:confirm:no",
@@ -26,6 +27,7 @@ def build_inline_menu_admin_kb(enabled: bool, global_active: bool) -> InlineKeyb
         [InlineKeyboardButton(f"🧩 Inline Menu: {state}", callback_data=CB["TOGGLE"])],
         [InlineKeyboardButton("🆕 Create New Menu", callback_data=CB["CREATE"]), InlineKeyboardButton("➕ Add Button", callback_data=CB["ADD_BTN"])],
         [InlineKeyboardButton("🗂 Menu Manager", callback_data=CB["MGR"]), InlineKeyboardButton("✏️ Edit Menu", callback_data=CB["EDIT"])],
+        [InlineKeyboardButton("📋 View All Menus (Live List)", callback_data=CB["LIVE"])],
         [InlineKeyboardButton("🧨 بازگشت", callback_data="menu:admin")],
     ])
 
