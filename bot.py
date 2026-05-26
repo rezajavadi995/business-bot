@@ -478,6 +478,19 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query
     if not q: return
     await q.answer(); data=load_data(); uid=q.from_user.id
+    if q.data.startswith("im:btn:"):
+        if not data.get("active", False) or not data.get("inline_menu_enabled", False):
+            return
+        bid=int(q.data.split(":")[2])
+        with db.conn() as c:
+            row=c.execute("SELECT action_type, action_payload FROM menu_buttons WHERE id=? AND is_active=1",(bid,)).fetchone()
+        if not row: return
+        handler = ACTION_REGISTRY.get(row["action_type"])
+        if not handler: return
+        async def send_fn(payload: str):
+            await send_formatted_message(q.message, payload, data)
+        await handler.execute(send_fn, row["action_payload"])
+        return
     if q.data and q.data.startswith("im:"):
         if not is_valid_im_callback(q.data):
             logging.warning("im_callback_rejected_invalid uid=%s data=%r", uid, q.data)
@@ -624,17 +637,6 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mapping={"user:services":data.get("service_text") or "متن خدمات ثبت نشده.","user:hours":data.get("hours_text") or "متن ساعات کاری ثبت نشده.","user:location":data.get("location_text") or "متن آدرس ثبت نشده.","user:faq":data.get("faq_text") or "متن FAQ ثبت نشده.","user:contact":data.get("contact_text") or "متن تماس ثبت نشده.","user:feedback":data.get("feedback_prompt_text") or "لطفاً بازخورد خود را ارسال کنید."}
         msg=mapping.get(q.data)
         if msg: await send_formatted_message(q.message, msg, data)
-        return
-    if q.data.startswith("im:btn:"):
-        bid=int(q.data.split(":")[2])
-        with db.conn() as c:
-            row=c.execute("SELECT action_type, action_payload FROM menu_buttons WHERE id=? AND is_active=1",(bid,)).fetchone()
-        if not row: return
-        handler = ACTION_REGISTRY.get(row["action_type"])
-        if not handler: return
-        async def send_fn(payload: str):
-            await send_formatted_message(q.message, payload, data)
-        await handler.execute(send_fn, row["action_payload"])
         return
     if not is_admin(uid,data): return
     if q.data=="menu:admin": await q.edit_message_text("پنل ادمین", reply_markup=create_admin_keyboard(data))
@@ -815,11 +817,14 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
         return
     prev=db.get_user(uid)
     db.upsert_user(uid,(bm.from_user.username if bm.from_user else "") or "",(bm.from_user.full_name if bm.from_user else bm.chat.full_name) or "",None,False,"business",src_txt)
-    if data.get("inline_menu_enabled", False):
+    if data.get("active", False) and data.get("inline_menu_enabled", False):
         menu = db.menu_by_command(txt)
         if menu:
             buttons = db.menu_buttons(menu["id"])
-            rows = [[InlineKeyboardButton(b["button_text"], callback_data=f"im:btn:{b['id']}")] for b in buttons]
+            rows = [[InlineKeyboardButton(buttons[i]["button_text"], callback_data=f"im:btn:{buttons[i]['id']}"),
+                     InlineKeyboardButton(buttons[i+1]["button_text"], callback_data=f"im:btn:{buttons[i+1]['id']}")] if i+1 < len(buttons)
+                    else [InlineKeyboardButton(buttons[i]["button_text"], callback_data=f"im:btn:{buttons[i]['id']}")]
+                    for i in range(0, len(buttons), 2)]
             out = render_html_text(menu["preview_text"], bold=data.get("bold_mode", True))
             kwargs = {"chat_id": bm.chat.id, "text": out, "parse_mode": ParseMode.HTML, "reply_markup": InlineKeyboardMarkup(rows)}
             bc = getattr(bm, "business_connection_id", None)
@@ -953,11 +958,14 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         STATE.temp_shortcuts=None
         await update.message.reply_text("پنل ادمین", reply_markup=create_admin_keyboard(data))
         return
-    if data.get("inline_menu_enabled", False):
+    if data.get("active", False) and data.get("inline_menu_enabled", False):
         m = db.menu_by_command(txt)
         if m:
             btns=db.menu_buttons(m["id"])
-            rows=[[InlineKeyboardButton(b["button_text"], callback_data=f"im:btn:{b['id']}")] for b in btns]
+            rows=[[InlineKeyboardButton(btns[i]["button_text"], callback_data=f"im:btn:{btns[i]['id']}"),
+                   InlineKeyboardButton(btns[i+1]["button_text"], callback_data=f"im:btn:{btns[i+1]['id']}")] if i+1 < len(btns)
+                  else [InlineKeyboardButton(btns[i]["button_text"], callback_data=f"im:btn:{btns[i]['id']}")]
+                  for i in range(0, len(btns), 2)]
             await update.message.reply_text(render_html_text(m["preview_text"], bold=data.get("bold_mode", True)), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
             return
     if txt.lower()=="menu":
