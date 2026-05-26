@@ -200,7 +200,8 @@ class DB:
     def list_menus(self):
         with self.conn() as c: return c.execute("SELECT * FROM menus ORDER BY id DESC").fetchall()
     def menu_by_command(self, command:str):
-        with self.conn() as c: return c.execute("SELECT * FROM menus WHERE command=? AND is_active=1",(command,)).fetchone()
+        with self.conn() as c:
+            return c.execute("SELECT * FROM menus WHERE LOWER(command)=LOWER(?) AND is_active=1", (command,)).fetchone()
     def menu_buttons(self, menu_id:int):
         with self.conn() as c: return c.execute("SELECT * FROM menu_buttons WHERE menu_id=? AND is_active=1 ORDER BY sort_order,id",(menu_id,)).fetchall()
     def delete_menu_atomic(self, menu_id: int) -> bool:
