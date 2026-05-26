@@ -500,6 +500,8 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text("State منقضی شد. دوباره از منو شروع کنید.", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False)))
             return
         if not is_admin(uid, data): return
+        if (not data.get("active", False)) and q.data not in {IMCB["ROOT"], IMCB["TOGGLE"], IMCB["CANCEL"], IMCB["CONFIRM_NO"]}:
+            await q.answer("اول باید ربات را از وضعیت سراسری روشن کنید.", show_alert=True); return
         if q.data == IMCB["ROOT"]:
             await q.edit_message_text("Inline Menu Engine", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False)))
             return
@@ -526,8 +528,20 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text("Live Menus:", reply_markup=paged_rows(menus,"im:livepick",0)); return
         if q.data.startswith("im:livepick:"):
             parts=q.data.split(":")
-            if len(parts) >= 4 and parts[2] != "page":
-                await q.edit_message_text("Live Menus:", reply_markup=paged_rows([{"id":m["id"],"label":f"{m['command']}"} for m in db.list_menus()],"im:livepick",0)); return
+            if len(parts) >= 4 and parts[2] == "page":
+                pass
+            elif len(parts) >= 3:
+                mid=int(parts[2])
+                menu = next((m for m in db.list_menus() if int(m["id"]) == mid), None)
+                if not menu:
+                    await q.edit_message_text("این منو دیگر وجود ندارد.", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False))); return
+                btns = db.menu_buttons(mid)
+                rows = [[InlineKeyboardButton(btns[i]["button_text"], callback_data=f"im:btn:{btns[i]['id']}"),
+                         InlineKeyboardButton(btns[i+1]["button_text"], callback_data=f"im:btn:{btns[i+1]['id']}")] if i+1 < len(btns)
+                        else [InlineKeyboardButton(btns[i]["button_text"], callback_data=f"im:btn:{btns[i]['id']}")]
+                        for i in range(0, len(btns), 2)]
+                rows.append([InlineKeyboardButton("🔙 بازگشت به لیست", callback_data="im:live")])
+                await q.edit_message_text(f"📋 Menu: {menu['command']}\n\n{menu['preview_text']}", reply_markup=InlineKeyboardMarkup(rows)); return
 
         if q.data.startswith("im:addbtnpick:"):
             try: mid=int(q.data.split(":")[2])
@@ -969,7 +983,7 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(render_html_text(m["preview_text"], bold=data.get("bold_mode", True)), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
             return
     if txt.lower()=="menu":
-        if not data.get("active", False) and not is_admin(uid, data):
+        if not data.get("active", False):
             return
         logging.info("user_menu_open uid=%s", uid)
         await update.message.reply_text("منوی کاربر", reply_markup=create_menu_keyboard())
