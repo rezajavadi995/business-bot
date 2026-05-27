@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram import MessageEntity
 from telegram.constants import ParseMode
+from telegram.error import TimedOut
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 from features.log_export import build_logs_keyboard, humanize_log_text
 from features.inline_menu import build_inline_menu_admin_kb, paged_rows, CB as IMCB
@@ -481,6 +482,17 @@ def hit_limit_and_maybe_ban(uid: int, bucket: str = "global_action", window_sec:
         return True
     return False
 
+async def safe_callback_answer(q, text: str | None = None, show_alert: bool = False) -> bool:
+    try:
+        if text is None:
+            await q.answer()
+        else:
+            await q.answer(text, show_alert=show_alert)
+        return True
+    except TimedOut:
+        logging.warning("callback_answer_timeout id=%s data=%r", getattr(q, "id", None), getattr(q, "data", None))
+        return False
+
 async def maybe_welcome(update: Update, data: dict[str, Any], uid: int, source: str) -> bool:
     if source!="business" or not data.get("welcome_enabled",True): return False
     row=db.get_user(uid); now=int(time.time())
@@ -505,7 +517,7 @@ async def panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query
     if not q: return
-    await q.answer(); data=load_data(); uid=q.from_user.id
+    await safe_callback_answer(q); data=load_data(); uid=q.from_user.id
     if q.data.startswith("im:btn:"):
         row_user = db.get_user(uid)
         if row_user and int(row_user["soft_ban_until"] or 0) > int(time.time()):
@@ -536,13 +548,13 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if not is_admin(uid, data): return
         if (not data.get("active", False)) and q.data not in {IMCB["ROOT"], IMCB["TOGGLE"], IMCB["CANCEL"], IMCB["CONFIRM_NO"]}:
-            await q.answer("اول باید ربات را از وضعیت سراسری روشن کنید.", show_alert=True); return
+            await safe_callback_answer(q, "اول باید ربات را از وضعیت سراسری روشن کنید.", show_alert=True); return
         if q.data == IMCB["ROOT"]:
             await q.edit_message_text("Inline Menu Engine", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False)))
             return
         if q.data == IMCB["TOGGLE"]:
             if not data.get("active", False):
-                await q.answer("اول ربات را روشن کنید.", show_alert=True); return
+                await safe_callback_answer(q, "اول ربات را روشن کنید.", show_alert=True); return
             data["inline_menu_enabled"] = not data.get("inline_menu_enabled", False); save_data(data)
             db.log_admin(uid, "toggle", "inline_menu", None, None, str(data["inline_menu_enabled"]))
             await q.edit_message_text("Inline Menu Engine", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False)))
@@ -712,7 +724,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text(f"متن قبلی ({TEXT_KEYS[key]}):\n{data.get(key,'') or '(خالی)'}\n\nمتن جدید را ارسال کنید.")
     elif q.data=="admin:selfbot":
         if not data.get("active", False):
-            await q.answer("اول ربات را از وضعیت سراسری روشن کنید.", show_alert=True)
+            await safe_callback_answer(q, "اول ربات را از وضعیت سراسری روشن کنید.", show_alert=True)
             return
         data["self_bot_enabled"]=not data.get("self_bot_enabled",False); save_data(data); await q.edit_message_text("وضعیت Self Bot تغییر کرد.", reply_markup=create_admin_keyboard(data))
     elif q.data=="admin:shortcut_menu": await q.edit_message_text("مدیریت سلف بات", reply_markup=create_shortcut_menu_keyboard())
@@ -832,7 +844,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("شورت‌کات‌ها ذخیره شدند.", reply_markup=create_shortcut_menu_keyboard())
     elif q.data=="admin:welcome_toggle":
         if not data.get("active", False):
-            await q.answer("اول ربات را از وضعیت سراسری روشن کنید.", show_alert=True)
+            await safe_callback_answer(q, "اول ربات را از وضعیت سراسری روشن کنید.", show_alert=True)
             return
         data["welcome_enabled"]=not data.get("welcome_enabled",False); save_data(data); await q.edit_message_text("وضعیت Welcome تغییر کرد.", reply_markup=create_admin_keyboard(data))
     elif q.data=="admin:welcome_cfg": STATE.flow,STATE.step,STATE.admin_id,STATE.message_id,STATE.pending_key="welcome_cfg","waiting_value",uid,q.message.message_id,"welcome_text"; await q.edit_message_text(f"متن فعلی Welcome:\n{data.get('welcome_text','')}\n\nمتن جدید را ارسال کنید.", reply_markup=build_back_kb("menu:admin"))
@@ -887,7 +899,10 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
             kwargs = {"chat_id": bm.chat.id, "text": out, "parse_mode": ParseMode.HTML, "reply_markup": InlineKeyboardMarkup(rows)}
             bc = getattr(bm, "business_connection_id", None)
             if bc: kwargs["business_connection_id"] = bc
-            await context.bot.send_message(**kwargs)
+            try:
+                await context.bot.send_message(**kwargs)
+            except TimedOut:
+                logging.warning("business_inline_menu_send_timeout uid=%s chat_id=%s command=%r", uid, bm.chat.id, txt)
             return
     sc=db.load_shortcuts(); resp=match_shortcut(txt, sc)
     if resp and data.get("self_bot_enabled", False):
@@ -917,7 +932,11 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
         out_text = render_html_text(resp, bold=data.get("bold_mode", True))
         kwargs={"chat_id":bm.chat.id,"text":out_text,"parse_mode":ParseMode.HTML}
         if bc: kwargs["business_connection_id"]=bc
-        await context.bot.send_message(**kwargs)
+        try:
+            await context.bot.send_message(**kwargs)
+        except TimedOut:
+            logging.warning("business_shortcut_send_timeout uid=%s chat_id=%s text=%r", uid, bm.chat.id, txt)
+            return
         logging.info("business_shortcut_sent uid=%s text=%s",uid, txt)
         return
     logging.info("business_shortcut_no_match uid=%s text=%s", uid, txt)
