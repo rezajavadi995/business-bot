@@ -1,69 +1,88 @@
-# Telegram Business Bot (v1 Release)
+# Telegram Business Bot — v2 Release Notes
 
-ربات بیزینسی تلگرام با ذخیره‌سازی پایدار SQLite، پنل ادمین کامل، مدیریت شورت‌کات، مانیتورینگ کلمات، خروجی لاگ، و بک‌آپ/ایمپورت دیتابیس.
+ربات بیزینسی/پرسونال هیبرید برای پاسخ‌دهی اتوماتیک، مدیریت منوهای اینلاین، شورت‌کات‌ها و مانیتورینگ.
 
-## نصب سریع
-```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/rezajavadi995/business-bot/main/install.sh)"
-```
-
-پس از نصب:
-```bash
-manage
-```
+## ✅ وضعیت v2
+این نسخه برای جریان Inline Menu Engine با رفتار production آماده شده است، شامل:
+- ترتیب صحیح ساخت منو (command → preview → button → action → output).
+- اجرای اکشن دکمه برای مشتری‌ها (غیرادمین) بدون بلاک اشتباه.
+- چیدمان افقی دکمه‌های منو (۲ تایی در هر ردیف).
+- تبعیت کامل Inline Menu از وضعیت سراسری ربات (`active`).
+- لیست زنده منوها + مشاهده دکمه‌های هر منو از داخل پنل.
 
 ---
 
-## معماری فعلی
+## معماری
 - Runtime: `python-telegram-bot` (async)
-- Database: `bot.db` (SQLite)
+- DB: `SQLite` (`bot.db`)
 - Entry point: `bot.py`
-- ماژول‌های کمکی:
+- Helper modules:
+  - `features/inline_menu.py`
+  - `features/inline_actions.py`
+  - `features/inline_callback.py`
   - `features/log_export.py`
 
 ---
 
-## جداول دیتابیس
-- `kv`: تنظیمات و state عمومی
-- `users`: اطلاعات کاربران
-- `shortcuts`: شورت‌کات‌ها
-- `feedbacks`: تاریخچه بازخوردها
-- `watch_settings`: تنظیمات مانیتورینگ (کلیدواژه‌ها، چنل گزارش)
-- `keyword_hits`: رخدادهای تشخیص کلیدواژه
+## رفتار کلیدی وضعیت سراسری
+- اگر `active = OFF`:
+  - عملیات‌های **ادمینی اینلاین** که نیاز به اجرای سیستم دارند با `Popup Alert` متوقف می‌شوند.
+  - دکمه‌های **Reply Keyboard فیزیکی** (مثل `menu`) سایلنت no-op هستند.
+  - اجرای منوهای اینلاین برای کاربران متوقف است.
+- اگر `active = ON` و `inline_menu_enabled = ON`:
+  - منوها فعال می‌شوند و خروجی طبق pipeline بیزینسی ارسال می‌گردد.
 
 ---
 
-## قابلیت‌های اصلی
-- پنل ادمین با دکمه‌های اینلاین
-- روشن/خاموش سراسری ربات (با اولویت بر فیچرها)
-- Welcome قابل تنظیم برای مسیر Business PV
-- Self Bot قابل تنظیم
-- مدیریت شورت‌کات:
-  - مشاهده
-  - افزودن
-  - ویرایش کلید/متن
-  - حذف با تایید
-- بازخورد کاربران + گزارش به ادمین
-- بک‌آپ دیتابیس (`.db`) و ایمپورت دیتابیس
-- خروجی لاگ‌ها به فایل txt انسان‌خوان
+## Inline Menu Engine (v2)
+### پنل ادمین
+- 🧩 Inline Menu Toggle
+- 🆕 ساخت منوی جدید
+- ➕ افزودن دکمه
+- 🗂️ مدیریت منوها
+- ✏️ ویرایش منو
+- 📡 لیست زنده منوها
+
+### Create Flow
+1. Menu command
+2. Preview text
+3. Button name
+4. Action type (فعلاً `just_text`)
+5. Output text
+6. Confirm (YES/NO)
+
+### Edit Button Output Flow
+1. انتخاب دکمه
+2. انتخاب Action Type (فعلاً `just_text`)
+3. ورود خروجی جدید
+4. ذخیره و جایگزینی متن قبلی
+
+### Live List
+- لیست منوها از دیتابیس و به‌صورت pagination.
+- با کلیک روی هر منو، preview و دکمه‌های همان منو به‌صورت شیشه‌ای نمایش داده می‌شود.
 
 ---
 
-## مانیتورینگ کلمات (Watch)
-در زیرمنوی «مدیریت سلف بات»:
-- تنظیم چنل گزارشات
-- افزودن کلمات مانیتور (با `,` یا `،`)
-- حذف کلمات مانیتور (inline + تایید)
-- مشاهده کلمات مانیتور و تعداد تشخیص
-
-### نکته مهم مانیتورینگ
-مانیتورینگ فقط روی آپدیت‌هایی کار می‌کند که تلگرام به همین بات می‌دهد؛ یعنی عملاً در چت‌ها/گروه‌ها/چنل‌هایی که بات در آن‌ها حضور/دسترسی دارد (و مسیر business update فعال است). این فیچر، مانیتور کامل کل اکانت شخصی در همه چت‌های خارج از دسترسی بات نیست.
+## دیتابیس
+جداول اصلی:
+- `menus`
+- `menu_buttons`
+- `admin_states`
+- `admin_logs`
+- `users`
+- `shortcuts`
+- `feedbacks`
+- `watch_settings`
+- `keyword_hits`
+- `kv`
 
 ---
 
-## لاگ‌ها
-- مسیر اصلی لاگ: `logs/bot.log`
-- در پنل ادمین می‌توانید فایل‌های `.log` / `.txt` داخل پوشه `logs/` را انتخاب و به‌صورت فایل txt دریافت کنید.
+## نصب و اجرا
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/rezajavadi995/business-bot/main/install.sh)"
+manage
+```
 
 ---
 
@@ -76,5 +95,7 @@ manage
 
 ---
 
-## اجرای پایدار سرویس
-از `manage` گزینه systemd را فعال کنید تا بعد از reboot هم سرویس بالا بماند.
+## چک سریع قبل از دیپلوی
+```bash
+python -m py_compile bot.py features/inline_menu.py features/inline_actions.py features/inline_callback.py
+```
