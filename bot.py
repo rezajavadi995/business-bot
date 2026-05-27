@@ -454,6 +454,18 @@ def match_shortcut(text: str, shortcuts: dict[str, str]) -> str | None:
             return value
     return None
 
+def hit_limit_and_maybe_ban(uid: int, bucket: str = "global_action", window_sec: int = 60, max_hits: int = 5, ban_sec: int = 5 * 60) -> bool:
+    now = int(time.time())
+    key = f"rate:{bucket}:{uid}"
+    hits = [int(x) for x in db.get_json(key, []) if isinstance(x, int) or str(x).isdigit()]
+    hits = [t for t in hits if now - t < window_sec]
+    hits.append(now)
+    db.set_json(key, hits)
+    if len(hits) > max_hits:
+        db.set_soft_ban(uid, now + ban_sec)
+        return True
+    return False
+
 async def maybe_welcome(update: Update, data: dict[str, Any], uid: int, source: str) -> bool:
     if source!="business" or not data.get("welcome_enabled",True): return False
     row=db.get_user(uid); now=int(time.time())
@@ -480,6 +492,9 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not q: return
     await q.answer(); data=load_data(); uid=q.from_user.id
     if q.data.startswith("im:btn:"):
+        if hit_limit_and_maybe_ban(uid, "inline_btn"):
+            await send_formatted_message(q.message, "<b>🚫 محدودیت ضداسپم فعال شد.</b>\n\nبه دلیل کلیک بیش از حد، به مدت <b>۵ دقیقه</b> محدود شدید.", data)
+            return
         if not data.get("active", False) or not data.get("inline_menu_enabled", False):
             return
         bid=int(q.data.split(":")[2])
@@ -645,6 +660,9 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 p=st.get("payload",{}); db.set_admin_state(uid,"im_create_output_text",p)
                 await q.edit_message_text("Output را دوباره بفرستید.", reply_markup=build_back_kb("im:root")); return
     if q.data.startswith("user:"):
+        if hit_limit_and_maybe_ban(uid, "reply_kb_btn"):
+            await send_formatted_message(q.message, "<b>🚫 محدودیت ضداسپم فعال شد.</b>\n\nبه دلیل کلیک بیش از حد، به مدت <b>۵ دقیقه</b> محدود شدید.", data)
+            return
         if not data.get("active", False):
             await q.message.reply_text("ربات خاموش است.")
             return
@@ -831,6 +849,8 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
         logging.info("business_ignored_bot_inactive uid=%s", uid)
         return
     prev=db.get_user(uid)
+    if prev and int(prev["soft_ban_until"] or 0) > int(time.time()):
+        return
     db.upsert_user(uid,(bm.from_user.username if bm.from_user else "") or "",(bm.from_user.full_name if bm.from_user else bm.chat.full_name) or "",None,False,"business",src_txt)
     if data.get("active", False) and data.get("inline_menu_enabled", False):
         menu = db.menu_by_command(txt)
@@ -848,6 +868,9 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
             return
     sc=db.load_shortcuts(); resp=match_shortcut(txt, sc)
     if resp and data.get("self_bot_enabled", False):
+        if hit_limit_and_maybe_ban(uid, "shortcut_business"):
+            await send_formatted_message(bm, "<b>🚫 محدودیت ضداسپم فعال شد.</b>\n\nبه دلیل ارسال سریع/پرتکرار، به مدت <b>۵ دقیقه</b> محدود شدید.", data)
+            return
         bc=getattr(bm,"business_connection_id",None)
         if data.get("self_bot_enabled") and is_admin(uid, data):
             out_self = render_html_text(resp, bold=data.get("bold_mode", True))
@@ -1098,6 +1121,9 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     resp=match_shortcut(txt,shortcuts)
     if resp:
+        if hit_limit_and_maybe_ban(uid, "shortcut_private"):
+            await send_formatted_message(update.message, "<b>🚫 محدودیت ضداسپم فعال شد.</b>\n\nبه دلیل ارسال سریع/پرتکرار، به مدت <b>۵ دقیقه</b> محدود شدید.", data)
+            return
         if data.get("self_bot_enabled") and is_admin(uid,data):
             out_text = render_html_text(resp, bold=data.get("bold_mode", True))
             try:
