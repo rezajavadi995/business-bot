@@ -199,9 +199,24 @@ class DB:
             return cur.lastrowid
     def list_menus(self):
         with self.conn() as c: return c.execute("SELECT * FROM menus ORDER BY id DESC").fetchall()
+    def has_command_ci(self, command:str, exclude_menu_id:int|None=None) -> bool:
+        with self.conn() as c:
+            if exclude_menu_id is None:
+                row = c.execute("SELECT 1 FROM menus WHERE LOWER(command)=LOWER(?) LIMIT 1", (command,)).fetchone()
+            else:
+                row = c.execute("SELECT 1 FROM menus WHERE LOWER(command)=LOWER(?) AND id<>? LIMIT 1", (command, exclude_menu_id)).fetchone()
+            return bool(row)
     def menu_by_command(self, command:str):
         with self.conn() as c:
-            return c.execute("SELECT * FROM menus WHERE LOWER(command)=LOWER(?) AND is_active=1", (command,)).fetchone()
+            exact = c.execute("SELECT * FROM menus WHERE command=? AND is_active=1", (command,)).fetchone()
+            if exact:
+                return exact
+            rows = c.execute("SELECT * FROM menus WHERE LOWER(command)=LOWER(?) AND is_active=1 ORDER BY id DESC", (command,)).fetchall()
+            if len(rows) == 1:
+                return rows[0]
+            if len(rows) > 1:
+                logging.warning("menu_case_collision command=%r count=%s", command, len(rows))
+            return None
     def menu_buttons(self, menu_id:int):
         with self.conn() as c: return c.execute("SELECT * FROM menu_buttons WHERE menu_id=? AND is_active=1 ORDER BY sort_order,id",(menu_id,)).fetchall()
     def delete_menu_atomic(self, menu_id: int) -> bool:
@@ -492,6 +507,10 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not q: return
     await q.answer(); data=load_data(); uid=q.from_user.id
     if q.data.startswith("im:btn:"):
+        row_user = db.get_user(uid)
+        if row_user and int(row_user["soft_ban_until"] or 0) > int(time.time()):
+            await send_formatted_message(q.message, "<b>🚫 شما موقتاً محدود هستید.</b>\n\nپس از پایان زمان محدودیت دوباره تلاش کنید.", data)
+            return
         if hit_limit_and_maybe_ban(uid, "inline_btn"):
             await send_formatted_message(q.message, "<b>🚫 محدودیت ضداسپم فعال شد.</b>\n\nبه دلیل کلیک بیش از حد، به مدت <b>۵ دقیقه</b> محدود شدید.", data)
             return
@@ -660,6 +679,10 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 p=st.get("payload",{}); db.set_admin_state(uid,"im_create_output_text",p)
                 await q.edit_message_text("Output را دوباره بفرستید.", reply_markup=build_back_kb("im:root")); return
     if q.data.startswith("user:"):
+        row_user = db.get_user(uid)
+        if row_user and int(row_user["soft_ban_until"] or 0) > int(time.time()):
+            await send_formatted_message(q.message, "<b>🚫 شما موقتاً محدود هستید.</b>\n\nپس از پایان زمان محدودیت دوباره تلاش کنید.", data)
+            return
         if hit_limit_and_maybe_ban(uid, "reply_kb_btn"):
             await send_formatted_message(q.message, "<b>🚫 محدودیت ضداسپم فعال شد.</b>\n\nبه دلیل کلیک بیش از حد، به مدت <b>۵ دقیقه</b> محدود شدید.", data)
             return
@@ -959,7 +982,7 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if s=="im_create_command":
             if len(txt) > 64 or not txt.strip():
                 await update.message.reply_text("command نامعتبر است."); return
-            if db.menu_by_command(txt):
+            if db.has_command_ci(txt):
                 await update.message.reply_text("این command تکراری است. دوباره بفرستید."); return
             p["command"]=txt; db.set_admin_state(uid,"im_create_preview_text",p); await update.message.reply_text("Step 2/5: menu preview text را بفرستید."); return
         if s=="im_create_preview_text":
@@ -980,7 +1003,7 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             mid=int(p["menu_id"]); db.update_menu_preview(mid, src_txt); db.log_admin(uid,"edit","menu_preview",mid,None,src_txt); db.clear_admin_state(uid); await update.message.reply_text("Preview بروزرسانی شد."); return
         if s=="im_edit_command_text":
             mid=int(p["menu_id"])
-            if db.menu_by_command(txt):
+            if db.has_command_ci(txt, exclude_menu_id=mid):
                 await update.message.reply_text("این command تکراری است."); return
             db.update_menu_command(mid, txt); db.log_admin(uid,"edit","menu_command",mid,None,txt); db.clear_admin_state(uid); await update.message.reply_text("Command بروزرسانی شد."); return
         if s=="im_edit_button_name":
