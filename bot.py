@@ -23,6 +23,7 @@ from features.log_export import build_logs_keyboard, humanize_log_text
 from features.inline_menu import build_inline_menu_admin_kb, paged_rows, CB as IMCB
 from features.inline_actions import ACTION_REGISTRY
 from features.inline_callback import parse as parse_cb, is_valid_im_callback
+from features.market_engine import MARKET_SERVICE, merge_market_settings, render_market_response
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
@@ -306,6 +307,7 @@ def setup_logging() -> None:
 def get_default_data() -> dict[str, Any]:
     return {"admin_id": int(os.getenv("ADMIN_ID") or 0), "active": False, "force_join_channel": os.getenv("FORCE_JOIN_CHANNEL", ""), "bold_mode": True,
             "welcome_enabled": False, "welcome_text": "سلام 🌟\nبه پیج بیزینسی ما خوش آمدید.", "self_bot_enabled": False, "inline_menu_enabled": False,
+            "market": {"market_engine_enabled": False},
             "features": {**{k: True for k in ADMIN_FEATURES}, **{k: True for k in USER_FEATURES}}, "offline_message": "پیام شما دریافت شد. به‌زودی پاسخ می‌دهیم.",
             "service_text": "", "hours_text": "", "location_text": "", "faq_text": "", "contact_text": "", "feedback_prompt_text": "لطفاً بازخورد خود را ارسال کنید.", "feedback_success_text": "✅ بازخورد شما با موفقیت ثبت شد."}
 
@@ -367,6 +369,7 @@ def load_data() -> dict[str, Any]:
     data["welcome_enabled"] = coerce_bool(data.get("welcome_enabled"), d["welcome_enabled"])
     if not isinstance(data.get("welcome_text"), str):
         data["welcome_text"] = str(data.get("welcome_text") or d["welcome_text"])
+    merge_market_settings(data)
     return data
 
 def save_data(data: dict[str, Any]) -> None: db.set_json("settings", data)
@@ -420,11 +423,13 @@ def build_watch_keyword_pick_keyboard(keywords: list[str], prefix: str, map_key:
 
 def create_admin_keyboard(data: dict[str, Any]) -> InlineKeyboardMarkup:
     status = "روشن" if data["active"] else "خاموش"
-    locked = " ⛔️" if not data.get("active", False) else ""
+    locked = " 🔒" if not data.get("active", False) else ""
     selfb = ("ON" if data.get("self_bot_enabled") else "OFF") + locked
     wel = ("ON" if data.get("welcome_enabled") else "OFF") + locked
+    market_settings = merge_market_settings(data)
+    market_state = ("ON" if market_settings.get("market_engine_enabled") else "OFF") + locked
     status_btn=create_success_button(f"وضعیت ربات: {status}","toggle:active") if data["active"] else create_danger_button(f"وضعیت ربات: {status}","toggle:active")
-    return InlineKeyboardMarkup([[status_btn],[create_primary_button("ویرایش متن‌ها","admin:texts"),create_primary_button("فیچرها","admin:features")],[create_success_button("گزارش وضعیت","admin:report"),create_danger_button("راهنمای برودکست","admin:broadcast_help")],[create_primary_button(f"Self Bot: {selfb}","admin:selfbot"),create_primary_button("مدیریت سلف بات","admin:shortcut_menu")],[create_primary_button(f"Welcome: {wel}","admin:welcome_toggle"),create_primary_button("پیکربندی Welcome","admin:welcome_cfg")],[create_primary_button("Inline Menu Engine","im:root"), create_primary_button("بک‌آپ دیتابیس","admin:db_export")],[create_primary_button("ایمپورت دیتابیس","admin:db_import"), create_primary_button("لاگ‌ها","admin:logs_menu")],[create_primary_button("پیام‌های بازخورد","admin:feedback_list")],[create_danger_button("بازگشت","menu:admin")]])
+    return InlineKeyboardMarkup([[status_btn],[create_primary_button("ویرایش متن‌ها","admin:texts"),create_primary_button("فیچرها","admin:features")],[create_success_button("گزارش وضعیت","admin:report"),create_danger_button("راهنمای برودکست","admin:broadcast_help")],[create_primary_button(f"Self Bot: {selfb}","admin:selfbot"),create_primary_button("مدیریت سلف بات","admin:shortcut_menu")],[create_primary_button(f"Welcome: {wel}","admin:welcome_toggle"),create_primary_button("پیکربندی Welcome","admin:welcome_cfg")],[create_primary_button("Inline Menu Engine","im:root"), create_primary_button(f"Conversion Engine: {market_state}","admin:market_toggle")],[create_primary_button("بک‌آپ دیتابیس","admin:db_export"), create_primary_button("ایمپورت دیتابیس","admin:db_import")],[create_primary_button("لاگ‌ها","admin:logs_menu")],[create_primary_button("پیام‌های بازخورد","admin:feedback_list")],[create_danger_button("بازگشت","menu:admin")]])
 
 def create_features_keyboard(data: dict[str, Any]) -> InlineKeyboardMarkup:
     rows=[[create_primary_button(f"{'✅' if data['features'].get(k) else '❌'} {k}",f"feature:{k}")] for k in ADMIN_FEATURES+USER_FEATURES]; rows.append([create_danger_button("بازگشت","menu:admin")]); return InlineKeyboardMarkup(rows)
@@ -552,6 +557,24 @@ async def maybe_report_watch_hit(update: Update, context: ContextTypes.DEFAULT_T
 
 async def send_formatted_message(target, text: str, data: dict[str, Any]):
     return await target.reply_text(render_html_text(text, bold=data.get("bold_mode", True)), parse_mode=ParseMode.HTML)
+
+
+async def maybe_send_market_response(message, data: dict[str, Any]) -> bool:
+    market_settings = merge_market_settings(data)
+    if not data.get("active", False) or not market_settings.get("market_engine_enabled", False):
+        return False
+    text = (getattr(message, "text", None) or "").strip()
+    if not text:
+        return False
+    try:
+        response = render_market_response(text, market_settings, MARKET_SERVICE.read_cache())
+    except Exception as exc:
+        logging.exception("market_response_failed reason=%s", exc)
+        response = "⚠️ پردازش تبدیل بازار ناموفق بود، اما ربات پایدار است."
+    if not response:
+        return False
+    await send_formatted_message(message, response, data)
+    return True
 
 def is_spam(text: str, shortcuts: dict[str, str]) -> bool:
     words=re.findall(r"\w+", text.lower());
@@ -1208,6 +1231,15 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         STATE.flow=STATE.step=STATE.pending_key=None
         STATE.temp_shortcuts=None
         await q.edit_message_text("شورت‌کات‌ها ذخیره شدند.", reply_markup=create_shortcut_menu_keyboard())
+    elif q.data=="admin:market_toggle":
+        if not data.get("active", False):
+            await safe_callback_answer(q, "اول ربات را روشن کنید.", show_alert=True); return
+        market_settings = merge_market_settings(data)
+        market_settings["market_engine_enabled"] = not market_settings.get("market_engine_enabled", False)
+        data["market"] = market_settings
+        save_data(data)
+        db.log_admin(uid, "toggle", "market_engine", None, None, str(market_settings["market_engine_enabled"]))
+        await q.edit_message_text("وضعیت Conversion Engine تغییر کرد.", reply_markup=create_admin_keyboard(data))
     elif q.data=="admin:welcome_toggle":
         data["welcome_enabled"]=not data.get("welcome_enabled",False); save_data(data); await q.edit_message_text("وضعیت Welcome تغییر کرد.", reply_markup=create_admin_keyboard(data))
     elif q.data=="admin:welcome_cfg":
@@ -1274,6 +1306,8 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
             except TimedOut:
                 logging.warning("business_inline_menu_send_timeout uid=%s chat_id=%s command=%r", uid, bm.chat.id, txt)
             return
+    if await maybe_send_market_response(bm, data):
+        return
     sc=db.load_shortcuts(); resp=match_shortcut(txt, sc)
     if resp and data.get("self_bot_enabled", False):
         if not is_admin(uid, data) and shortcut_rate_limited(uid, txt):
@@ -1362,6 +1396,8 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if update.effective_chat and update.effective_chat.type in {"group", "supergroup"}:
         await maybe_report_watch_hit(update, context, "group", update.message.text or update.message.caption or "")
+        data = load_data()
+        await maybe_send_market_response(update.message, data)
         return
     # Monitoring is event-driven from business/channel/group updates.
     data=load_data(); uid=update.effective_user.id; src_txt=text_with_custom_emoji_markup(update.message); txt=(update.message.text or "").strip()
@@ -1515,6 +1551,9 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not data.get("active", False) and not is_admin(uid, data):
         return
 
+    if await maybe_send_market_response(update.message, data):
+        return
+
     shortcuts=db.load_shortcuts()
     if is_spam(txt,shortcuts):
         ban_until = int(time.time())+SOFT_BAN_SECONDS
@@ -1589,11 +1628,16 @@ def is_state_stale(admin_id: int) -> bool:
     return int(time.time()) - int(row["updated_at"] or 0) > FSM_TTL_SECONDS
 
 
+async def post_init(app: Application) -> None:
+    MARKET_SERVICE.bind_store(db)
+    app.create_task(MARKET_SERVICE.run_forever(lambda: merge_market_settings(load_data())))
+
+
 def main() -> None:
-    setup_logging(); db.init(); save_data(load_data())
+    setup_logging(); db.init(); MARKET_SERVICE.bind_store(db); save_data(load_data())
     token=os.getenv("BOT_TOKEN")
     if not token: raise RuntimeError("BOT_TOKEN is missing")
-    app=Application.builder().token(token).build()
+    app=Application.builder().token(token).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start)); app.add_handler(CommandHandler("panel", panel)); app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CallbackQueryHandler(callbacks)); app.add_handler(MessageHandler(filters.ALL, all_messages)); app.add_error_handler(on_error)
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
