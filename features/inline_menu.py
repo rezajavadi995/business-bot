@@ -14,6 +14,7 @@ CB = {
     "MGR": "im:mgr",
     "EDIT": "im:edit",
     "LIVE": "im:live",
+    "ACTIVE": "im:active",
     "CANCEL": "im:cancel",
     "CONFIRM_YES": "im:confirm:yes",
     "CONFIRM_NO": "im:confirm:no",
@@ -27,7 +28,7 @@ def build_inline_menu_admin_kb(enabled: bool, global_active: bool) -> InlineKeyb
         [InlineKeyboardButton(f"🧩 Inline Menu: {state}", callback_data=CB["TOGGLE"])],
         [InlineKeyboardButton("🆕 ساخت منوی جدید", callback_data=CB["CREATE"]), InlineKeyboardButton("➕ افزودن دکمه", callback_data=CB["ADD_BTN"])],
         [InlineKeyboardButton("🗂️ مدیریت منوها", callback_data=CB["MGR"]), InlineKeyboardButton("✏️ ویرایش منو", callback_data=CB["EDIT"])],
-        [InlineKeyboardButton("📡 لیست زنده منوها", callback_data=CB["LIVE"])],
+        [InlineKeyboardButton("🟢 مدیریت فعال/غیرفعال", callback_data=CB["ACTIVE"]), InlineKeyboardButton("📡 لیست زنده منوها", callback_data=CB["LIVE"])],
         [InlineKeyboardButton("🔙 بازگشت", callback_data="menu:admin")],
     ])
 
