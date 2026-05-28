@@ -10,6 +10,7 @@ from features.market_engine import (
     render_market_response,
     validate_market_api_key,
     stars_unit_usd,
+    MarketRateService,
 )
 
 
@@ -43,6 +44,12 @@ class MarketEngineParserTests(unittest.TestCase):
         self.assertEqual(parse_market_intent("btc today").kind, "status")
         self.assertEqual(parse_market_intent("btc dominance").kind, "dominance")
         self.assertEqual(parse_market_intent("trend").kind, "trending")
+
+    def test_dollar_and_multiword_aliases_parse(self):
+        self.assertEqual((parse_market_intent("100$ trx").source, parse_market_intent("100$ trx").target), ("usd", "trx"))
+        self.assertEqual((parse_market_intent("$100 trx").source, parse_market_intent("$100 trx").target), ("usd", "trx"))
+        self.assertEqual(parse_market_intent("قیمت بیت کوین").query_asset, "btc")
+        self.assertEqual((parse_market_intent("100 بیت کوین تومان").source, parse_market_intent("100 بیت کوین تومان").target), ("btc", "irt"))
 
 
 class MarketEngineRenderTests(unittest.TestCase):
@@ -98,6 +105,14 @@ class MarketEngineAdminSupportTests(unittest.TestCase):
         self.assertEqual(stars_unit_usd(settings), 0.045)
         settings["stars_auto_multiplier_enabled"] = True
         self.assertEqual(stars_unit_usd(settings), 0.03)
+
+    def test_fetch_rates_keeps_partial_provider_success(self):
+        service = MarketRateService()
+        service._fetch_coingecko = Mock(side_effect=RuntimeError("rate limited"))
+        service._fetch_exchange_rates = Mock(return_value={"rates_usd": {"eur": 1.1, "irt": 0.00002}, "meta": {"source": "exchange"}})
+        payload = service._fetch_rates({"coingecko_enabled": True, "exchangerate_enabled": True, "stars_unit_amount": 1000, "stars_unit_usd": 30})
+        self.assertIn("irt", payload["rates_usd"])
+        self.assertIn("coingecko", payload["meta"]["provider_errors"])
 
     @patch("features.market_engine.requests.get")
     def test_validate_exchangerate_key_uses_real_validation_endpoint_shape(self, mock_get):

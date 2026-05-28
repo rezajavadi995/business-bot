@@ -7,6 +7,7 @@ import re
 import sqlite3
 import time
 from datetime import datetime
+from io import BytesIO
 from dataclasses import dataclass
 import tempfile
 from zoneinfo import ZoneInfo
@@ -25,6 +26,7 @@ from features.inline_menu import build_inline_menu_admin_kb, paged_rows, CB as I
 from features.inline_actions import ACTION_REGISTRY
 from features.inline_callback import parse as parse_cb, is_valid_im_callback
 from features.market_engine import MARKET_SERVICE, cache_status, market_help_text, merge_market_settings, normalize_asset_list, render_market_response, validate_market_api_key
+from features.market_cards import merge_branding_settings, render_market_card
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
@@ -479,8 +481,10 @@ def create_market_root_keyboard(data: dict[str, Any]) -> InlineKeyboardMarkup:
         [create_primary_button(f"Conversion Engine: {engine}", "admin:market_toggle")],
         [create_primary_button("Market API Configuration", "admin:market_api"), create_primary_button("Test APIs", "admin:market_test")],
         [create_primary_button("Stars Rate Settings", "admin:market_stars"), create_primary_button("Cache Settings", "admin:market_cache")],
-        [create_primary_button("Live Cache Status", "admin:market_status"), create_primary_button("Quick Assets", "admin:market_quick")],
-        [create_primary_button("Conversion Help", "admin:market_help"), create_danger_button("بازگشت", "menu:admin")],
+        [create_primary_button("Market Branding", "admin:market_branding"), create_primary_button("Market Card Preview", "admin:market_card_preview")],
+        [create_primary_button("Theme Settings", "admin:market_theme"), create_primary_button("Quick Assets", "admin:market_quick")],
+        [create_primary_button("Live Cache Status", "admin:market_status"), create_primary_button("Conversion Help", "admin:market_help")],
+        [create_danger_button("بازگشت", "menu:admin")],
     ])
 
 
@@ -516,12 +520,37 @@ def create_market_cache_keyboard(data: dict[str, Any]) -> InlineKeyboardMarkup:
         [create_danger_button("بازگشت", "admin:market_root")],
     ])
 
+
+def create_market_branding_keyboard(data: dict[str, Any]) -> InlineKeyboardMarkup:
+    branding = merge_branding_settings(data)
+    return InlineKeyboardMarkup([
+        [create_primary_button(f"Cards: {'ON' if branding.get('card_enabled') else 'OFF'}", "admin:market_card_bool:card_enabled")],
+        [create_primary_button("Branding text", "admin:market_card_text:branding_text"), create_primary_button("Watermark text", "admin:market_card_text:watermark_text")],
+        [create_primary_button("Branding channel ID", "admin:market_card_text:branding_channel_id"), create_primary_button(f"Logo: {'ON' if branding.get('logo_enabled') else 'OFF'}", "admin:market_card_bool:logo_enabled")],
+        [create_primary_button("Upload logo", "admin:market_card_logo_upload"), create_primary_button("Text opacity", "admin:market_card_number:text_opacity")],
+        [create_primary_button("Watermark position", "admin:market_card_text:watermark_position")],
+        [create_primary_button("Preview", "admin:market_card_preview"), create_danger_button("بازگشت", "admin:market_root")],
+    ])
+
+
+def create_market_theme_keyboard(data: dict[str, Any]) -> InlineKeyboardMarkup:
+    branding = merge_branding_settings(data)
+    return InlineKeyboardMarkup([
+        [create_primary_button(f"Dark mode: {'ON' if branding.get('card_dark_mode') else 'OFF'}", "admin:market_card_bool:card_dark_mode")],
+        [create_primary_button(f"Theme: {branding.get('card_theme')}", "admin:market_card_text:card_theme")],
+        [create_primary_button(f"Primary: {branding.get('card_primary_color')}", "admin:market_card_text:card_primary_color")],
+        [create_primary_button(f"Secondary: {branding.get('card_secondary_color')}", "admin:market_card_text:card_secondary_color")],
+        [create_primary_button("Preview", "admin:market_card_preview"), create_danger_button("بازگشت", "admin:market_root")],
+    ])
+
+
 def create_admin_keyboard(data: dict[str, Any]) -> InlineKeyboardMarkup:
     status = "روشن" if data["active"] else "خاموش"
     locked = " 🔒" if not data.get("active", False) else ""
     selfb = ("ON" if data.get("self_bot_enabled") else "OFF") + locked
     wel = ("ON" if data.get("welcome_enabled") else "OFF") + locked
     market_settings = merge_market_settings(data)
+    merge_branding_settings(data)
     market_state = ("ON" if market_settings.get("market_engine_enabled") else "OFF") + locked
     status_btn=create_success_button(f"وضعیت ربات: {status}","toggle:active") if data["active"] else create_danger_button(f"وضعیت ربات: {status}","toggle:active")
     return InlineKeyboardMarkup([[status_btn],[create_primary_button("ویرایش متن‌ها","admin:texts"),create_primary_button("فیچرها","admin:features")],[create_success_button("گزارش وضعیت","admin:report"),create_danger_button("راهنمای برودکست","admin:broadcast_help")],[create_primary_button(f"Self Bot: {selfb}","admin:selfbot"),create_primary_button("مدیریت سلف بات","admin:shortcut_menu")],[create_primary_button(f"Welcome: {wel}","admin:welcome_toggle"),create_primary_button("پیکربندی Welcome","admin:welcome_cfg")],[create_primary_button("Inline Menu Engine","im:root"), create_primary_button(f"Conversion Engine: {market_state}","admin:market_root")],[create_primary_button("بک‌آپ دیتابیس","admin:db_export"), create_primary_button("ایمپورت دیتابیس","admin:db_import")],[create_primary_button("لاگ‌ها","admin:logs_menu")],[create_primary_button("پیام‌های بازخورد","admin:feedback_list")],[create_danger_button("بازگشت","menu:admin")]])
@@ -656,6 +685,7 @@ async def send_formatted_message(target, text: str, data: dict[str, Any]):
 
 async def maybe_send_market_response(message, data: dict[str, Any]) -> bool:
     market_settings = merge_market_settings(data)
+    branding = merge_branding_settings(data)
     if not data.get("active", False) or not market_settings.get("market_engine_enabled", False):
         return False
     text = (getattr(message, "text", None) or "").strip()
@@ -669,6 +699,12 @@ async def maybe_send_market_response(message, data: dict[str, Any]) -> bool:
     if not response:
         return False
     await send_formatted_message(message, response, data)
+    if branding.get("card_enabled", False):
+        try:
+            image_bytes = await asyncio.to_thread(render_market_card, response, branding)
+            await message.reply_photo(photo=BytesIO(image_bytes), caption=str(branding.get("branding_channel_id") or "")[:1000] or None)
+        except Exception as exc:
+            logging.warning("market_card_send_failed reason=%s", exc)
     return True
 
 def is_spam(text: str, shortcuts: dict[str, str]) -> bool:
@@ -1379,6 +1415,46 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("Quick Assets فعلی:\n" + ", ".join(settings.get("quick_assets", [])) + "\n\nلیست جدید را با کاما ارسال کنید. نمونه: BTC,ETH,TRX,TON,USDT", reply_markup=build_back_kb("admin:market_root"))
     elif q.data=="admin:market_help":
         await q.edit_message_text(market_help_text(is_admin=True), reply_markup=create_market_root_keyboard(data))
+    elif q.data=="admin:market_branding":
+        STATE.flow = STATE.step = STATE.pending_key = None
+        merge_branding_settings(data)
+        await q.edit_message_text("🎨 Market Card Branding", reply_markup=create_market_branding_keyboard(data))
+    elif q.data=="admin:market_theme":
+        STATE.flow = STATE.step = STATE.pending_key = None
+        merge_branding_settings(data)
+        await q.edit_message_text("🌓 Market Card Theme", reply_markup=create_market_theme_keyboard(data))
+    elif q.data=="admin:market_card_preview":
+        branding = merge_branding_settings(data)
+        sample = "✨ 2,000 STARS :\n\n💸 5,234,610 toman\n🌀 16.845 TON\n💵 $30 dollar\n\n🪙 1405/03/04 | 05:52:46"
+        try:
+            image_bytes = await asyncio.to_thread(render_market_card, sample, branding)
+            await context.bot.send_photo(chat_id=uid, photo=BytesIO(image_bytes), caption="Market Card Preview")
+            await q.edit_message_text("✅ پیش‌نمایش کارت ارسال شد.", reply_markup=create_market_root_keyboard(data))
+        except Exception as exc:
+            logging.warning("market_card_preview_failed reason=%s", exc)
+            await q.edit_message_text(f"❌ ساخت کارت ناموفق بود: {exc}", reply_markup=create_market_root_keyboard(data))
+    elif q.data.startswith("admin:market_card_bool:"):
+        field = q.data.rsplit(":", 1)[1]
+        branding = merge_branding_settings(data)
+        if field in {"card_enabled", "logo_enabled", "card_dark_mode"}:
+            branding[field] = not branding.get(field, False)
+            data.setdefault("market", {})["card"] = branding
+            save_data(data)
+        kb = create_market_theme_keyboard(data) if field == "card_dark_mode" else create_market_branding_keyboard(data)
+        await q.edit_message_text("🎨 Market Card Settings", reply_markup=kb)
+    elif q.data=="admin:market_card_logo_upload":
+        STATE.flow, STATE.step, STATE.admin_id, STATE.message_id, STATE.pending_key = "market_card_cfg", "waiting_logo", uid, q.message.message_id, "logo_path"
+        await q.edit_message_text("لوگوی کارت را به صورت photo یا فایل تصویر ارسال کنید.", reply_markup=build_back_kb("admin:market_branding"))
+    elif q.data.startswith("admin:market_card_text:"):
+        field = q.data.rsplit(":", 1)[1]
+        if field not in {"branding_text", "branding_channel_id", "watermark_text", "watermark_position", "card_theme", "card_primary_color", "card_secondary_color"}: return
+        STATE.flow, STATE.step, STATE.admin_id, STATE.message_id, STATE.pending_key = "market_card_cfg", "waiting_text", uid, q.message.message_id, field
+        await q.edit_message_text(f"مقدار جدید برای {field} را ارسال کنید.", reply_markup=build_back_kb("admin:market_branding"))
+    elif q.data.startswith("admin:market_card_number:"):
+        field = q.data.rsplit(":", 1)[1]
+        if field not in {"text_opacity"}: return
+        STATE.flow, STATE.step, STATE.admin_id, STATE.message_id, STATE.pending_key = "market_card_cfg", "waiting_number", uid, q.message.message_id, field
+        await q.edit_message_text(f"عدد جدید برای {field} را ارسال کنید. مثال: 220", reply_markup=build_back_kb("admin:market_branding"))
     elif q.data.startswith("admin:market_edit:"):
         field = q.data.rsplit(":", 1)[1]
         if field not in {"stars_unit_amount", "stars_unit_usd", "stars_manual_override_usd", "cache_ttl_seconds", "stale_ttl_seconds"}: return
@@ -1502,6 +1578,8 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
             logging.warning("business_shortcut_send_timeout uid=%s chat_id=%s text=%r", uid, bm.chat.id, txt)
             return
         logging.info("business_shortcut_sent uid=%s text=%s",uid, txt)
+        return
+    if await maybe_send_market_response(bm, data):
         return
     logging.info("business_shortcut_no_match uid=%s text=%s", uid, txt)
     if data.get("welcome_enabled",True) and (prev is None or int(prev["last_seen_at"] or 0)<=0 or int(time.time())-int(prev["last_seen_at"] or 0)>=WELCOME_COOLDOWN_SECONDS):
@@ -1628,6 +1706,56 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("منوی کاربر", reply_markup=create_menu_keyboard())
         return
 
+
+    if STATE.admin_id==uid and STATE.flow=="market_card_cfg" and can_edit_flow(uid):
+        branding = merge_branding_settings(data)
+        field = STATE.pending_key or ""
+        if STATE.step=="waiting_logo":
+            tg_file = None
+            suffix = ".png"
+            if update.message.photo:
+                tg_file = await update.message.photo[-1].get_file()
+            elif update.message.document and str(update.message.document.mime_type or "").startswith("image/"):
+                tg_file = await update.message.document.get_file()
+                suffix = Path(update.message.document.file_name or "logo.png").suffix or ".png"
+            if not tg_file:
+                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="لطفاً فقط تصویر ارسال کنید.", reply_markup=build_back_kb("admin:market_branding")); return
+            logo_dir = BASE_DIR / "assets" / "market"
+            logo_dir.mkdir(parents=True, exist_ok=True)
+            logo_path = logo_dir / f"card_logo{suffix}"
+            await tg_file.download_to_drive(custom_path=str(logo_path))
+            branding["logo_path"] = str(logo_path)
+            branding["logo_enabled"] = True
+            data.setdefault("market", {})["card"] = branding
+            save_data(data)
+            STATE.flow = STATE.step = STATE.pending_key = None
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="✅ لوگوی کارت ذخیره و فعال شد.", reply_markup=create_market_branding_keyboard(data)); return
+        if STATE.step=="waiting_text":
+            value = txt.strip()
+            if field in {"card_primary_color", "card_secondary_color"} and not re.fullmatch(r"#?[0-9a-fA-F]{6}", value):
+                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="رنگ نامعتبر است. نمونه: #2336ff", reply_markup=build_back_kb("admin:market_theme")); return
+            if field in {"card_primary_color", "card_secondary_color"} and not value.startswith("#"):
+                value = f"#{value}"
+            if field in {"watermark_position"} and value not in {"bottom_right", "bottom_left", "top_right", "top_left"}:
+                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="position معتبر: bottom_right, bottom_left, top_right, top_left", reply_markup=build_back_kb("admin:market_branding")); return
+            branding[field] = value[:256]
+            data.setdefault("market", {})["card"] = branding
+            save_data(data)
+            STATE.flow = STATE.step = STATE.pending_key = None
+            kb = create_market_theme_keyboard(data) if field.startswith("card_") else create_market_branding_keyboard(data)
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"✅ {field} بروزرسانی شد.", reply_markup=kb); return
+        if STATE.step=="waiting_number":
+            try:
+                value = int(float(txt.strip()))
+            except Exception:
+                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="عدد نامعتبر است.", reply_markup=build_back_kb("admin:market_branding")); return
+            if field == "text_opacity" and not 40 <= value <= 255:
+                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="opacity باید بین 40 و 255 باشد.", reply_markup=build_back_kb("admin:market_branding")); return
+            branding[field] = value
+            data.setdefault("market", {})["card"] = branding
+            save_data(data)
+            STATE.flow = STATE.step = STATE.pending_key = None
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"✅ {field} بروزرسانی شد: {value}", reply_markup=create_market_branding_keyboard(data)); return
 
     if STATE.admin_id==uid and STATE.flow=="market_cfg" and can_edit_flow(uid):
         settings = merge_market_settings(data)
@@ -1780,28 +1908,30 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(admin_id, f"شما یک پیام جدید دارید از طرف {update.effective_user.full_name or update.effective_user.first_name}", reply_markup=kb)
         return
 
-    if not data.get("self_bot_enabled", False):
-        return
-    resp=match_shortcut(txt,shortcuts)
-    if resp:
-        if not is_admin(uid, data) and shortcut_rate_limited(uid, txt):
-            await send_formatted_message(update.message, "<b>🚫 محدودیت ضداسپم فعال شد.</b>\n\nبه دلیل ارسال سریع/پرتکرار، به مدت <b>۵ دقیقه</b> محدود شدید.", data)
-            return
-        if data.get("self_bot_enabled") and is_admin(uid,data):
-            out_text = render_html_text(resp, bold=data.get("bold_mode", True))
-            try:
-                await update.message.edit_text(out_text, parse_mode=ParseMode.HTML)
-                logging.info("admin_shortcut_edit_ok uid=%s msg_id=%s", uid, update.message.message_id)
-            except Exception as exc:
-                logging.warning("admin_shortcut_edit_failed uid=%s msg_id=%s reason=%s", uid, update.message.message_id, exc)
+    if data.get("self_bot_enabled", False):
+        resp=match_shortcut(txt,shortcuts)
+        if resp:
+            if not is_admin(uid, data) and shortcut_rate_limited(uid, txt):
+                await send_formatted_message(update.message, "<b>🚫 محدودیت ضداسپم فعال شد.</b>\n\nبه دلیل ارسال سریع/پرتکرار، به مدت <b>۵ دقیقه</b> محدود شدید.", data)
+                return
+            if is_admin(uid,data):
+                out_text = render_html_text(resp, bold=data.get("bold_mode", True))
                 try:
-                    await update.message.delete()
-                    logging.info("admin_shortcut_delete_ok uid=%s msg_id=%s", uid, update.message.message_id)
-                except Exception as delete_exc:
-                    logging.warning("admin_shortcut_delete_failed uid=%s msg_id=%s reason=%s", uid, update.message.message_id, delete_exc)
-                await send_formatted_message(update.message, resp, data)
-            return
-        if not is_admin(uid,data): await send_formatted_message(update.message, resp, data); return
+                    await update.message.edit_text(out_text, parse_mode=ParseMode.HTML)
+                    logging.info("admin_shortcut_edit_ok uid=%s msg_id=%s", uid, update.message.message_id)
+                except Exception as exc:
+                    logging.warning("admin_shortcut_edit_failed uid=%s msg_id=%s reason=%s", uid, update.message.message_id, exc)
+                    try:
+                        await update.message.delete()
+                        logging.info("admin_shortcut_delete_ok uid=%s msg_id=%s", uid, update.message.message_id)
+                    except Exception as delete_exc:
+                        logging.warning("admin_shortcut_delete_failed uid=%s msg_id=%s reason=%s", uid, update.message.message_id, delete_exc)
+                    await send_formatted_message(update.message, resp, data)
+                return
+            if not is_admin(uid,data): await send_formatted_message(update.message, resp, data); return
+
+    if await maybe_send_market_response(update.message, data):
+        return
 
     if data["active"] and not is_admin(uid,data): await send_formatted_message(update.message, data.get("offline_message",""), data)
 
@@ -1850,9 +1980,16 @@ def is_state_stale(admin_id: int) -> bool:
     return int(time.time()) - int(row["updated_at"] or 0) > FSM_TTL_SECONDS
 
 
+def get_market_runtime_settings() -> dict[str, Any]:
+    data = load_data()
+    settings = merge_market_settings(data)
+    settings["_global_active"] = bool(data.get("active", False))
+    return settings
+
+
 async def post_init(app: Application) -> None:
     MARKET_SERVICE.bind_store(db)
-    app.create_task(MARKET_SERVICE.run_forever(lambda: merge_market_settings(load_data())))
+    app.create_task(MARKET_SERVICE.run_forever(get_market_runtime_settings))
 
 
 def main() -> None:

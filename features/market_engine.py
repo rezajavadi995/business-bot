@@ -133,6 +133,7 @@ def normalize_number(value: str) -> float | None:
 def normalize_text(text: str) -> str:
     value = str(text or "").translate(PERSIAN_DIGITS).casefold()
     value = value.replace("٫", ".").replace("٬", ",")
+    value = re.sub(r"\$", " $ ", value)
     value = re.sub(r"([0-9][0-9,]*(?:\.[0-9]+)?)(?=[^\W\d_\$])", r"\1 ", value, flags=re.UNICODE)
     value = re.sub(r"(?<=[^\W\d_])([0-9])", r" \1", value, flags=re.UNICODE)
     value = re.sub(r"\s+", " ", value).strip()
@@ -146,13 +147,34 @@ def normalize_asset(value: str | None) -> str | None:
     return ASSET_ALIASES.get(key)
 
 
+def extract_assets(words: list[str]) -> list[str]:
+    assets: list[str] = []
+    idx = 0
+    max_alias_words = max(len(alias.split()) for alias in ASSET_ALIASES)
+    while idx < len(words):
+        matched: str | None = None
+        matched_len = 0
+        for size in range(min(max_alias_words, len(words) - idx), 0, -1):
+            phrase = " ".join(words[idx:idx + size])
+            asset = normalize_asset(phrase)
+            if asset:
+                matched = asset
+                matched_len = size
+                break
+        if matched:
+            assets.append(matched)
+            idx += matched_len
+        else:
+            idx += 1
+    return assets
+
+
 def parse_market_intent(text: str) -> MarketIntent | None:
     normalized = normalize_text(text)
     if not normalized or len(normalized) > 160:
         return None
     words = normalized.split()
-    asset_words = [(idx, normalize_asset(word)) for idx, word in enumerate(words)]
-    assets = [asset for _, asset in asset_words if asset]
+    assets = extract_assets(words)
     amount: float | None = None
     for word in words:
         amount = normalize_number(word)
@@ -168,7 +190,7 @@ def parse_market_intent(text: str) -> MarketIntent | None:
         return MarketIntent(kind="price", query_asset=assets[0])
     if any(w in words for w in {"status", "today", "وضعیت", "امروز"}) and assets:
         return MarketIntent(kind="status", query_asset=assets[0])
-    if amount is None and len(words) == 1 and assets and assets[0] in CRYPTO_IDS:
+    if amount is None and len(words) <= 3 and assets and assets[0] in CRYPTO_IDS:
         return MarketIntent(kind="price", query_asset=assets[0])
     if amount is not None and assets:
         source = assets[0]
@@ -200,7 +222,7 @@ class MarketRateService:
         while not self._stop.is_set():
             settings = settings_getter()
             interval = int(settings.get("cache_ttl_seconds", 60) or 60)
-            if settings.get("market_api_enabled", True):
+            if settings.get("_global_active", False) and settings.get("market_engine_enabled", False) and settings.get("market_api_enabled", True):
                 await self.refresh(settings)
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=max(30, interval))
@@ -224,10 +246,23 @@ class MarketRateService:
 
     def _fetch_rates(self, settings: dict[str, Any]) -> dict[str, Any]:
         timeout = float(settings.get("request_timeout_seconds", 8) or 8)
-        crypto = self._fetch_coingecko(settings, timeout) if settings.get("coingecko_enabled", True) else {}
-        fiat = self._fetch_exchange_rates(settings, timeout) if settings.get("exchangerate_enabled", True) else {}
+        crypto: dict[str, Any] = {}
+        fiat: dict[str, Any] = {}
+        errors: dict[str, str] = {}
+        if settings.get("coingecko_enabled", True):
+            try:
+                crypto = self._fetch_coingecko(settings, timeout)
+            except Exception as exc:
+                errors["coingecko"] = safe_error(exc)
+                logging.warning("market_provider_failed provider=coingecko reason=%s", errors["coingecko"])
+        if settings.get("exchangerate_enabled", True):
+            try:
+                fiat = self._fetch_exchange_rates(settings, timeout)
+            except Exception as exc:
+                errors["exchangerate"] = safe_error(exc)
+                logging.warning("market_provider_failed provider=exchangerate reason=%s", errors["exchangerate"])
         rates_usd: dict[str, float] = {"usd": 1.0}
-        meta: dict[str, Any] = {"crypto": crypto.get("meta", {}), "fiat": fiat.get("meta", {})}
+        meta: dict[str, Any] = {"crypto": crypto.get("meta", {}), "fiat": fiat.get("meta", {}), "provider_errors": errors}
         rates_usd.update(crypto.get("rates_usd", {}))
         rates_usd.update(fiat.get("rates_usd", {}))
         stars_usd = stars_unit_usd(settings)
@@ -235,6 +270,8 @@ class MarketRateService:
             rates_usd["stars"] = stars_usd
         if "usdt" not in rates_usd:
             rates_usd["usdt"] = 1.0
+        if len(rates_usd) <= 2 and errors:
+            raise RuntimeError("; ".join(f"{k}: {v}" for k, v in errors.items()))
         if len(rates_usd) <= 2:
             raise RuntimeError("no usable market rates returned")
         return {"rates_usd": rates_usd, "meta": meta}
