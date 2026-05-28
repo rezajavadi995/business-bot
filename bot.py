@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram import MessageEntity
 from telegram.constants import ParseMode
-from telegram.error import TimedOut
+from telegram.error import BadRequest, TimedOut
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 from features.log_export import build_logs_keyboard, humanize_log_text
 from features.inline_menu import build_inline_menu_admin_kb, paged_rows, CB as IMCB
@@ -109,6 +109,25 @@ class DB:
                 new_value TEXT,
                 created_at INTEGER NOT NULL
             )""")
+            self._migrate_users(c)
+
+    def _migrate_users(self, c: sqlite3.Connection) -> None:
+        cols = {r["name"] for r in c.execute("PRAGMA table_info(users)").fetchall()}
+        migrations = {
+            "username": "ALTER TABLE users ADD COLUMN username TEXT",
+            "full_name": "ALTER TABLE users ADD COLUMN full_name TEXT",
+            "phone": "ALTER TABLE users ADD COLUMN phone TEXT",
+            "is_channel_joined": "ALTER TABLE users ADD COLUMN is_channel_joined INTEGER DEFAULT 0",
+            "last_seen_at": "ALTER TABLE users ADD COLUMN last_seen_at INTEGER",
+            "first_seen_at": "ALTER TABLE users ADD COLUMN first_seen_at INTEGER",
+            "source": "ALTER TABLE users ADD COLUMN source TEXT",
+            "soft_ban_until": "ALTER TABLE users ADD COLUMN soft_ban_until INTEGER DEFAULT 0",
+            "spam_score": "ALTER TABLE users ADD COLUMN spam_score INTEGER DEFAULT 0",
+            "last_message": "ALTER TABLE users ADD COLUMN last_message TEXT",
+        }
+        for col, sql in migrations.items():
+            if col not in cols:
+                c.execute(sql)
     def get_json(self, key: str, default: Any) -> Any:
         with self.conn() as c:
             row = c.execute("SELECT v FROM kv WHERE k=?", (key,)).fetchone()
@@ -126,8 +145,12 @@ class DB:
             """, (user_id, username, full_name, phone, 1 if joined else 0, now, now, source, last_message))
     def get_user(self, user_id: int):
         with self.conn() as c: return c.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
-    def list_users(self, limit: int = 50):
-        with self.conn() as c: return c.execute("SELECT * FROM users ORDER BY last_seen_at DESC LIMIT ?", (limit,)).fetchall()
+    def count_users(self) -> int:
+        with self.conn() as c:
+            row = c.execute("SELECT COUNT(*) AS cnt FROM users").fetchone()
+            return int(row["cnt"] if row else 0)
+    def list_users(self, limit: int = 50, offset: int = 0):
+        with self.conn() as c: return c.execute("SELECT * FROM users ORDER BY COALESCE(last_seen_at,0) DESC, user_id DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()
     def set_soft_ban(self, user_id: int, until_ts: int):
         with self.conn() as c: c.execute("UPDATE users SET soft_ban_until=? WHERE user_id=?", (until_ts, user_id))
     def save_shortcuts(self, items: dict[str, str]):
@@ -492,6 +515,92 @@ async def safe_callback_answer(q, text: str | None = None, show_alert: bool = Fa
     except TimedOut:
         logging.warning("callback_answer_timeout id=%s data=%r", getattr(q, "id", None), getattr(q, "data", None))
         return False
+    except BadRequest as exc:
+        logging.warning("callback_answer_failed id=%s data=%r reason=%s", getattr(q, "id", None), getattr(q, "data", None), exc)
+        return False
+
+
+def format_ts(ts: int | None) -> str:
+    if not ts:
+        return "-"
+    try:
+        return datetime.fromtimestamp(int(ts), ZoneInfo("Asia/Tehran")).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return "-"
+
+
+def clip_report_text(value: Any, limit: int = 160) -> str:
+    text = str(value or "").replace("\n", " ").strip()
+    if len(text) > limit:
+        return f"{text[:limit-1]}…"
+    return text or "-"
+
+
+def build_report_keyboard(page: int, total_pages: int) -> InlineKeyboardMarkup:
+    rows = []
+    nav = []
+    if page > 0:
+        nav.append(create_primary_button("⬅️ صفحه قبل", f"admin:report_page:{page - 1}"))
+    if page + 1 < total_pages:
+        nav.append(create_success_button("صفحه بعد ➡️", f"admin:report_page:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([create_primary_button("🔄 بروزرسانی گزارش", f"admin:report_page:{page}"), create_danger_button("🏠 بازگشت به پنل", "menu:admin")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_users_report(page: int = 0, page_size: int = 8) -> tuple[str, InlineKeyboardMarkup]:
+    total = db.count_users()
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
+    users = db.list_users(page_size, page * page_size)
+    uptime = int(time.time() - START_TIME)
+    header = (
+        "📊 <b>گزارش وضعیت ربات</b>\n"
+        f"👥 <b>کل کاربران ثبت‌شده:</b> {total}\n"
+        f"📄 <b>صفحه:</b> {page + 1}/{total_pages}\n"
+        f"⏱ <b>آپتایم:</b> {uptime} ثانیه\n"
+        f"🧠 <b>CPU:</b> {psutil.cpu_percent()}%\n"
+        f"💾 <b>RAM:</b> {psutil.virtual_memory().percent}%\n\n"
+        "👤 <b>لیست کاربران</b>\n"
+    )
+    if not users:
+        body = "\nهنوز کاربری ثبت نشده است."
+    else:
+        blocks = []
+        for index, u in enumerate(users, start=page * page_size + 1):
+            ban_until = int(u["soft_ban_until"] or 0)
+            is_banned = ban_until > int(time.time())
+            username = f"@{u['username']}" if u["username"] else "-"
+            blocks.append(
+                f"\n<b>#{index}</b> 👤 {html.escape(u['full_name'] or '-')}\n"
+                f"🆔 <code>{u['user_id']}</code> | 🔗 {html.escape(username)}\n"
+                f"📱 موبایل: {html.escape(u['phone'] or '-')} | 📣 جوین: {'✅' if u['is_channel_joined'] else '❌'}\n"
+                f"🟢 اولین حضور: {format_ts(u['first_seen_at'])}\n"
+                f"🕘 آخرین حضور: {format_ts(u['last_seen_at'])}\n"
+                f"🚪 منبع: {html.escape(u['source'] or '-')} | 🚫 محدودیت: {('تا ' + format_ts(ban_until)) if is_banned else 'ندارد'}\n"
+                f"⚠️ امتیاز اسپم: {int(u['spam_score'] or 0)}\n"
+                f"💬 آخرین پیام: {html.escape(clip_report_text(u['last_message']))}"
+            )
+        body = "\n".join(blocks)
+    return header + body, build_report_keyboard(page, total_pages)
+
+
+async def disable_callback_markup(q) -> None:
+    try:
+        await q.edit_message_reply_markup(reply_markup=None)
+    except Exception as exc:
+        logging.warning("callback_markup_disable_failed uid=%s data=%r reason=%s", getattr(getattr(q, "from_user", None), "id", None), getattr(q, "data", None), exc)
+
+
+async def block_banned_callback(q, data: dict[str, Any]) -> None:
+    await disable_callback_markup(q)
+    await safe_callback_answer(q, "🚫 شما موقتاً محدود هستید. بعداً دوباره تلاش کنید.", show_alert=True)
+
+
+async def block_rate_limited_callback(q, data: dict[str, Any]) -> None:
+    await disable_callback_markup(q)
+    await safe_callback_answer(q, "🚫 محدودیت ضداسپم فعال شد. ۵ دقیقه بعد دوباره تلاش کنید.", show_alert=True)
 
 async def maybe_welcome(update: Update, data: dict[str, Any], uid: int, source: str) -> bool:
     if source!="business" or not data.get("welcome_enabled",True): return False
@@ -517,15 +626,19 @@ async def panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query
     if not q: return
-    await safe_callback_answer(q); data=load_data(); uid=q.from_user.id
-    if q.data.startswith("im:btn:"):
-        row_user = db.get_user(uid)
-        if row_user and int(row_user["soft_ban_until"] or 0) > int(time.time()):
-            await send_formatted_message(q.message, "<b>🚫 شما موقتاً محدود هستید.</b>\n\nپس از پایان زمان محدودیت دوباره تلاش کنید.", data)
-            return
-        if hit_limit_and_maybe_ban(uid, "inline_btn"):
-            await send_formatted_message(q.message, "<b>🚫 محدودیت ضداسپم فعال شد.</b>\n\nبه دلیل کلیک بیش از حد، به مدت <b>۵ دقیقه</b> محدود شدید.", data)
-            return
+    data=load_data(); uid=q.from_user.id
+    if not (q.data and q.data.startswith(("im:btn:", "user:"))):
+        await safe_callback_answer(q)
+    if q.data and q.data.startswith("im:btn:"):
+        if not is_admin(uid, data):
+            row_user = db.get_user(uid)
+            if row_user and int(row_user["soft_ban_until"] or 0) > int(time.time()):
+                await block_banned_callback(q, data)
+                return
+            if hit_limit_and_maybe_ban(uid, "inline_btn"):
+                await block_rate_limited_callback(q, data)
+                return
+        await safe_callback_answer(q)
         if not data.get("active", False) or not data.get("inline_menu_enabled", False):
             return
         bid=int(q.data.split(":")[2])
@@ -690,14 +803,16 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if st.get("state")=="im_create_confirm":
                 p=st.get("payload",{}); db.set_admin_state(uid,"im_create_output_text",p)
                 await q.edit_message_text("Output را دوباره بفرستید.", reply_markup=build_back_kb("im:root")); return
-    if q.data.startswith("user:"):
-        row_user = db.get_user(uid)
-        if row_user and int(row_user["soft_ban_until"] or 0) > int(time.time()):
-            await send_formatted_message(q.message, "<b>🚫 شما موقتاً محدود هستید.</b>\n\nپس از پایان زمان محدودیت دوباره تلاش کنید.", data)
-            return
-        if hit_limit_and_maybe_ban(uid, "reply_kb_btn"):
-            await send_formatted_message(q.message, "<b>🚫 محدودیت ضداسپم فعال شد.</b>\n\nبه دلیل کلیک بیش از حد، به مدت <b>۵ دقیقه</b> محدود شدید.", data)
-            return
+    if q.data and q.data.startswith("user:"):
+        if not is_admin(uid, data):
+            row_user = db.get_user(uid)
+            if row_user and int(row_user["soft_ban_until"] or 0) > int(time.time()):
+                await block_banned_callback(q, data)
+                return
+            if hit_limit_and_maybe_ban(uid, "reply_kb_btn"):
+                await block_rate_limited_callback(q, data)
+                return
+        await safe_callback_answer(q)
         if not data.get("active", False):
             await q.message.reply_text("ربات خاموش است.")
             return
@@ -843,16 +958,17 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         STATE.temp_shortcuts=None
         await q.edit_message_text("شورت‌کات‌ها ذخیره شدند.", reply_markup=create_shortcut_menu_keyboard())
     elif q.data=="admin:welcome_toggle":
-        if not data.get("active", False):
-            await safe_callback_answer(q, "اول ربات را از وضعیت سراسری روشن کنید.", show_alert=True)
-            return
         data["welcome_enabled"]=not data.get("welcome_enabled",False); save_data(data); await q.edit_message_text("وضعیت Welcome تغییر کرد.", reply_markup=create_admin_keyboard(data))
     elif q.data=="admin:welcome_cfg": STATE.flow,STATE.step,STATE.admin_id,STATE.message_id,STATE.pending_key="welcome_cfg","waiting_value",uid,q.message.message_id,"welcome_text"; await q.edit_message_text(f"متن فعلی Welcome:\n{data.get('welcome_text','')}\n\nمتن جدید را ارسال کنید.", reply_markup=build_back_kb("menu:admin"))
-    elif q.data=="admin:report":
-        users=db.list_users(50)
-        lines=[f"• نام: {u['full_name'] or '-'}\n  آیدی: {u['user_id']} | یوزرنیم: @{u['username'] or '-'}\n  موبایل: {u['phone'] or '-'} | جوین: {'yes' if u['is_channel_joined'] else 'no'}" for u in users]
-        rep=f"📊 گزارش سیستم\n• کاربران: {len(users)}\n• آپتایم: {int(time.time()-START_TIME)} ثانیه\n• CPU: {psutil.cpu_percent()}%\n• RAM: {psutil.virtual_memory().percent}%\n\n👤 لیست کاربران:\n\n" + ("\n\n".join(lines) if lines else "-")
-        await q.edit_message_text(rep, reply_markup=build_back_kb("menu:admin"))
+    elif q.data=="admin:report" or q.data.startswith("admin:report_page:"):
+        page = 0
+        if q.data.startswith("admin:report_page:"):
+            try:
+                page = int(q.data.rsplit(":", 1)[1])
+            except Exception:
+                page = 0
+        rep, kb = build_users_report(page)
+        await q.edit_message_text(rep, parse_mode=ParseMode.HTML, reply_markup=kb)
     elif q.data=="admin:broadcast_help": await q.edit_message_text("برای برودکست از دستور /broadcast <متن> استفاده کنید.", reply_markup=build_back_kb("menu:admin"))
     elif q.data=="admin:feedback_list":
         rows=db.list_feedbacks(100)
@@ -995,6 +1111,12 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     # Monitoring is event-driven from business/channel/group updates.
     data=load_data(); uid=update.effective_user.id; src_txt=text_with_custom_emoji_markup(update.message); txt=(update.message.text or "").strip()
+    if txt.lower() in {"panel", "/panel"} and is_admin(uid,data):
+        STATE.flow=STATE.step=STATE.pending_key=None
+        STATE.temp_shortcuts=None
+        db.clear_admin_state(uid)
+        await update.message.reply_text("پنل ادمین", reply_markup=create_admin_keyboard(data))
+        return
     st=db.get_admin_state(uid) if is_admin(uid, data) else None
     if st:
         s=st.get("state"); p=st.get("payload",{})
@@ -1033,11 +1155,6 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if row and int(row["soft_ban_until"] or 0)>int(time.time()): return
     db.upsert_user(uid, update.effective_user.username or "", update.effective_user.full_name or update.effective_user.first_name or "", update.message.contact.phone_number if update.message.contact else None, False, "message", txt)
 
-    if txt.lower()=="panel" and is_admin(uid,data):
-        STATE.flow=STATE.step=STATE.pending_key=None
-        STATE.temp_shortcuts=None
-        await update.message.reply_text("پنل ادمین", reply_markup=create_admin_keyboard(data))
-        return
     if data.get("active", False) and data.get("inline_menu_enabled", False):
         m = db.menu_by_command(txt)
         if m:
