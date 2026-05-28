@@ -131,10 +131,20 @@ class DB:
     def get_json(self, key: str, default: Any) -> Any:
         with self.conn() as c:
             row = c.execute("SELECT v FROM kv WHERE k=?", (key,)).fetchone()
-            return default if not row else json.loads(row["v"])
+            if not row:
+                return default
+            try:
+                return json.loads(row["v"])
+            except Exception as exc:
+                logging.warning("kv_json_decode_failed key=%s reason=%s", key, exc)
+                return default
     def set_json(self, key: str, value: Any):
         with self.conn() as c:
             c.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (key, json.dumps(value, ensure_ascii=False)))
+    def get_kv_raw(self, key: str) -> str | None:
+        with self.conn() as c:
+            row = c.execute("SELECT v FROM kv WHERE k=?", (key,)).fetchone()
+            return None if not row else str(row["v"])
     def upsert_user(self, user_id: int, username: str, full_name: str, phone: str | None, joined: bool, source: str, last_message: str | None):
         now = int(time.time())
         with self.conn() as c:
@@ -151,8 +161,24 @@ class DB:
             return int(row["cnt"] if row else 0)
     def list_users(self, limit: int = 50, offset: int = 0):
         with self.conn() as c: return c.execute("SELECT * FROM users ORDER BY COALESCE(last_seen_at,0) DESC, user_id DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()
-    def set_soft_ban(self, user_id: int, until_ts: int):
-        with self.conn() as c: c.execute("UPDATE users SET soft_ban_until=? WHERE user_id=?", (until_ts, user_id))
+    def touch_user_activity(self, user_id: int, source: str | None = None, last_message: str | None = None, spam_delta: int = 0):
+        now = int(time.time())
+        with self.conn() as c:
+            c.execute("""UPDATE users SET
+                last_seen_at=?,
+                source=COALESCE(?, source),
+                last_message=COALESCE(?, last_message),
+                spam_score=COALESCE(spam_score,0)+?
+                WHERE user_id=?
+            """, (now, source, last_message, spam_delta, user_id))
+    def set_soft_ban(self, user_id: int, until_ts: int, spam_delta: int = 1):
+        now = int(time.time())
+        with self.conn() as c:
+            c.execute("""UPDATE users SET soft_ban_until=?, last_seen_at=?, spam_score=COALESCE(spam_score,0)+? WHERE user_id=?""", (until_ts, now, spam_delta, user_id))
+    def set_menu_active(self, menu_id: int, active: bool):
+        with self.conn() as c: c.execute("UPDATE menus SET is_active=?, updated_at=? WHERE id=?", (1 if active else 0, int(time.time()), menu_id))
+    def set_button_active(self, button_id: int, active: bool):
+        with self.conn() as c: c.execute("UPDATE menu_buttons SET is_active=?, updated_at=? WHERE id=?", (1 if active else 0, int(time.time()), button_id))
     def save_shortcuts(self, items: dict[str, str]):
         cleaned=[]
         for k,v in items.items():
@@ -224,25 +250,28 @@ class DB:
     def list_menus(self):
         with self.conn() as c: return c.execute("SELECT * FROM menus ORDER BY id DESC").fetchall()
     def has_command_ci(self, command:str, exclude_menu_id:int|None=None) -> bool:
+        wanted = normalize_trigger(command)
         with self.conn() as c:
-            if exclude_menu_id is None:
-                row = c.execute("SELECT 1 FROM menus WHERE LOWER(command)=LOWER(?) LIMIT 1", (command,)).fetchone()
-            else:
-                row = c.execute("SELECT 1 FROM menus WHERE LOWER(command)=LOWER(?) AND id<>? LIMIT 1", (command, exclude_menu_id)).fetchone()
-            return bool(row)
+            rows = c.execute("SELECT id, command FROM menus").fetchall()
+            return any(normalize_trigger(r["command"]) == wanted and (exclude_menu_id is None or int(r["id"]) != exclude_menu_id) for r in rows)
     def menu_by_command(self, command:str):
+        wanted = normalize_trigger(command)
+        if not wanted:
+            return None
         with self.conn() as c:
-            exact = c.execute("SELECT * FROM menus WHERE command=? AND is_active=1", (command,)).fetchone()
-            if exact:
-                return exact
-            rows = c.execute("SELECT * FROM menus WHERE LOWER(command)=LOWER(?) AND is_active=1 ORDER BY id DESC", (command,)).fetchall()
-            if len(rows) == 1:
-                return rows[0]
-            if len(rows) > 1:
-                logging.warning("menu_case_collision command=%r count=%s", command, len(rows))
+            rows = c.execute("SELECT * FROM menus WHERE is_active=1 ORDER BY id DESC").fetchall()
+            matches = [r for r in rows if normalize_trigger(r["command"]) == wanted]
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                logging.warning("menu_case_collision command=%r normalized=%r count=%s", command, wanted, len(matches))
             return None
     def menu_buttons(self, menu_id:int):
         with self.conn() as c: return c.execute("SELECT * FROM menu_buttons WHERE menu_id=? AND is_active=1 ORDER BY sort_order,id",(menu_id,)).fetchall()
+    def menu_buttons_all(self, menu_id:int):
+        with self.conn() as c: return c.execute("SELECT * FROM menu_buttons WHERE menu_id=? ORDER BY sort_order,id",(menu_id,)).fetchall()
+    def menu_by_id(self, menu_id:int):
+        with self.conn() as c: return c.execute("SELECT * FROM menus WHERE id=?", (menu_id,)).fetchone()
     def delete_menu_atomic(self, menu_id: int) -> bool:
         with self.conn() as c:
             cur = c.execute("DELETE FROM menus WHERE id=?", (menu_id,))
@@ -280,11 +309,64 @@ def get_default_data() -> dict[str, Any]:
             "features": {**{k: True for k in ADMIN_FEATURES}, **{k: True for k in USER_FEATURES}}, "offline_message": "پیام شما دریافت شد. به‌زودی پاسخ می‌دهیم.",
             "service_text": "", "hours_text": "", "location_text": "", "faq_text": "", "contact_text": "", "feedback_prompt_text": "لطفاً بازخورد خود را ارسال کنید.", "feedback_success_text": "✅ بازخورد شما با موفقیت ثبت شد."}
 
+def coerce_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "on", "yes", "y", "فعال", "روشن"}:
+            return True
+        if normalized in {"0", "false", "off", "no", "n", "غیرفعال", "خاموش"}:
+            return False
+    return default
+
+
+def normalize_trigger(text: str | None) -> str:
+    value = str(text or "").strip()
+    value = re.sub(r"^[\s/!#@]+", "", value)
+    value = re.sub(r"[\s.!؟?،,؛;:]+$", "", value)
+    return value.casefold()
+
+
+def normalize_shortcut_map(shortcuts: dict[str, str]) -> dict[str, str]:
+    normalized: dict[str, str] = {}
+    for key, value in shortcuts.items():
+        nk = normalize_trigger(key)
+        if nk and nk not in normalized:
+            normalized[nk] = value
+    return normalized
+
+
 def load_data() -> dict[str, Any]:
-    data=db.get_json("settings", get_default_data()); d=get_default_data()
+    d=get_default_data()
+    settings_raw = db.get_kv_raw("settings")
+    data=db.get_json("settings", d.copy())
+    if not isinstance(data, dict):
+        logging.warning("settings_invalid_type type=%s", type(data).__name__)
+        data = d.copy()
     for k,v in d.items(): data.setdefault(k,v)
     data.setdefault("features",{})
+    if not isinstance(data["features"], dict):
+        data["features"] = {}
     for k,v in d["features"].items(): data["features"].setdefault(k,v)
+    if settings_raw is None:
+        legacy_welcome_enabled = db.get_kv_raw("welcome_enabled")
+        legacy_welcome_text = db.get_kv_raw("welcome_text")
+        if legacy_welcome_enabled is not None:
+            try:
+                data["welcome_enabled"] = json.loads(legacy_welcome_enabled)
+            except Exception:
+                data["welcome_enabled"] = legacy_welcome_enabled
+        if legacy_welcome_text is not None:
+            try:
+                data["welcome_text"] = json.loads(legacy_welcome_text)
+            except Exception:
+                data["welcome_text"] = legacy_welcome_text
+    data["welcome_enabled"] = coerce_bool(data.get("welcome_enabled"), d["welcome_enabled"])
+    if not isinstance(data.get("welcome_text"), str):
+        data["welcome_text"] = str(data.get("welcome_text") or d["welcome_text"])
     return data
 
 def save_data(data: dict[str, Any]) -> None: db.set_json("settings", data)
@@ -469,7 +551,7 @@ async def maybe_report_watch_hit(update: Update, context: ContextTypes.DEFAULT_T
         logging.warning("watch_report_send_failed reason=%s", exc)
 
 async def send_formatted_message(target, text: str, data: dict[str, Any]):
-    await target.reply_text(render_html_text(text, bold=data.get("bold_mode", True)), parse_mode=ParseMode.HTML)
+    return await target.reply_text(render_html_text(text, bold=data.get("bold_mode", True)), parse_mode=ParseMode.HTML)
 
 def is_spam(text: str, shortcuts: dict[str, str]) -> bool:
     words=re.findall(r"\w+", text.lower());
@@ -484,14 +566,7 @@ def is_spam(text: str, shortcuts: dict[str, str]) -> bool:
     return False
 
 def match_shortcut(text: str, shortcuts: dict[str, str]) -> str | None:
-    t = (text or "").strip().lower()
-    if not t:
-        return None
-    for key, value in shortcuts.items():
-        kk = str(key or "").strip().lower()
-        if kk and t == kk:
-            return value
-    return None
+    return normalize_shortcut_map(shortcuts).get(normalize_trigger(text))
 
 def hit_limit_and_maybe_ban(uid: int, bucket: str = "global_action", window_sec: int = 60, max_hits: int = 5, ban_sec: int = 5 * 60) -> bool:
     now = int(time.time())
@@ -501,9 +576,41 @@ def hit_limit_and_maybe_ban(uid: int, bucket: str = "global_action", window_sec:
     hits.append(now)
     db.set_json(key, hits)
     if len(hits) > max_hits:
-        db.set_soft_ban(uid, now + ban_sec)
+        db.set_soft_ban(uid, now + ban_sec, spam_delta=1)
         return True
     return False
+
+
+def smart_rate_limit(uid: int, bucket: str, action_key: str, window_sec: int, max_total: int, same_window_sec: int, max_same: int, ban_sec: int = 5 * 60) -> bool:
+    now = int(time.time())
+    key = f"rate2:{bucket}:{uid}"
+    action_key = normalize_trigger(action_key) or str(action_key or "-")
+    raw_events = db.get_json(key, [])
+    events = []
+    for item in raw_events if isinstance(raw_events, list) else []:
+        if isinstance(item, dict) and str(item.get("t", "")).isdigit():
+            t = int(item["t"])
+            if now - t < window_sec:
+                events.append({"t": t, "k": str(item.get("k") or "-")})
+    events.append({"t": now, "k": action_key})
+    db.set_json(key, events)
+    same_count = sum(1 for e in events if e["k"] == action_key and now - int(e["t"]) < same_window_sec)
+    if len(events) > max_total or same_count > max_same:
+        db.set_soft_ban(uid, now + ban_sec, spam_delta=1)
+        return True
+    return False
+
+
+def inline_button_rate_limited(uid: int, button_id: int) -> bool:
+    return smart_rate_limit(uid, "inline_button", str(button_id), 60, 30, 12, 6)
+
+
+def menu_command_rate_limited(uid: int, command: str) -> bool:
+    return smart_rate_limit(uid, "menu_command", command, 60, 16, 30, 5)
+
+
+def shortcut_rate_limited(uid: int, command: str) -> bool:
+    return smart_rate_limit(uid, "shortcut", command, 60, 20, 30, 7)
 
 async def safe_callback_answer(q, text: str | None = None, show_alert: bool = False) -> bool:
     try:
@@ -534,6 +641,56 @@ def clip_report_text(value: Any, limit: int = 160) -> str:
     if len(text) > limit:
         return f"{text[:limit-1]}…"
     return text or "-"
+
+
+def truncate_preserving_tg_emoji(value: Any, limit: int = 160) -> str:
+    text = str(value or "").replace("\n", " ").strip()
+    if not text:
+        return "-"
+    pattern = re.compile(r'<tg-emoji\s+emoji-id="\d+">.*?</tg-emoji>', re.DOTALL)
+    out: list[str] = []
+    pos = 0
+    visible = 0
+    truncated = False
+    for match in pattern.finditer(text):
+        plain = text[pos:match.start()]
+        room = limit - visible
+        if room <= 0:
+            truncated = True
+            break
+        if len(plain) > room:
+            out.append(plain[:room])
+            visible += room
+            truncated = True
+            break
+        out.append(plain)
+        visible += len(plain)
+        inner = re.sub(r"<[^>]+>", "", match.group(0)) or "🙂"
+        if visible + len(inner) > limit:
+            truncated = True
+            break
+        out.append(match.group(0))
+        visible += len(inner)
+        pos = match.end()
+    if not truncated:
+        tail = text[pos:]
+        room = limit - visible
+        if len(tail) > room:
+            out.append(tail[:room])
+            truncated = True
+        else:
+            out.append(tail)
+    result = "".join(out).strip()
+    if truncated:
+        result += "…"
+    return result or "-"
+
+
+def format_report_message(value: Any, limit: int = 160) -> str:
+    clipped = truncate_preserving_tg_emoji(value, limit)
+    if clipped == "-":
+        return clipped
+    return preserve_tg_emoji_markup(clipped)
 
 
 def build_report_keyboard(page: int, total_pages: int) -> InlineKeyboardMarkup:
@@ -580,7 +737,7 @@ def build_users_report(page: int = 0, page_size: int = 8) -> tuple[str, InlineKe
                 f"🕘 آخرین حضور: {format_ts(u['last_seen_at'])}\n"
                 f"🚪 منبع: {html.escape(u['source'] or '-')} | 🚫 محدودیت: {('تا ' + format_ts(ban_until)) if is_banned else 'ندارد'}\n"
                 f"⚠️ امتیاز اسپم: {int(u['spam_score'] or 0)}\n"
-                f"💬 آخرین پیام: {html.escape(clip_report_text(u['last_message']))}"
+                f"💬 آخرین پیام: {format_report_message(u['last_message'])}"
             )
         body = "\n".join(blocks)
     return header + body, build_report_keyboard(page, total_pages)
@@ -601,6 +758,68 @@ async def block_banned_callback(q, data: dict[str, Any]) -> None:
 async def block_rate_limited_callback(q, data: dict[str, Any]) -> None:
     await disable_callback_markup(q)
     await safe_callback_answer(q, "🚫 محدودیت ضداسپم فعال شد. ۵ دقیقه بعد دوباره تلاش کنید.", show_alert=True)
+
+async def send_or_replace_button_response(q, context: ContextTypes.DEFAULT_TYPE, button_id: int, payload: str, data: dict[str, Any]):
+    if not q.message:
+        return
+    chat_id = q.message.chat.id
+    storage_key = f"last_btn_response:{q.from_user.id}:{chat_id}:{button_id}"
+    out_text = render_html_text(payload, bold=data.get("bold_mode", True))
+    bc = getattr(q.message, "business_connection_id", None)
+    kwargs = {"chat_id": chat_id, "text": out_text, "parse_mode": ParseMode.HTML}
+    if bc:
+        kwargs["business_connection_id"] = bc
+    previous = db.get_json(storage_key, {})
+    prev_msg_id = int(previous.get("message_id") or 0) if isinstance(previous, dict) else 0
+    if prev_msg_id:
+        try:
+            await context.bot.edit_message_text(message_id=prev_msg_id, **kwargs)
+            db.set_json(storage_key, {"message_id": prev_msg_id, "updated_at": int(time.time())})
+            return
+        except BadRequest as exc:
+            if "message is not modified" in str(exc).lower():
+                db.set_json(storage_key, {"message_id": prev_msg_id, "updated_at": int(time.time())})
+                return
+            logging.warning("button_response_edit_failed uid=%s bid=%s reason=%s", q.from_user.id, button_id, exc)
+        except Exception as exc:
+            logging.warning("button_response_edit_failed uid=%s bid=%s reason=%s", q.from_user.id, button_id, exc)
+    try:
+        sent = await context.bot.send_message(**kwargs)
+        db.set_json(storage_key, {"message_id": sent.message_id, "updated_at": int(time.time())})
+    except TimedOut:
+        logging.warning("button_response_send_timeout uid=%s bid=%s", q.from_user.id, button_id)
+
+
+async def delete_admin_trigger_message(message, context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        kwargs = {"chat_id": message.chat.id, "message_id": message.message_id}
+        bc = getattr(message, "business_connection_id", None)
+        if bc:
+            kwargs["business_connection_id"] = bc
+        await context.bot.delete_message(**kwargs)
+    except Exception as exc:
+        logging.warning("admin_menu_trigger_delete_failed uid=%s msg_id=%s reason=%s", getattr(getattr(message, "from_user", None), "id", None), getattr(message, "message_id", None), exc)
+
+
+def build_menu_markup(buttons) -> InlineKeyboardMarkup | None:
+    rows = [[InlineKeyboardButton(buttons[i]["button_text"], callback_data=f"im:btn:{buttons[i]['id']}"),
+             InlineKeyboardButton(buttons[i+1]["button_text"], callback_data=f"im:btn:{buttons[i+1]['id']}")] if i+1 < len(buttons)
+            else [InlineKeyboardButton(buttons[i]["button_text"], callback_data=f"im:btn:{buttons[i]['id']}")]
+            for i in range(0, len(buttons), 2)]
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+def build_toggle_menu_keyboard(menu_id: int) -> InlineKeyboardMarkup:
+    menu = db.menu_by_id(menu_id)
+    if not menu:
+        return build_inline_menu_admin_kb(False, False)
+    rows = [[create_success_button(f"{'✅' if menu['is_active'] else '❌'} منو: {menu['command']}", f"im:togmenu:{menu_id}")]]
+    for b in db.menu_buttons_all(menu_id):
+        state = "✅ فعال" if b["is_active"] else "❌ غیرفعال"
+        rows.append([create_primary_button(f"{state} | {b['button_text']}", f"im:togbtn:{b['id']}")])
+    rows.append([create_primary_button("🔙 انتخاب منوی دیگر", "im:active"), create_danger_button("🏠 بازگشت", "im:root")])
+    return InlineKeyboardMarkup(rows)
+
 
 async def maybe_welcome(update: Update, data: dict[str, Any], uid: int, source: str) -> bool:
     if source!="business" or not data.get("welcome_enabled",True): return False
@@ -627,27 +846,30 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query
     if not q: return
     data=load_data(); uid=q.from_user.id
+    db.upsert_user(uid, q.from_user.username or "", q.from_user.full_name or q.from_user.first_name or "", None, False, "callback", q.data or "")
     if not (q.data and q.data.startswith(("im:btn:", "user:"))):
         await safe_callback_answer(q)
     if q.data and q.data.startswith("im:btn:"):
-        row_user = db.get_user(uid)
-        if row_user and int(row_user["soft_ban_until"] or 0) > int(time.time()):
-            await block_banned_callback(q, data)
-            return
-        if hit_limit_and_maybe_ban(uid, "inline_btn"):
-            await block_rate_limited_callback(q, data)
-            return
+        bid=int(q.data.split(":")[2])
+        db.touch_user_activity(uid, "inline_button", f"button:{bid}")
+        if not is_admin(uid, data):
+            row_user = db.get_user(uid)
+            if row_user and int(row_user["soft_ban_until"] or 0) > int(time.time()):
+                await block_banned_callback(q, data)
+                return
+            if inline_button_rate_limited(uid, bid):
+                await block_rate_limited_callback(q, data)
+                return
         await safe_callback_answer(q)
         if not data.get("active", False) or not data.get("inline_menu_enabled", False):
             return
-        bid=int(q.data.split(":")[2])
         with db.conn() as c:
             row=c.execute("SELECT action_type, action_payload FROM menu_buttons WHERE id=? AND is_active=1",(bid,)).fetchone()
         if not row: return
         handler = ACTION_REGISTRY.get(row["action_type"])
         if not handler: return
         async def send_fn(payload: str):
-            await send_formatted_message(q.message, payload, data)
+            await send_or_replace_button_response(q, context, bid, payload, data)
         await handler.execute(send_fn, row["action_payload"])
         return
     if q.data and q.data.startswith("im:"):
@@ -677,11 +899,14 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if q.data == IMCB["ADD_BTN"]:
             menus=[{"id":m["id"],"label":f"{m['command']}"} for m in db.list_menus()]
             await q.edit_message_text("انتخاب منو:", reply_markup=paged_rows(menus,"im:addbtnpick",0)); return
-        if ":page:" in q.data and q.data.startswith(("im:addbtnpick","im:mgrpick","im:editpick","im:livepick")):
+        if ":page:" in q.data and q.data.startswith(("im:addbtnpick","im:mgrpick","im:editpick","im:livepick","im:togpick")):
             parts=q.data.split(":")
             prefix=":".join(parts[:2]); page=int(parts[-1])
-            menus=[{"id":m["id"],"label":f"{m['command']}"} for m in db.list_menus()]
+            menus=[{"id":m["id"],"label":(f"{'✅' if m['is_active'] else '❌'} {m['command']}" if prefix=="im:togpick" else f"{m['command']}")} for m in db.list_menus()]
             await q.edit_message_text("انتخاب منو:", reply_markup=paged_rows(menus,prefix,page)); return
+        if q.data == IMCB["ACTIVE"]:
+            menus=[{"id":m["id"],"label":f"{'✅' if m['is_active'] else '❌'} {m['command']}"} for m in db.list_menus()]
+            await q.edit_message_text("🟢 مدیریت فعال/غیرفعال منو و دکمه‌ها:", reply_markup=paged_rows(menus,"im:togpick",0)); return
         if q.data == IMCB["LIVE"]:
             menus=[{"id":m["id"],"label":f"{m['command']}"} for m in db.list_menus()]
             await q.edit_message_text("Live Menus:", reply_markup=paged_rows(menus,"im:livepick",0)); return
@@ -701,6 +926,32 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         for i in range(0, len(btns), 2)]
                 rows.append([InlineKeyboardButton("🔙 بازگشت به لیست", callback_data="im:live")])
                 await q.edit_message_text(f"📋 Menu: {menu['command']}\n\n{menu['preview_text']}", reply_markup=InlineKeyboardMarkup(rows)); return
+
+        if q.data.startswith("im:togpick:"):
+            try: mid=int(q.data.split(":")[2])
+            except Exception: logging.warning("im_invalid_payload uid=%s data=%r", uid, q.data); return
+            menu = db.menu_by_id(mid)
+            if not menu:
+                await q.edit_message_text("این منو دیگر وجود ندارد.", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False))); return
+            await q.edit_message_text(f"⚙️ وضعیت منو: {menu['command']}", reply_markup=build_toggle_menu_keyboard(mid)); return
+        if q.data.startswith("im:togmenu:"):
+            mid=int(q.data.split(":")[2])
+            menu = db.menu_by_id(mid)
+            if not menu:
+                await q.edit_message_text("این منو دیگر وجود ندارد.", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False))); return
+            db.set_menu_active(mid, not bool(menu["is_active"]))
+            db.log_admin(uid,"toggle","menu_active",mid,str(bool(menu["is_active"])),str(not bool(menu["is_active"])))
+            menu = db.menu_by_id(mid)
+            await q.edit_message_text(f"⚙️ وضعیت منو: {menu['command']}", reply_markup=build_toggle_menu_keyboard(mid)); return
+        if q.data.startswith("im:togbtn:"):
+            bid=int(q.data.split(":")[2])
+            btn = db.button_by_id(bid)
+            if not btn:
+                await q.edit_message_text("این دکمه دیگر وجود ندارد.", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False))); return
+            db.set_button_active(bid, not bool(btn["is_active"]))
+            db.log_admin(uid,"toggle","button_active",bid,str(bool(btn["is_active"])),str(not bool(btn["is_active"])))
+            menu = db.menu_by_id(int(btn["menu_id"]))
+            await q.edit_message_text(f"⚙️ وضعیت منو: {menu['command'] if menu else '-'}", reply_markup=build_toggle_menu_keyboard(int(btn["menu_id"]))); return
 
         if q.data.startswith("im:addbtnpick:"):
             try: mid=int(q.data.split(":")[2])
@@ -803,13 +1054,15 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 p=st.get("payload",{}); db.set_admin_state(uid,"im_create_output_text",p)
                 await q.edit_message_text("Output را دوباره بفرستید.", reply_markup=build_back_kb("im:root")); return
     if q.data and q.data.startswith("user:"):
-        row_user = db.get_user(uid)
-        if row_user and int(row_user["soft_ban_until"] or 0) > int(time.time()):
-            await block_banned_callback(q, data)
-            return
-        if hit_limit_and_maybe_ban(uid, "reply_kb_btn"):
-            await block_rate_limited_callback(q, data)
-            return
+        db.touch_user_activity(uid, "user_button", q.data)
+        if not is_admin(uid, data):
+            row_user = db.get_user(uid)
+            if row_user and int(row_user["soft_ban_until"] or 0) > int(time.time()):
+                await block_banned_callback(q, data)
+                return
+            if smart_rate_limit(uid, "user_button", q.data, 60, 25, 20, 8):
+                await block_rate_limited_callback(q, data)
+                return
         await safe_callback_answer(q)
         if not data.get("active", False):
             await q.message.reply_text("ربات خاموش است.")
@@ -957,7 +1210,9 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("شورت‌کات‌ها ذخیره شدند.", reply_markup=create_shortcut_menu_keyboard())
     elif q.data=="admin:welcome_toggle":
         data["welcome_enabled"]=not data.get("welcome_enabled",False); save_data(data); await q.edit_message_text("وضعیت Welcome تغییر کرد.", reply_markup=create_admin_keyboard(data))
-    elif q.data=="admin:welcome_cfg": STATE.flow,STATE.step,STATE.admin_id,STATE.message_id,STATE.pending_key="welcome_cfg","waiting_value",uid,q.message.message_id,"welcome_text"; await q.edit_message_text(f"متن فعلی Welcome:\n{data.get('welcome_text','')}\n\nمتن جدید را ارسال کنید.", reply_markup=build_back_kb("menu:admin"))
+    elif q.data=="admin:welcome_cfg":
+        STATE.flow,STATE.step,STATE.admin_id,STATE.message_id,STATE.pending_key="welcome_cfg","waiting_value",uid,q.message.message_id,"welcome_text"
+        await q.edit_message_text(f"📝 حالت ویرایش Welcome فعال شد.\n\n✅ همین حالا متن جدید ولکام را در پیام بعدی ارسال کنید.\n\nمتن فعلی:\n{render_html_text(data.get('welcome_text','') or '(خالی)')}", parse_mode=ParseMode.HTML, reply_markup=build_back_kb("menu:admin"))
     elif q.data=="admin:report" or q.data.startswith("admin:report_page:"):
         page = 0
         if q.data.startswith("admin:report_page:"):
@@ -1004,15 +1259,16 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
     if data.get("active", False) and data.get("inline_menu_enabled", False):
         menu = db.menu_by_command(txt)
         if menu:
+            if not is_admin(uid, data) and menu_command_rate_limited(uid, txt):
+                logging.warning("business_menu_command_rate_limited uid=%s command=%r", uid, txt)
+                return
             buttons = db.menu_buttons(menu["id"])
-            rows = [[InlineKeyboardButton(buttons[i]["button_text"], callback_data=f"im:btn:{buttons[i]['id']}"),
-                     InlineKeyboardButton(buttons[i+1]["button_text"], callback_data=f"im:btn:{buttons[i+1]['id']}")] if i+1 < len(buttons)
-                    else [InlineKeyboardButton(buttons[i]["button_text"], callback_data=f"im:btn:{buttons[i]['id']}")]
-                    for i in range(0, len(buttons), 2)]
             out = render_html_text(menu["preview_text"], bold=data.get("bold_mode", True))
-            kwargs = {"chat_id": bm.chat.id, "text": out, "parse_mode": ParseMode.HTML, "reply_markup": InlineKeyboardMarkup(rows)}
+            kwargs = {"chat_id": bm.chat.id, "text": out, "parse_mode": ParseMode.HTML, "reply_markup": build_menu_markup(buttons)}
             bc = getattr(bm, "business_connection_id", None)
             if bc: kwargs["business_connection_id"] = bc
+            if is_admin(uid, data):
+                await delete_admin_trigger_message(bm, context)
             try:
                 await context.bot.send_message(**kwargs)
             except TimedOut:
@@ -1020,7 +1276,7 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
             return
     sc=db.load_shortcuts(); resp=match_shortcut(txt, sc)
     if resp and data.get("self_bot_enabled", False):
-        if hit_limit_and_maybe_ban(uid, "shortcut_business"):
+        if not is_admin(uid, data) and shortcut_rate_limited(uid, txt):
             await send_formatted_message(bm, "<b>🚫 محدودیت ضداسپم فعال شد.</b>\n\nبه دلیل ارسال سریع/پرتکرار، به مدت <b>۵ دقیقه</b> محدود شدید.", data)
             return
         bc=getattr(bm,"business_connection_id",None)
@@ -1109,6 +1365,12 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     # Monitoring is event-driven from business/channel/group updates.
     data=load_data(); uid=update.effective_user.id; src_txt=text_with_custom_emoji_markup(update.message); txt=(update.message.text or "").strip()
+    if txt.lower() in {"panel", "/panel"} and is_admin(uid,data):
+        STATE.flow=STATE.step=STATE.pending_key=None
+        STATE.temp_shortcuts=None
+        db.clear_admin_state(uid)
+        await update.message.reply_text("پنل ادمین", reply_markup=create_admin_keyboard(data))
+        return
     st=db.get_admin_state(uid) if is_admin(uid, data) else None
     if st:
         s=st.get("state"); p=st.get("payload",{})
@@ -1147,20 +1409,18 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if row and int(row["soft_ban_until"] or 0)>int(time.time()): return
     db.upsert_user(uid, update.effective_user.username or "", update.effective_user.full_name or update.effective_user.first_name or "", update.message.contact.phone_number if update.message.contact else None, False, "message", txt)
 
-    if txt.lower()=="panel" and is_admin(uid,data):
-        STATE.flow=STATE.step=STATE.pending_key=None
-        STATE.temp_shortcuts=None
-        await update.message.reply_text("پنل ادمین", reply_markup=create_admin_keyboard(data))
-        return
     if data.get("active", False) and data.get("inline_menu_enabled", False):
         m = db.menu_by_command(txt)
         if m:
+            if not is_admin(uid, data) and menu_command_rate_limited(uid, txt):
+                logging.warning("menu_command_rate_limited uid=%s command=%r", uid, txt)
+                return
             btns=db.menu_buttons(m["id"])
-            rows=[[InlineKeyboardButton(btns[i]["button_text"], callback_data=f"im:btn:{btns[i]['id']}"),
-                   InlineKeyboardButton(btns[i+1]["button_text"], callback_data=f"im:btn:{btns[i+1]['id']}")] if i+1 < len(btns)
-                  else [InlineKeyboardButton(btns[i]["button_text"], callback_data=f"im:btn:{btns[i]['id']}")]
-                  for i in range(0, len(btns), 2)]
-            await update.message.reply_text(render_html_text(m["preview_text"], bold=data.get("bold_mode", True)), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
+            if is_admin(uid, data):
+                await delete_admin_trigger_message(update.message, context)
+                await context.bot.send_message(chat_id=update.effective_chat.id, text=render_html_text(m["preview_text"], bold=data.get("bold_mode", True)), parse_mode=ParseMode.HTML, reply_markup=build_menu_markup(btns))
+            else:
+                await update.message.reply_text(render_html_text(m["preview_text"], bold=data.get("bold_mode", True)), parse_mode=ParseMode.HTML, reply_markup=build_menu_markup(btns))
             return
     if txt.lower()=="menu":
         if not data.get("active", False):
@@ -1214,7 +1474,7 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="متن شورت‌کات بروزرسانی شد.", reply_markup=create_shortcut_menu_keyboard()); return
     if STATE.admin_id==uid and STATE.flow=="welcome_cfg" and STATE.step=="waiting_value" and can_edit_flow(uid):
         old=data.get("welcome_text",""); data["welcome_text"]=src_txt; save_data(data); STATE.flow=STATE.step=None
-        preview = f"Welcome بروزرسانی شد.\nقبلی:\n{render_html_text(old)}\n\nجدید:\n{render_html_text(src_txt)}"
+        preview = f"✅ Welcome بروزرسانی شد و از همین دیتابیس خوانده می‌شود.\n\nقبلی:\n{render_html_text(old or '(خالی)')}\n\nجدید:\n{render_html_text(src_txt)}"
         await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=preview, parse_mode=ParseMode.HTML, reply_markup=create_admin_keyboard(data)); return
     if STATE.admin_id==uid and STATE.flow=="watch_cfg" and can_edit_flow(uid):
         if STATE.step=="waiting_channel_id":
@@ -1277,7 +1537,7 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     resp=match_shortcut(txt,shortcuts)
     if resp:
-        if hit_limit_and_maybe_ban(uid, "shortcut_private"):
+        if not is_admin(uid, data) and shortcut_rate_limited(uid, txt):
             await send_formatted_message(update.message, "<b>🚫 محدودیت ضداسپم فعال شد.</b>\n\nبه دلیل ارسال سریع/پرتکرار، به مدت <b>۵ دقیقه</b> محدود شدید.", data)
             return
         if data.get("self_bot_enabled") and is_admin(uid,data):
