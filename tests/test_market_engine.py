@@ -1,10 +1,15 @@
 import time
 import unittest
+from unittest.mock import Mock, patch
 
 from features.market_engine import (
+    cache_status,
+    market_help_text,
     merge_market_settings,
     parse_market_intent,
     render_market_response,
+    validate_market_api_key,
+    stars_unit_usd,
 )
 
 
@@ -72,6 +77,41 @@ class MarketEngineRenderTests(unittest.TestCase):
         stale = dict(self.cache, updated_at=1)
         text = render_market_response("100 usd trx", self.settings, stale)
         self.assertIn("نرخ معتبر", text)
+
+
+class MarketEngineAdminSupportTests(unittest.TestCase):
+    def test_cache_status_reports_fresh_usable_cache(self):
+        data = {}
+        settings = merge_market_settings(data)
+        status = cache_status({"updated_at": int(time.time()), "rates_usd": {"usd": 1.0}}, settings)
+        self.assertTrue(status["fresh"])
+        self.assertTrue(status["usable"])
+        self.assertEqual(status["rate_count"], 1)
+
+    def test_help_text_includes_admin_section_when_requested(self):
+        text = market_help_text(is_admin=True)
+        self.assertIn("Market API Configuration", text)
+        self.assertIn("۲۰۰۰ استارز", text)
+
+    def test_stars_manual_override_is_functional_when_auto_multiplier_is_off(self):
+        settings = {"stars_unit_amount": 1000, "stars_unit_usd": 30, "stars_manual_override_usd": 45, "stars_auto_multiplier_enabled": False}
+        self.assertEqual(stars_unit_usd(settings), 0.045)
+        settings["stars_auto_multiplier_enabled"] = True
+        self.assertEqual(stars_unit_usd(settings), 0.03)
+
+    @patch("features.market_engine.requests.get")
+    def test_validate_exchangerate_key_uses_real_validation_endpoint_shape(self, mock_get):
+        response = Mock()
+        response.status_code = 200
+        response.json.return_value = {"result": "success", "conversion_rate": 0.92}
+        response.raise_for_status.return_value = None
+        mock_get.return_value = response
+
+        result = validate_market_api_key("exchangerate", "abc123", timeout=3)
+
+        self.assertTrue(result["ok"])
+        self.assertIn("USD/EUR", result["message"])
+        self.assertIn("/abc123/pair/USD/EUR", mock_get.call_args.args[0])
 
 
 if __name__ == "__main__":

@@ -285,10 +285,10 @@ class MarketRateService:
 
 
 def stars_unit_usd(settings: dict[str, Any]) -> float:
-    override = settings.get("stars_manual_override_usd")
-    if isinstance(override, (int, float)) and override > 0:
-        return float(override) / max(float(settings.get("stars_unit_amount") or 1000), 1.0)
     amount = max(float(settings.get("stars_unit_amount") or 1000), 1.0)
+    override = settings.get("stars_manual_override_usd")
+    if not settings.get("stars_auto_multiplier_enabled", False) and isinstance(override, (int, float)) and override > 0:
+        return float(override) / amount
     total = float(settings.get("stars_unit_usd") or 0)
     return total / amount if total > 0 else 0.0
 
@@ -403,6 +403,90 @@ def render_market_response(text: str, settings: dict[str, Any], cache: dict[str,
     if intent.kind in {"trending", "dominance"}:
         return None
     return None
+
+
+def validate_market_api_key(provider: str, api_key: str, timeout: float = 8.0) -> dict[str, Any]:
+    provider = str(provider or "").strip().lower()
+    key = str(api_key or "").strip()
+    if provider not in {"coingecko", "exchangerate"}:
+        return {"ok": False, "provider": provider, "message": "Unknown API provider."}
+    if not key or len(key) > 256:
+        return {"ok": False, "provider": provider, "message": "API key is empty or too long."}
+    try:
+        if provider == "coingecko":
+            response = requests.get(
+                "https://api.coingecko.com/api/v3/simple/price",
+                params={"ids": "bitcoin", "vs_currencies": "usd"},
+                headers={"x-cg-demo-api-key": key},
+                timeout=timeout,
+            )
+            if response.status_code in {401, 403, 429}:
+                return {"ok": False, "provider": provider, "message": f"CoinGecko rejected the key/status: {response.status_code}"}
+            response.raise_for_status()
+            body = response.json()
+            price = ((body.get("bitcoin") or {}).get("usd") if isinstance(body, dict) else None)
+            if not isinstance(price, (int, float)) or price <= 0:
+                return {"ok": False, "provider": provider, "message": "CoinGecko response did not include BTC/USD price."}
+            return {"ok": True, "provider": provider, "message": f"CoinGecko validation OK. BTC/USD={price}", "sample": price}
+        response = requests.get(f"https://v6.exchangerate-api.com/v6/{key}/pair/USD/EUR", timeout=timeout)
+        if response.status_code in {401, 403, 404, 429}:
+            return {"ok": False, "provider": provider, "message": f"ExchangeRate rejected the key/status: {response.status_code}"}
+        response.raise_for_status()
+        body = response.json()
+        if body.get("result") != "success":
+            return {"ok": False, "provider": provider, "message": str(body.get("error-type") or body.get("result") or "ExchangeRate validation failed")}
+        rate = body.get("conversion_rate")
+        if not isinstance(rate, (int, float)) or rate <= 0:
+            return {"ok": False, "provider": provider, "message": "ExchangeRate response did not include USD/EUR rate."}
+        return {"ok": True, "provider": provider, "message": f"ExchangeRate validation OK. USD/EUR={rate}", "sample": rate}
+    except Exception as exc:
+        return {"ok": False, "provider": provider, "message": safe_error(exc)}
+
+
+def cache_status(cache: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
+    updated_at = int(cache.get("updated_at") or 0) if isinstance(cache, dict) else 0
+    age = max(0, int(time.time()) - updated_at) if updated_at else None
+    rates = cache.get("rates_usd") if isinstance(cache, dict) else None
+    rate_count = len(rates) if isinstance(rates, dict) else 0
+    ttl = int(settings.get("cache_ttl_seconds", 60) or 60)
+    stale_ttl = int(settings.get("stale_ttl_seconds", 86400) or 86400)
+    return {
+        "updated_at": updated_at,
+        "age": age,
+        "rate_count": rate_count,
+        "fresh": age is not None and age <= ttl,
+        "usable": age is not None and age <= stale_ttl and rate_count > 0,
+        "last_error": cache.get("last_error") if isinstance(cache, dict) else None,
+    }
+
+
+def market_help_text(is_admin: bool = False) -> str:
+    base = [
+        "📈 راهنمای Market & Conversion Engine",
+        "",
+        "نمونه تبدیل‌ها:",
+        "• ۲۰۰۰ استارز",
+        "• 100 usd trx",
+        "• ۲۰ ترون تومان",
+        "• 1200000 تومان تتر",
+        "",
+        "نمونه قیمت/وضعیت:",
+        "• btc",
+        "• price trx",
+        "• trx status",
+        "• btc today",
+        "",
+        "Alias ها: ترون/trx، تون/ton، تتر/usdt، دلار/usd/$، تومان/irt، ریال/irr، استارز/stars",
+    ]
+    if is_admin:
+        base.extend([
+            "",
+            "ادمین:",
+            "• از پنل: Market API Configuration برای تنظیم و اعتبارسنجی API ها",
+            "• Stars Rate Settings برای نرخ دستی استارز",
+            "• Cache Settings برای TTL و وضعیت کش",
+        ])
+    return "\n".join(base)
 
 
 MARKET_SERVICE = MarketRateService()

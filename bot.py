@@ -1,3 +1,4 @@
+import asyncio
 import html
 import json
 import logging
@@ -23,7 +24,7 @@ from features.log_export import build_logs_keyboard, humanize_log_text
 from features.inline_menu import build_inline_menu_admin_kb, paged_rows, CB as IMCB
 from features.inline_actions import ACTION_REGISTRY
 from features.inline_callback import parse as parse_cb, is_valid_im_callback
-from features.market_engine import MARKET_SERVICE, merge_market_settings, render_market_response
+from features.market_engine import MARKET_SERVICE, cache_status, market_help_text, merge_market_settings, normalize_asset_list, render_market_response, validate_market_api_key
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
@@ -421,6 +422,100 @@ def build_watch_keyword_pick_keyboard(keywords: list[str], prefix: str, map_key:
     rows.append([create_danger_button("بازگشت", "admin:shortcut_menu")])
     return InlineKeyboardMarkup(rows)
 
+
+
+def mask_secret(value: str | None) -> str:
+    raw = str(value or "")
+    if not raw:
+        return "ثبت نشده"
+    if len(raw) <= 8:
+        return "****"
+    return f"{raw[:4]}...{raw[-4:]}"
+
+
+def set_env_value(key: str, value: str) -> None:
+    key = str(key or "").strip()
+    value = str(value or "").strip()
+    if not re.fullmatch(r"[A-Z0-9_]+", key):
+        raise ValueError("invalid env key")
+    lines = []
+    if ENV_PATH.exists():
+        lines = ENV_PATH.read_text(encoding="utf-8").splitlines()
+    rendered = f"{key}={value}"
+    replaced = False
+    for idx, line in enumerate(lines):
+        if line.startswith(f"{key}="):
+            lines[idx] = rendered
+            replaced = True
+            break
+    if not replaced:
+        lines.append(rendered)
+    ENV_PATH.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    os.environ[key] = value
+
+
+def format_market_status(data: dict[str, Any]) -> str:
+    settings = merge_market_settings(data)
+    cache = MARKET_SERVICE.read_cache()
+    status = cache_status(cache, settings)
+    return (
+        "📊 Market Engine Status\n\n"
+        f"Conversion Engine: {'ON' if settings.get('market_engine_enabled') else 'OFF'}{' 🔒' if not data.get('active', False) else ''}\n"
+        f"API Updater: {'ON' if settings.get('market_api_enabled') else 'OFF'}\n"
+        f"CoinGecko: {'ON' if settings.get('coingecko_enabled') else 'OFF'} | key: {mask_secret(os.getenv('COINGECKO_API_KEY'))}\n"
+        f"ExchangeRate: {'ON' if settings.get('exchangerate_enabled') else 'OFF'} | key: {mask_secret(os.getenv('EXCHANGERATE_API_KEY'))}\n"
+        f"Cache TTL: {settings.get('cache_ttl_seconds')}s | stale fallback: {settings.get('stale_ttl_seconds')}s\n"
+        f"Cache rates: {status['rate_count']} | fresh: {status['fresh']} | usable: {status['usable']}\n"
+        f"Last update: {format_ts(status['updated_at'])}\n"
+        f"Last safe error: {status['last_error'] or '-'}"
+    )
+
+
+def create_market_root_keyboard(data: dict[str, Any]) -> InlineKeyboardMarkup:
+    settings = merge_market_settings(data)
+    locked = " 🔒" if not data.get("active", False) else ""
+    engine = ("ON" if settings.get("market_engine_enabled") else "OFF") + locked
+    return InlineKeyboardMarkup([
+        [create_primary_button(f"Conversion Engine: {engine}", "admin:market_toggle")],
+        [create_primary_button("Market API Configuration", "admin:market_api"), create_primary_button("Test APIs", "admin:market_test")],
+        [create_primary_button("Stars Rate Settings", "admin:market_stars"), create_primary_button("Cache Settings", "admin:market_cache")],
+        [create_primary_button("Live Cache Status", "admin:market_status"), create_primary_button("Quick Assets", "admin:market_quick")],
+        [create_primary_button("Conversion Help", "admin:market_help"), create_danger_button("بازگشت", "menu:admin")],
+    ])
+
+
+def create_market_api_keyboard(data: dict[str, Any]) -> InlineKeyboardMarkup:
+    settings = merge_market_settings(data)
+    return InlineKeyboardMarkup([
+        [create_primary_button(f"API Updater: {'ON' if settings.get('market_api_enabled') else 'OFF'}", "admin:market_api_toggle:market_api_enabled")],
+        [create_primary_button(f"CoinGecko API: {'ON' if settings.get('coingecko_enabled') else 'OFF'}", "admin:market_api_toggle:coingecko_enabled")],
+        [create_primary_button(f"ExchangeRate API: {'ON' if settings.get('exchangerate_enabled') else 'OFF'}", "admin:market_api_toggle:exchangerate_enabled")],
+        [create_primary_button("Set CoinGecko API Key", "admin:market_set_key:coingecko"), create_primary_button("Validate CoinGecko", "admin:market_validate:coingecko")],
+        [create_primary_button("Set ExchangeRate API Key", "admin:market_set_key:exchangerate"), create_primary_button("Validate ExchangeRate", "admin:market_validate:exchangerate")],
+        [create_primary_button("Test Live Requests", "admin:market_test"), create_danger_button("بازگشت", "admin:market_root")],
+    ])
+
+
+def create_market_stars_keyboard(data: dict[str, Any]) -> InlineKeyboardMarkup:
+    settings = merge_market_settings(data)
+    return InlineKeyboardMarkup([
+        [create_primary_button(f"Unit stars: {settings.get('stars_unit_amount')}", "admin:market_edit:stars_unit_amount")],
+        [create_primary_button(f"Unit USD: {settings.get('stars_unit_usd')}", "admin:market_edit:stars_unit_usd")],
+        [create_primary_button(f"Auto multiplier: {'ON' if settings.get('stars_auto_multiplier_enabled') else 'OFF'}", "admin:market_bool:stars_auto_multiplier_enabled")],
+        [create_primary_button("Set manual override USD", "admin:market_edit:stars_manual_override_usd"), create_danger_button("Clear override", "admin:market_clear:stars_manual_override_usd")],
+        [create_danger_button("بازگشت", "admin:market_root")],
+    ])
+
+
+def create_market_cache_keyboard(data: dict[str, Any]) -> InlineKeyboardMarkup:
+    settings = merge_market_settings(data)
+    return InlineKeyboardMarkup([
+        [create_primary_button(f"Cache TTL: {settings.get('cache_ttl_seconds')}s", "admin:market_edit:cache_ttl_seconds")],
+        [create_primary_button(f"Stale fallback: {settings.get('stale_ttl_seconds')}s", "admin:market_edit:stale_ttl_seconds")],
+        [create_primary_button("Refresh Cache Now", "admin:market_refresh"), create_primary_button("Live Cache Status", "admin:market_status")],
+        [create_danger_button("بازگشت", "admin:market_root")],
+    ])
+
 def create_admin_keyboard(data: dict[str, Any]) -> InlineKeyboardMarkup:
     status = "روشن" if data["active"] else "خاموش"
     locked = " 🔒" if not data.get("active", False) else ""
@@ -429,7 +524,7 @@ def create_admin_keyboard(data: dict[str, Any]) -> InlineKeyboardMarkup:
     market_settings = merge_market_settings(data)
     market_state = ("ON" if market_settings.get("market_engine_enabled") else "OFF") + locked
     status_btn=create_success_button(f"وضعیت ربات: {status}","toggle:active") if data["active"] else create_danger_button(f"وضعیت ربات: {status}","toggle:active")
-    return InlineKeyboardMarkup([[status_btn],[create_primary_button("ویرایش متن‌ها","admin:texts"),create_primary_button("فیچرها","admin:features")],[create_success_button("گزارش وضعیت","admin:report"),create_danger_button("راهنمای برودکست","admin:broadcast_help")],[create_primary_button(f"Self Bot: {selfb}","admin:selfbot"),create_primary_button("مدیریت سلف بات","admin:shortcut_menu")],[create_primary_button(f"Welcome: {wel}","admin:welcome_toggle"),create_primary_button("پیکربندی Welcome","admin:welcome_cfg")],[create_primary_button("Inline Menu Engine","im:root"), create_primary_button(f"Conversion Engine: {market_state}","admin:market_toggle")],[create_primary_button("بک‌آپ دیتابیس","admin:db_export"), create_primary_button("ایمپورت دیتابیس","admin:db_import")],[create_primary_button("لاگ‌ها","admin:logs_menu")],[create_primary_button("پیام‌های بازخورد","admin:feedback_list")],[create_danger_button("بازگشت","menu:admin")]])
+    return InlineKeyboardMarkup([[status_btn],[create_primary_button("ویرایش متن‌ها","admin:texts"),create_primary_button("فیچرها","admin:features")],[create_success_button("گزارش وضعیت","admin:report"),create_danger_button("راهنمای برودکست","admin:broadcast_help")],[create_primary_button(f"Self Bot: {selfb}","admin:selfbot"),create_primary_button("مدیریت سلف بات","admin:shortcut_menu")],[create_primary_button(f"Welcome: {wel}","admin:welcome_toggle"),create_primary_button("پیکربندی Welcome","admin:welcome_cfg")],[create_primary_button("Inline Menu Engine","im:root"), create_primary_button(f"Conversion Engine: {market_state}","admin:market_root")],[create_primary_button("بک‌آپ دیتابیس","admin:db_export"), create_primary_button("ایمپورت دیتابیس","admin:db_import")],[create_primary_button("لاگ‌ها","admin:logs_menu")],[create_primary_button("پیام‌های بازخورد","admin:feedback_list")],[create_danger_button("بازگشت","menu:admin")]])
 
 def create_features_keyboard(data: dict[str, Any]) -> InlineKeyboardMarkup:
     rows=[[create_primary_button(f"{'✅' if data['features'].get(k) else '❌'} {k}",f"feature:{k}")] for k in ADMIN_FEATURES+USER_FEATURES]; rows.append([create_danger_button("بازگشت","menu:admin")]); return InlineKeyboardMarkup(rows)
@@ -1231,6 +1326,9 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         STATE.flow=STATE.step=STATE.pending_key=None
         STATE.temp_shortcuts=None
         await q.edit_message_text("شورت‌کات‌ها ذخیره شدند.", reply_markup=create_shortcut_menu_keyboard())
+    elif q.data=="admin:market_root":
+        STATE.flow = STATE.step = STATE.pending_key = None
+        await q.edit_message_text(format_market_status(data), reply_markup=create_market_root_keyboard(data))
     elif q.data=="admin:market_toggle":
         if not data.get("active", False):
             await safe_callback_answer(q, "اول ربات را روشن کنید.", show_alert=True); return
@@ -1239,7 +1337,69 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data["market"] = market_settings
         save_data(data)
         db.log_admin(uid, "toggle", "market_engine", None, None, str(market_settings["market_engine_enabled"]))
-        await q.edit_message_text("وضعیت Conversion Engine تغییر کرد.", reply_markup=create_admin_keyboard(data))
+        await q.edit_message_text(format_market_status(data), reply_markup=create_market_root_keyboard(data))
+    elif q.data=="admin:market_api":
+        STATE.flow = STATE.step = STATE.pending_key = None
+        await q.edit_message_text(format_market_status(data), reply_markup=create_market_api_keyboard(data))
+    elif q.data.startswith("admin:market_api_toggle:"):
+        key = q.data.rsplit(":", 1)[1]
+        settings = merge_market_settings(data)
+        if key in {"market_api_enabled", "coingecko_enabled", "exchangerate_enabled"}:
+            settings[key] = not settings.get(key, True)
+            data["market"] = settings
+            save_data(data)
+        await q.edit_message_text(format_market_status(data), reply_markup=create_market_api_keyboard(data))
+    elif q.data.startswith("admin:market_set_key:"):
+        provider = q.data.rsplit(":", 1)[1]
+        if provider not in {"coingecko", "exchangerate"}: return
+        STATE.flow, STATE.step, STATE.admin_id, STATE.message_id, STATE.pending_key = "market_cfg", "waiting_api_key", uid, q.message.message_id, provider
+        await q.edit_message_text(f"کلید API برای {provider} را ارسال کنید. قبل از ذخیره، درخواست واقعی اعتبارسنجی انجام می‌شود.", reply_markup=build_back_kb("admin:market_api"))
+    elif q.data.startswith("admin:market_validate:"):
+        provider = q.data.rsplit(":", 1)[1]
+        key = os.getenv("COINGECKO_API_KEY" if provider=="coingecko" else "EXCHANGERATE_API_KEY", "")
+        result = await asyncio.to_thread(validate_market_api_key, provider, key, merge_market_settings(data).get("request_timeout_seconds", 8))
+        await q.edit_message_text(("✅ " if result.get("ok") else "❌ ") + result.get("message", "unknown"), reply_markup=create_market_api_keyboard(data))
+    elif q.data=="admin:market_test":
+        await MARKET_SERVICE.refresh(merge_market_settings(data))
+        await q.edit_message_text("درخواست زنده انجام شد.\n\n" + format_market_status(data), reply_markup=create_market_api_keyboard(data))
+    elif q.data=="admin:market_stars":
+        STATE.flow = STATE.step = STATE.pending_key = None
+        await q.edit_message_text("⭐ Stars Rate Settings", reply_markup=create_market_stars_keyboard(data))
+    elif q.data=="admin:market_cache":
+        STATE.flow = STATE.step = STATE.pending_key = None
+        await q.edit_message_text(format_market_status(data), reply_markup=create_market_cache_keyboard(data))
+    elif q.data=="admin:market_status":
+        await q.edit_message_text(format_market_status(data), reply_markup=create_market_root_keyboard(data))
+    elif q.data=="admin:market_refresh":
+        await MARKET_SERVICE.refresh(merge_market_settings(data))
+        await q.edit_message_text("کش بروزرسانی شد.\n\n" + format_market_status(data), reply_markup=create_market_cache_keyboard(data))
+    elif q.data=="admin:market_quick":
+        settings = merge_market_settings(data)
+        STATE.flow, STATE.step, STATE.admin_id, STATE.message_id, STATE.pending_key = "market_cfg", "waiting_quick_assets", uid, q.message.message_id, "quick_assets"
+        await q.edit_message_text("Quick Assets فعلی:\n" + ", ".join(settings.get("quick_assets", [])) + "\n\nلیست جدید را با کاما ارسال کنید. نمونه: BTC,ETH,TRX,TON,USDT", reply_markup=build_back_kb("admin:market_root"))
+    elif q.data=="admin:market_help":
+        await q.edit_message_text(market_help_text(is_admin=True), reply_markup=create_market_root_keyboard(data))
+    elif q.data.startswith("admin:market_edit:"):
+        field = q.data.rsplit(":", 1)[1]
+        if field not in {"stars_unit_amount", "stars_unit_usd", "stars_manual_override_usd", "cache_ttl_seconds", "stale_ttl_seconds"}: return
+        STATE.flow, STATE.step, STATE.admin_id, STATE.message_id, STATE.pending_key = "market_cfg", "waiting_number", uid, q.message.message_id, field
+        await q.edit_message_text(f"مقدار عددی جدید برای {field} را ارسال کنید.", reply_markup=build_back_kb("admin:market_root"))
+    elif q.data.startswith("admin:market_bool:"):
+        field = q.data.rsplit(":", 1)[1]
+        settings = merge_market_settings(data)
+        if field in {"stars_auto_multiplier_enabled"}:
+            settings[field] = not settings.get(field, False)
+            data["market"] = settings
+            save_data(data)
+        await q.edit_message_text("⭐ Stars Rate Settings", reply_markup=create_market_stars_keyboard(data))
+    elif q.data.startswith("admin:market_clear:"):
+        field = q.data.rsplit(":", 1)[1]
+        settings = merge_market_settings(data)
+        if field == "stars_manual_override_usd":
+            settings[field] = None
+            data["market"] = settings
+            save_data(data)
+        await q.edit_message_text("⭐ Stars Rate Settings", reply_markup=create_market_stars_keyboard(data))
     elif q.data=="admin:welcome_toggle":
         data["welcome_enabled"]=not data.get("welcome_enabled",False); save_data(data); await q.edit_message_text("وضعیت Welcome تغییر کرد.", reply_markup=create_admin_keyboard(data))
     elif q.data=="admin:welcome_cfg":
@@ -1407,6 +1567,9 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.clear_admin_state(uid)
         await update.message.reply_text("پنل ادمین", reply_markup=create_admin_keyboard(data))
         return
+    if txt.casefold() in {"help convert", "help market", "market help", "راهنمای تبدیل", "راهنمای بازار"}:
+        await update.message.reply_text(market_help_text(is_admin=is_admin(uid, data)))
+        return
     st=db.get_admin_state(uid) if is_admin(uid, data) else None
     if st:
         s=st.get("state"); p=st.get("payload",{})
@@ -1464,6 +1627,51 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.info("user_menu_open uid=%s", uid)
         await update.message.reply_text("منوی کاربر", reply_markup=create_menu_keyboard())
         return
+
+
+    if STATE.admin_id==uid and STATE.flow=="market_cfg" and can_edit_flow(uid):
+        settings = merge_market_settings(data)
+        if STATE.step=="waiting_api_key":
+            provider = STATE.pending_key or ""
+            env_key = "COINGECKO_API_KEY" if provider == "coingecko" else "EXCHANGERATE_API_KEY" if provider == "exchangerate" else ""
+            api_key = txt.strip()
+            if not env_key:
+                STATE.flow = STATE.step = STATE.pending_key = None
+                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="Provider نامعتبر است.", reply_markup=create_market_api_keyboard(data)); return
+            result = await asyncio.to_thread(validate_market_api_key, provider, api_key, settings.get("request_timeout_seconds", 8))
+            if result.get("ok"):
+                set_env_value(env_key, api_key)
+                STATE.flow = STATE.step = STATE.pending_key = None
+                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="✅ کلید معتبر بود و در .env ذخیره شد.\n" + result.get("message", ""), reply_markup=create_market_api_keyboard(data)); return
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="❌ کلید ذخیره نشد؛ اعتبارسنجی واقعی ناموفق بود.\n" + result.get("message", ""), reply_markup=build_back_kb("admin:market_api")); return
+        if STATE.step=="waiting_number":
+            field = STATE.pending_key or ""
+            try:
+                value = float(txt.replace(",", "").strip())
+            except Exception:
+                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="عدد نامعتبر است. دوباره مقدار عددی ارسال کنید.", reply_markup=build_back_kb("admin:market_root")); return
+            if field in {"cache_ttl_seconds", "stale_ttl_seconds"}:
+                value = int(value)
+            if field == "cache_ttl_seconds" and not 30 <= int(value) <= 3600:
+                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="TTL باید بین 30 و 3600 ثانیه باشد.", reply_markup=build_back_kb("admin:market_cache")); return
+            if field == "stale_ttl_seconds" and not 30 <= int(value) <= 86400:
+                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="Stale fallback باید بین 30 و 86400 ثانیه باشد.", reply_markup=build_back_kb("admin:market_cache")); return
+            if field in {"stars_unit_amount", "stars_unit_usd", "stars_manual_override_usd"} and value < 0:
+                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="مقدار نمی‌تواند منفی باشد.", reply_markup=build_back_kb("admin:market_stars")); return
+            settings[field] = value
+            data["market"] = settings
+            save_data(data)
+            STATE.flow = STATE.step = STATE.pending_key = None
+            kb = create_market_cache_keyboard(data) if field in {"cache_ttl_seconds", "stale_ttl_seconds"} else create_market_stars_keyboard(data)
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"✅ {field} بروزرسانی شد: {value}", reply_markup=kb); return
+        if STATE.step=="waiting_quick_assets":
+            raw_items = [x.strip() for x in re.split(r"[,،\s]+", txt) if x.strip()]
+            normalized = normalize_asset_list(raw_items, settings.get("quick_assets", []))
+            settings["quick_assets"] = normalized
+            data["market"] = settings
+            save_data(data)
+            STATE.flow = STATE.step = STATE.pending_key = None
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="✅ Quick Assets بروزرسانی شد:\n" + ", ".join(normalized), reply_markup=create_market_root_keyboard(data)); return
 
     if STATE.admin_id==uid and STATE.flow=="text_edit" and STATE.step=="waiting_value" and STATE.pending_key and can_edit_flow(uid):
         key=STATE.pending_key; old=data.get(key,""); data[key]=src_txt; save_data(data); STATE.flow=STATE.step=STATE.pending_key=None
@@ -1597,6 +1805,20 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data["active"] and not is_admin(uid,data): await send_formatted_message(update.message, data.get("offline_message",""), data)
 
+async def help_market(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_user: return
+    data = load_data()
+    await update.message.reply_text(market_help_text(is_admin=is_admin(update.effective_user.id, data)))
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.args and str(context.args[0]).lower() in {"convert", "market", "conversion"}:
+        await help_market(update, context)
+        return
+    if update.message:
+        await update.message.reply_text("برای راهنمای تبدیل و بازار از /help_market یا /help convert استفاده کنید.")
+
+
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_user: return
     data=load_data()
@@ -1638,7 +1860,7 @@ def main() -> None:
     token=os.getenv("BOT_TOKEN")
     if not token: raise RuntimeError("BOT_TOKEN is missing")
     app=Application.builder().token(token).post_init(post_init).build()
-    app.add_handler(CommandHandler("start", start)); app.add_handler(CommandHandler("panel", panel)); app.add_handler(CommandHandler("broadcast", broadcast))
+    app.add_handler(CommandHandler("start", start)); app.add_handler(CommandHandler("panel", panel)); app.add_handler(CommandHandler("help_market", help_market)); app.add_handler(CommandHandler("help", help_command)); app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CallbackQueryHandler(callbacks)); app.add_handler(MessageHandler(filters.ALL, all_messages)); app.add_error_handler(on_error)
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
