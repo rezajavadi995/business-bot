@@ -1554,6 +1554,8 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
             except TimedOut:
                 logging.warning("business_inline_menu_send_timeout uid=%s chat_id=%s command=%r", uid, bm.chat.id, txt)
             return
+    if await maybe_send_market_response(bm, data):
+        return
     sc=db.load_shortcuts(); resp=match_shortcut(txt, sc)
     if resp and data.get("self_bot_enabled", False):
         if not is_admin(uid, data) and shortcut_rate_limited(uid, txt):
@@ -1895,6 +1897,9 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"حذف انجام شد.\nباقی‌مانده: {', '.join(left) if left else '-'}", reply_markup=create_shortcut_menu_keyboard()); return
 
     if not data.get("active", False) and not is_admin(uid, data):
+        return
+
+    if await maybe_send_market_response(update.message, data):
         return
 
     shortcuts=db.load_shortcuts()
