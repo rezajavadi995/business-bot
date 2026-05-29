@@ -181,6 +181,8 @@ def parse_market_intent(text: str) -> MarketIntent | None:
         if amount is not None:
             break
 
+    if normalized in {"fear", "fear greed", "fear & greed", "ترس", "طمع", "شاخص ترس"}:
+        return MarketIntent(kind="fear_greed")
     if normalized in {"trend", "trends", "ترند", "top gainers", "gainers"}:
         return MarketIntent(kind="trending")
     if "dominance" in words or "دامیننس" in words:
@@ -233,7 +235,19 @@ class MarketRateService:
         try:
             payload = await asyncio.to_thread(self._fetch_rates, settings)
             old = self.read_cache()
-            merged = {**old, **payload, "updated_at": int(time.time()), "last_error": None}
+            merged_rates = dict(old.get("rates_usd", {}) if isinstance(old.get("rates_usd"), dict) else {})
+            merged_rates.update(payload.get("rates_usd", {}) if isinstance(payload.get("rates_usd"), dict) else {})
+            old_meta = old.get("meta", {}) if isinstance(old.get("meta"), dict) else {}
+            new_meta = payload.get("meta", {}) if isinstance(payload.get("meta"), dict) else {}
+            merged_meta = dict(old_meta)
+            for key, value in new_meta.items():
+                if isinstance(value, dict) and isinstance(merged_meta.get(key), dict):
+                    nested = dict(merged_meta[key])
+                    nested.update({k: v for k, v in value.items() if v not in ({}, [], None)})
+                    merged_meta[key] = nested
+                elif value not in ({}, [], None):
+                    merged_meta[key] = value
+            merged = {**old, **payload, "rates_usd": merged_rates, "meta": merged_meta, "updated_at": int(time.time()), "last_error": None}
             self.write_cache(merged)
             return merged
         except Exception as exc:
@@ -262,7 +276,8 @@ class MarketRateService:
                 errors["exchangerate"] = safe_error(exc)
                 logging.warning("market_provider_failed provider=exchangerate reason=%s", errors["exchangerate"])
         rates_usd: dict[str, float] = {"usd": 1.0}
-        meta: dict[str, Any] = {"crypto": crypto.get("meta", {}), "fiat": fiat.get("meta", {}), "provider_errors": errors}
+        sentiment = self._fetch_fear_greed(timeout)
+        meta: dict[str, Any] = {"crypto": crypto.get("meta", {}), "fiat": fiat.get("meta", {}), "fear_greed": sentiment, "provider_errors": errors}
         rates_usd.update(crypto.get("rates_usd", {}))
         rates_usd.update(fiat.get("rates_usd", {}))
         stars_usd = stars_unit_usd(settings)
@@ -278,28 +293,85 @@ class MarketRateService:
 
     def _fetch_coingecko(self, settings: dict[str, Any], timeout: float) -> dict[str, Any]:
         ids = ",".join(CRYPTO_IDS.values())
-        url = "https://api.coingecko.com/api/v3/simple/price"
         headers = {}
         key = os.getenv("COINGECKO_API_KEY", "").strip()
         if key:
             headers["x-cg-demo-api-key"] = key
-        params = {"ids": ids, "vs_currencies": "usd", "include_24hr_change": "true"}
-        response = requests.get(url, params=params, headers=headers, timeout=timeout)
+        response = requests.get(
+            "https://api.coingecko.com/api/v3/coins/markets",
+            params={"vs_currency": "usd", "ids": ids, "price_change_percentage": "24h"},
+            headers=headers,
+            timeout=timeout,
+        )
         response.raise_for_status()
         body = response.json()
         rates: dict[str, float] = {}
         changes: dict[str, float] = {}
-        for symbol, coin_id in CRYPTO_IDS.items():
-            item = body.get(coin_id) if isinstance(body, dict) else None
+        highs: dict[str, float] = {}
+        lows: dict[str, float] = {}
+        id_to_symbol = {coin_id: symbol for symbol, coin_id in CRYPTO_IDS.items()}
+        for item in body if isinstance(body, list) else []:
             if not isinstance(item, dict):
                 continue
-            usd = item.get("usd")
+            symbol = id_to_symbol.get(str(item.get("id") or ""))
+            if not symbol:
+                continue
+            usd = item.get("current_price")
             if isinstance(usd, (int, float)) and usd > 0:
                 rates[symbol] = float(usd)
-            change = item.get("usd_24h_change")
+            change = item.get("price_change_percentage_24h")
             if isinstance(change, (int, float)):
                 changes[symbol] = float(change)
-        return {"rates_usd": rates, "meta": {"24h_change": changes, "source": "coingecko"}}
+            high = item.get("high_24h")
+            low = item.get("low_24h")
+            if isinstance(high, (int, float)):
+                highs[symbol] = float(high)
+            if isinstance(low, (int, float)):
+                lows[symbol] = float(low)
+        trending = self._fetch_coingecko_trending(headers, timeout)
+        return {"rates_usd": rates, "meta": {"24h_change": changes, "24h_high": highs, "24h_low": lows, "trending": trending.get("trending", []), "top_gainers": build_top_gainers(changes), "dominance": self._fetch_coingecko_global(headers, timeout), "source": "coingecko"}}
+
+    def _fetch_coingecko_trending(self, headers: dict[str, str], timeout: float) -> dict[str, Any]:
+        try:
+            response = requests.get("https://api.coingecko.com/api/v3/search/trending", headers=headers, timeout=timeout)
+            response.raise_for_status()
+            body = response.json()
+            coins = []
+            for row in (body.get("coins", []) if isinstance(body, dict) else [])[:7]:
+                item = row.get("item", {}) if isinstance(row, dict) else {}
+                symbol = str(item.get("symbol") or "").upper()
+                name = str(item.get("name") or "")
+                if symbol:
+                    coins.append({"symbol": symbol, "name": name})
+            return {"trending": coins}
+        except Exception as exc:
+            logging.warning("market_provider_failed provider=coingecko_trending reason=%s", safe_error(exc))
+            return {"trending": [], "error": safe_error(exc)}
+
+    def _fetch_coingecko_global(self, headers: dict[str, str], timeout: float) -> dict[str, Any]:
+        try:
+            response = requests.get("https://api.coingecko.com/api/v3/global", headers=headers, timeout=timeout)
+            response.raise_for_status()
+            body = response.json()
+            data = body.get("data", {}) if isinstance(body, dict) else {}
+            dominance = data.get("market_cap_percentage", {}) if isinstance(data, dict) else {}
+            btc = dominance.get("btc") if isinstance(dominance, dict) else None
+            return {"btc": float(btc)} if isinstance(btc, (int, float)) else {}
+        except Exception as exc:
+            logging.warning("market_provider_failed provider=coingecko_global reason=%s", safe_error(exc))
+            return {"error": safe_error(exc)}
+
+    def _fetch_fear_greed(self, timeout: float) -> dict[str, Any]:
+        try:
+            response = requests.get("https://api.alternative.me/fng/", params={"limit": 1}, timeout=timeout)
+            response.raise_for_status()
+            body = response.json()
+            item = (body.get("data") or [{}])[0] if isinstance(body, dict) else {}
+            value = item.get("value")
+            return {"value": int(value), "classification": str(item.get("value_classification") or ""), "timestamp": int(item.get("timestamp") or 0)} if str(value).isdigit() else {}
+        except Exception as exc:
+            logging.warning("market_provider_failed provider=fear_greed reason=%s", safe_error(exc))
+            return {"error": safe_error(exc)}
 
     def _fetch_exchange_rates(self, settings: dict[str, Any], timeout: float) -> dict[str, Any]:
         key = os.getenv("EXCHANGERATE_API_KEY", "").strip()
@@ -319,6 +391,10 @@ class MarketRateService:
             out["irr"] = 1.0 / float(irr)
             out["irt"] = 10.0 / float(irr)
         return {"rates_usd": out, "meta": {"source": "exchangerate", "result": body.get("result")}}
+
+
+def build_top_gainers(changes: dict[str, float]) -> list[dict[str, Any]]:
+    return [{"symbol": symbol.upper(), "change": change} for symbol, change in sorted(changes.items(), key=lambda item: item[1], reverse=True)[:5]]
 
 
 def stars_unit_usd(settings: dict[str, Any]) -> float:
@@ -412,15 +488,56 @@ def render_price(intent: MarketIntent, settings: dict[str, Any], cache: dict[str
     age = int(time.time()) - int(cache.get("updated_at") or 0)
     if age > int(settings.get("stale_ttl_seconds", 3600)):
         return unavailable_message(cache)
-    change = (((cache.get("meta") or {}).get("crypto") or {}).get("24h_change") or {}).get(asset)
+    crypto_meta = ((cache.get("meta") or {}).get("crypto") or {})
+    change = (crypto_meta.get("24h_change") or {}).get(asset)
+    high = (crypto_meta.get("24h_high") or {}).get(asset)
+    low = (crypto_meta.get("24h_low") or {}).get(asset)
     lines = [f"🪙 {asset_label(asset)}", f"💵 ${format_number(float(usd), 'usd')}"]
     if isinstance(change, (int, float)):
         arrow = "📈" if change >= 0 else "📉"
         lines.append(f"{arrow} 24h: {change:+.2f}%")
+    if isinstance(high, (int, float)) and isinstance(low, (int, float)):
+        lines.append(f"🔼 High: ${format_number(float(high), 'usd')} | 🔽 Low: ${format_number(float(low), 'usd')}")
     if age > 90:
         lines.append("⚠️ نرخ از کش قبلی خوانده شد.")
     lines.append(f"⏱ {format_timestamp(int(cache.get('updated_at') or 0))}")
     return "\n".join(lines)
+
+
+def render_trending(cache: dict[str, Any], kind: str) -> str:
+    crypto_meta = ((cache.get("meta") or {}).get("crypto") or {}) if isinstance(cache, dict) else {}
+    if kind == "gainers":
+        gainers = crypto_meta.get("top_gainers") or []
+        if not gainers:
+            return unavailable_message(cache)
+        lines = ["🚀 Top gainers (cached):", ""]
+        for item in gainers[:5]:
+            lines.append(f"• {item.get('symbol')}: {float(item.get('change') or 0):+.2f}%")
+        lines.append(f"\n⏱ {format_timestamp(int(cache.get('updated_at') or 0))}")
+        return "\n".join(lines)
+    trending = crypto_meta.get("trending") or []
+    if not trending:
+        return unavailable_message(cache)
+    lines = ["🔥 Trending coins (cached):", ""]
+    for item in trending[:7]:
+        lines.append(f"• {item.get('symbol')} — {item.get('name') or '-'}")
+    lines.append(f"\n⏱ {format_timestamp(int(cache.get('updated_at') or 0))}")
+    return "\n".join(lines)
+
+
+def render_dominance(cache: dict[str, Any]) -> str:
+    dominance = (((cache.get("meta") or {}).get("crypto") or {}).get("dominance") or {}).get("btc") if isinstance(cache, dict) else None
+    if not isinstance(dominance, (int, float)):
+        return unavailable_message(cache)
+    return f"👑 BTC Dominance\n\n📊 {dominance:.2f}%\n⏱ {format_timestamp(int(cache.get('updated_at') or 0))}"
+
+
+def render_fear_greed(cache: dict[str, Any]) -> str:
+    data = ((cache.get("meta") or {}).get("fear_greed") or {}) if isinstance(cache, dict) else {}
+    value = data.get("value")
+    if not isinstance(value, int):
+        return unavailable_message(cache)
+    return f"😨 Fear & Greed\n\n📊 {value}/100 — {data.get('classification') or '-'}\n⏱ {format_timestamp(int(data.get('timestamp') or cache.get('updated_at') or 0))}"
 
 
 def unavailable_message(cache: dict[str, Any]) -> str:
@@ -437,8 +554,13 @@ def render_market_response(text: str, settings: dict[str, Any], cache: dict[str,
         return render_conversion(intent, settings, cache)
     if intent.kind in {"price", "status"}:
         return render_price(intent, settings, cache)
-    if intent.kind in {"trending", "dominance"}:
-        return None
+    if intent.kind == "trending":
+        normalized = normalize_text(text)
+        return render_trending(cache, "gainers" if "gainers" in normalized else "trending")
+    if intent.kind == "dominance":
+        return render_dominance(cache)
+    if intent.kind == "fear_greed":
+        return render_fear_greed(cache)
     return None
 
 
@@ -512,6 +634,10 @@ def market_help_text(is_admin: bool = False) -> str:
         "• price trx",
         "• trx status",
         "• btc today",
+        "• trend",
+        "• top gainers",
+        "• btc dominance",
+        "• fear greed",
         "",
         "Alias ها: ترون/trx، تون/ton، تتر/usdt، دلار/usd/$، تومان/irt، ریال/irr، استارز/stars",
     ]

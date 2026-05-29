@@ -69,7 +69,7 @@ class MarketEngineRenderTests(unittest.TestCase):
                 "btc": 70000.0,
                 "eth": 3500.0,
             },
-            "meta": {"crypto": {"24h_change": {"trx": 2.5}}},
+            "meta": {"crypto": {"24h_change": {"trx": 2.5}, "24h_high": {"trx": 0.13}, "24h_low": {"trx": 0.11}, "trending": [{"symbol": "BTC", "name": "Bitcoin"}], "top_gainers": [{"symbol": "TRX", "change": 2.5}], "dominance": {"btc": 52.3}}, "fear_greed": {"value": 70, "classification": "Greed", "timestamp": int(time.time())}},
         }
 
     def test_conversion_uses_cache_only(self):
@@ -79,6 +79,13 @@ class MarketEngineRenderTests(unittest.TestCase):
     def test_price_uses_cached_change(self):
         text = render_market_response("trx status", self.settings, self.cache)
         self.assertIn("24h: +2.50%", text)
+        self.assertIn("High", text)
+
+    def test_extra_market_features_render_from_cache(self):
+        self.assertIn("Trending", render_market_response("trend", self.settings, self.cache))
+        self.assertIn("Top gainers", render_market_response("top gainers", self.settings, self.cache))
+        self.assertIn("52.30%", render_market_response("btc dominance", self.settings, self.cache))
+        self.assertIn("70/100", render_market_response("fear greed", self.settings, self.cache))
 
     def test_stale_cache_fails_safely(self):
         stale = dict(self.cache, updated_at=1)
@@ -110,6 +117,7 @@ class MarketEngineAdminSupportTests(unittest.TestCase):
         service = MarketRateService()
         service._fetch_coingecko = Mock(side_effect=RuntimeError("rate limited"))
         service._fetch_exchange_rates = Mock(return_value={"rates_usd": {"eur": 1.1, "irt": 0.00002}, "meta": {"source": "exchange"}})
+        service._fetch_fear_greed = Mock(return_value={})
         payload = service._fetch_rates({"coingecko_enabled": True, "exchangerate_enabled": True, "stars_unit_amount": 1000, "stars_unit_usd": 30})
         self.assertIn("irt", payload["rates_usd"])
         self.assertIn("coingecko", payload["meta"]["provider_errors"])

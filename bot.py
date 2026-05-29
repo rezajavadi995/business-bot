@@ -975,6 +975,14 @@ def build_toggle_menu_keyboard(menu_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+
+def is_safe_callback_data(raw: str | None) -> bool:
+    if not raw:
+        return False
+    if len(raw.encode("utf-8")) > 64:
+        return False
+    return bool(re.fullmatch(r"[A-Za-z0-9_:\-]+", raw))
+
 async def maybe_welcome(update: Update, data: dict[str, Any], uid: int, source: str) -> bool:
     if source!="business" or not data.get("welcome_enabled",True): return False
     row=db.get_user(uid); now=int(time.time())
@@ -999,6 +1007,10 @@ async def panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query
     if not q: return
+    if not is_safe_callback_data(q.data):
+        logging.warning("callback_rejected_invalid data=%r", q.data)
+        await safe_callback_answer(q, "Callback نامعتبر است.", show_alert=True)
+        return
     data=load_data(); uid=q.from_user.id
     db.upsert_user(uid, q.from_user.username or "", q.from_user.full_name or q.from_user.first_name or "", None, False, "callback", q.data or "")
     if not (q.data and q.data.startswith(("im:btn:", "user:"))):

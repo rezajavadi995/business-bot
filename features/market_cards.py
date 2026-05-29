@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 import importlib
+import json
+import time
 from io import BytesIO
 from pathlib import Path
 from typing import Any
+
+_CARD_CACHE: dict[str, tuple[float, bytes]] = {}
+_CARD_CACHE_TTL_SECONDS = 300
 
 
 def default_branding_settings() -> dict[str, Any]:
@@ -74,6 +80,11 @@ def _line_wrap(draw, text: str, font, max_width: int) -> list[str]:
 
 
 def render_market_card(response_text: str, branding: dict[str, Any]) -> bytes:
+    cache_key = hashlib.sha256((response_text + json.dumps(branding, sort_keys=True, ensure_ascii=False)).encode("utf-8")).hexdigest()
+    now = time.time()
+    cached = _CARD_CACHE.get(cache_key)
+    if cached and now - cached[0] <= _CARD_CACHE_TTL_SECONDS:
+        return cached[1]
     image_mod = importlib.import_module("PIL.Image")
     draw_mod = importlib.import_module("PIL.ImageDraw")
     font_mod = importlib.import_module("PIL.ImageFont")
@@ -130,4 +141,8 @@ def render_market_card(response_text: str, branding: dict[str, Any]) -> bytes:
 
     out = BytesIO()
     base.convert("RGB").save(out, format="PNG", optimize=True)
-    return out.getvalue()
+    data = out.getvalue()
+    if len(_CARD_CACHE) > 64:
+        _CARD_CACHE.clear()
+    _CARD_CACHE[cache_key] = (now, data)
+    return data
