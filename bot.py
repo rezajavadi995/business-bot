@@ -26,7 +26,7 @@ from features.inline_menu import build_inline_menu_admin_kb, paged_rows, CB as I
 from features.inline_actions import ACTION_REGISTRY
 from features.inline_callback import parse as parse_cb, is_valid_im_callback
 from features.market_engine import MARKET_SERVICE, cache_status, market_help_text, merge_market_settings, normalize_asset_list, parse_market_intent, render_market_response, validate_market_api_key
-from features.market_cards import merge_branding_settings, render_market_card
+from features.market_cards import COLOR_PALETTES, CARD_THEMES, ENGLISH_FONT_CHOICES, PERSIAN_FONT_CHOICES, WATERMARK_POSITIONS, merge_branding_settings, render_market_card
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
@@ -521,14 +521,65 @@ def create_market_cache_keyboard(data: dict[str, Any]) -> InlineKeyboardMarkup:
     ])
 
 
+
+def button_grid(items: list[tuple[str, str]], width: int = 2) -> list[list[InlineKeyboardButton]]:
+    rows: list[list[InlineKeyboardButton]] = []
+    for idx in range(0, len(items), width):
+        rows.append([create_primary_button(label, callback) for label, callback in items[idx:idx + width]])
+    return rows
+
+
+def create_market_fonts_keyboard(data: dict[str, Any]) -> InlineKeyboardMarkup:
+    branding = merge_branding_settings(data)
+    return InlineKeyboardMarkup([
+        [create_primary_button(f"Persian Fonts: {branding.get('persian_font')}", "admin:market_fonts:persian")],
+        [create_primary_button(f"English Fonts: {branding.get('english_font')}", "admin:market_fonts:english")],
+        [create_primary_button(f"Persian Bold: {'ON' if branding.get('persian_bold') else 'OFF'}", "admin:market_card_bool:persian_bold")],
+        [create_primary_button(f"English Bold: {'ON' if branding.get('english_bold') else 'OFF'}", "admin:market_card_bool:english_bold")],
+        [create_primary_button("Preview", "admin:market_card_preview"), create_danger_button("بازگشت", "admin:market_branding")],
+    ])
+
+
+def create_market_font_select_keyboard(kind: str) -> InlineKeyboardMarkup:
+    choices = PERSIAN_FONT_CHOICES if kind == "persian" else ENGLISH_FONT_CHOICES
+    rows = button_grid([(meta["label"], f"admin:market_font_preview:{kind}:{key}") for key, meta in choices.items()], 2)
+    rows.append([create_danger_button("بازگشت", "admin:market_fonts")])
+    return InlineKeyboardMarkup(rows)
+
+
+def create_market_confirm_keyboard(apply_cb: str, back_cb: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[create_primary_button("Apply", apply_cb), create_danger_button("Back", back_cb)]])
+
+
+def create_watermark_position_keyboard() -> InlineKeyboardMarkup:
+    order = ["top_left", "top_center", "top_right", "center_left", "center", "center_right", "bottom_left", "bottom_center", "bottom_right"]
+    rows = button_grid([(WATERMARK_POSITIONS[key], f"admin:market_position_preview:{key}") for key in order], 3)
+    rows.append([create_danger_button("بازگشت", "admin:market_branding")])
+    return InlineKeyboardMarkup(rows)
+
+
+def create_market_theme_select_keyboard() -> InlineKeyboardMarkup:
+    rows = button_grid([(meta["label"], f"admin:market_theme_preview:{key}") for key, meta in CARD_THEMES.items()], 2)
+    rows.append([create_danger_button("بازگشت", "admin:market_theme")])
+    return InlineKeyboardMarkup(rows)
+
+
+def create_market_palette_keyboard() -> InlineKeyboardMarkup:
+    rows = button_grid([(meta["label"], f"admin:market_palette_preview:{key}") for key, meta in COLOR_PALETTES.items() if key != "manual"], 2)
+    rows.append([create_primary_button("Manual colors", "admin:market_card_text:manual_colors")])
+    rows.append([create_danger_button("بازگشت", "admin:market_theme")])
+    return InlineKeyboardMarkup(rows)
+
+
 def create_market_branding_keyboard(data: dict[str, Any]) -> InlineKeyboardMarkup:
     branding = merge_branding_settings(data)
     return InlineKeyboardMarkup([
         [create_primary_button(f"Cards: {'ON' if branding.get('card_enabled') else 'OFF'}", "admin:market_card_bool:card_enabled")],
+        [create_primary_button("Fonts", "admin:market_fonts"), create_primary_button("Text opacity", "admin:market_opacity_menu")],
         [create_primary_button("Branding text", "admin:market_card_text:branding_text"), create_primary_button("Watermark text", "admin:market_card_text:watermark_text")],
         [create_primary_button("Branding channel ID", "admin:market_card_text:branding_channel_id"), create_primary_button(f"Logo: {'ON' if branding.get('logo_enabled') else 'OFF'}", "admin:market_card_bool:logo_enabled")],
-        [create_primary_button("Upload logo", "admin:market_card_logo_upload"), create_primary_button("Text opacity", "admin:market_card_number:text_opacity")],
-        [create_primary_button("Watermark position", "admin:market_card_text:watermark_position")],
+        [create_primary_button("Upload/Replace logo", "admin:market_card_logo_upload"), create_danger_button("Remove logo", "admin:market_logo_remove")],
+        [create_primary_button("Watermark position", "admin:market_watermark_positions")],
         [create_primary_button("Preview", "admin:market_card_preview"), create_danger_button("بازگشت", "admin:market_root")],
     ])
 
@@ -537,7 +588,8 @@ def create_market_theme_keyboard(data: dict[str, Any]) -> InlineKeyboardMarkup:
     branding = merge_branding_settings(data)
     return InlineKeyboardMarkup([
         [create_primary_button(f"Dark mode: {'ON' if branding.get('card_dark_mode') else 'OFF'}", "admin:market_card_bool:card_dark_mode")],
-        [create_primary_button(f"Theme: {branding.get('card_theme')}", "admin:market_card_text:card_theme")],
+        [create_primary_button(f"Theme: {branding.get('card_theme')}", "admin:market_theme_select")],
+        [create_primary_button("Preset palettes", "admin:market_palette_select")],
         [create_primary_button(f"Primary: {branding.get('card_primary_color')}", "admin:market_card_text:card_primary_color")],
         [create_primary_button(f"Secondary: {branding.get('card_secondary_color')}", "admin:market_card_text:card_secondary_color")],
         [create_primary_button("Preview", "admin:market_card_preview"), create_danger_button("بازگشت", "admin:market_root")],
@@ -1458,6 +1510,114 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         STATE.flow = STATE.step = STATE.pending_key = None
         merge_branding_settings(data)
         await q.edit_message_text("🌓 Market Card Theme", reply_markup=create_market_theme_keyboard(data))
+    elif q.data=="admin:market_fonts":
+        STATE.flow = STATE.step = STATE.pending_key = None
+        await q.edit_message_text("🔤 Market Fonts", reply_markup=create_market_fonts_keyboard(data))
+    elif q.data.startswith("admin:market_fonts:"):
+        kind = q.data.rsplit(":", 1)[1]
+        if kind not in {"persian", "english"}: return
+        await q.edit_message_text("فونت را انتخاب کنید:", reply_markup=create_market_font_select_keyboard(kind))
+    elif q.data.startswith("admin:market_font_preview:"):
+        _, _, kind, font_key = q.data.split(":", 3)
+        branding = merge_branding_settings(data)
+        field = "persian_font" if kind == "persian" else "english_font"
+        choices = PERSIAN_FONT_CHOICES if kind == "persian" else ENGLISH_FONT_CHOICES
+        if font_key not in choices: return
+        preview_branding = dict(branding, **{field: font_key})
+        sample = "قیمت بیت‌کوین\n💵 70,000 USD\n✨ تبدیل 100 ترون\n💸 600,000 تومان"
+        try:
+            image_bytes = await asyncio.to_thread(render_market_card, sample, preview_branding)
+            await context.bot.send_photo(chat_id=uid, photo=BytesIO(image_bytes), caption=f"Preview: {choices[font_key]['label']}")
+        except Exception as exc:
+            logging.warning("market_font_preview_failed reason=%s", exc)
+        await q.edit_message_text("این فونت اعمال شود؟", reply_markup=create_market_confirm_keyboard(f"admin:market_font_apply:{kind}:{font_key}", f"admin:market_fonts:{kind}"))
+    elif q.data.startswith("admin:market_font_apply:"):
+        _, _, kind, font_key = q.data.split(":", 3)
+        branding = merge_branding_settings(data)
+        choices = PERSIAN_FONT_CHOICES if kind == "persian" else ENGLISH_FONT_CHOICES
+        if font_key not in choices: return
+        branding["persian_font" if kind == "persian" else "english_font"] = font_key
+        data.setdefault("market", {})["card"] = branding
+        save_data(data)
+        await q.edit_message_text("✅ فونت اعمال شد.", reply_markup=create_market_fonts_keyboard(data))
+    elif q.data=="admin:market_watermark_positions":
+        await q.edit_message_text("Watermark position را انتخاب کنید:", reply_markup=create_watermark_position_keyboard())
+    elif q.data.startswith("admin:market_position_preview:"):
+        pos = q.data.rsplit(":", 1)[1]
+        if pos not in WATERMARK_POSITIONS: return
+        branding = merge_branding_settings(data)
+        preview_branding = dict(branding, watermark_position=pos)
+        try:
+            image_bytes = await asyncio.to_thread(render_market_card, "Market card preview\nنمونه متن فارسی", preview_branding)
+            await context.bot.send_photo(chat_id=uid, photo=BytesIO(image_bytes), caption=f"Preview: {WATERMARK_POSITIONS[pos]}")
+        except Exception as exc:
+            logging.warning("market_position_preview_failed reason=%s", exc)
+        await q.edit_message_text("این موقعیت ذخیره شود؟", reply_markup=create_market_confirm_keyboard(f"admin:market_position_apply:{pos}", "admin:market_watermark_positions"))
+    elif q.data.startswith("admin:market_position_apply:"):
+        pos = q.data.rsplit(":", 1)[1]
+        if pos not in WATERMARK_POSITIONS: return
+        branding = merge_branding_settings(data)
+        branding["watermark_position"] = pos
+        data.setdefault("market", {})["card"] = branding
+        save_data(data)
+        await q.edit_message_text("✅ Watermark position ذخیره شد.", reply_markup=create_market_branding_keyboard(data))
+    elif q.data=="admin:market_theme_select":
+        await q.edit_message_text("Theme را انتخاب کنید:", reply_markup=create_market_theme_select_keyboard())
+    elif q.data.startswith("admin:market_theme_preview:"):
+        theme_key = q.data.rsplit(":", 1)[1]
+        if theme_key not in CARD_THEMES: return
+        theme = CARD_THEMES[theme_key]
+        branding = merge_branding_settings(data)
+        preview_branding = dict(branding, card_theme=theme_key, card_primary_color=theme["primary"], card_secondary_color=theme["secondary"], card_dark_mode=theme["dark"])
+        try:
+            image_bytes = await asyncio.to_thread(render_market_card, "Theme preview\nقیمت BTC: 70,000 USD", preview_branding)
+            await context.bot.send_photo(chat_id=uid, photo=BytesIO(image_bytes), caption=f"Preview: {theme['label']}")
+        except Exception as exc:
+            logging.warning("market_theme_preview_failed reason=%s", exc)
+        await q.edit_message_text("این theme اعمال شود؟", reply_markup=create_market_confirm_keyboard(f"admin:market_theme_apply:{theme_key}", "admin:market_theme_select"))
+    elif q.data.startswith("admin:market_theme_apply:"):
+        theme_key = q.data.rsplit(":", 1)[1]
+        if theme_key not in CARD_THEMES: return
+        theme = CARD_THEMES[theme_key]
+        branding = merge_branding_settings(data)
+        branding.update({"card_theme": theme_key, "card_primary_color": theme["primary"], "card_secondary_color": theme["secondary"], "card_dark_mode": bool(theme["dark"])})
+        data.setdefault("market", {})["card"] = branding
+        save_data(data)
+        await q.edit_message_text("✅ Theme اعمال شد.", reply_markup=create_market_theme_keyboard(data))
+    elif q.data=="admin:market_palette_select":
+        await q.edit_message_text("Color palette را انتخاب کنید:", reply_markup=create_market_palette_keyboard())
+    elif q.data.startswith("admin:market_palette_preview:"):
+        palette_key = q.data.rsplit(":", 1)[1]
+        if palette_key not in COLOR_PALETTES: return
+        palette = COLOR_PALETTES[palette_key]
+        branding = merge_branding_settings(data)
+        preview_branding = dict(branding, card_primary_color=palette["primary"], card_secondary_color=palette["secondary"])
+        try:
+            image_bytes = await asyncio.to_thread(render_market_card, "Palette preview\nنمونه رنگ کارت", preview_branding)
+            await context.bot.send_photo(chat_id=uid, photo=BytesIO(image_bytes), caption=f"Preview: {palette['label']}")
+        except Exception as exc:
+            logging.warning("market_palette_preview_failed reason=%s", exc)
+        await q.edit_message_text("این palette اعمال شود؟", reply_markup=create_market_confirm_keyboard(f"admin:market_palette_apply:{palette_key}", "admin:market_palette_select"))
+    elif q.data.startswith("admin:market_palette_apply:"):
+        palette_key = q.data.rsplit(":", 1)[1]
+        if palette_key not in COLOR_PALETTES: return
+        palette = COLOR_PALETTES[palette_key]
+        branding = merge_branding_settings(data)
+        branding["card_primary_color"] = palette["primary"]
+        branding["card_secondary_color"] = palette["secondary"]
+        data.setdefault("market", {})["card"] = branding
+        save_data(data)
+        await q.edit_message_text("✅ Palette اعمال شد.", reply_markup=create_market_theme_keyboard(data))
+    elif q.data=="admin:market_opacity_menu":
+        STATE.flow, STATE.step, STATE.admin_id, STATE.message_id, STATE.pending_key = "market_card_cfg", "waiting_number", uid, q.message.message_id, "text_opacity"
+        await q.edit_message_text("Opacity متن را بین 40 تا 255 ارسال کنید. پس از ذخیره Preview بگیرید.", reply_markup=build_back_kb("admin:market_branding"))
+    elif q.data=="admin:market_logo_remove":
+        branding = merge_branding_settings(data)
+        branding["logo_enabled"] = False
+        branding["logo_path"] = ""
+        data.setdefault("market", {})["card"] = branding
+        save_data(data)
+        await q.edit_message_text("✅ لوگو حذف/غیرفعال شد.", reply_markup=create_market_branding_keyboard(data))
     elif q.data=="admin:market_card_preview":
         branding = merge_branding_settings(data)
         sample = "✨ 2,000 STARS :\n\n💸 5,234,610 toman\n🌀 16.845 TON\n💵 $30 dollar\n\n🪙 1405/03/04 | 05:52:46"
@@ -1471,18 +1631,18 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif q.data.startswith("admin:market_card_bool:"):
         field = q.data.rsplit(":", 1)[1]
         branding = merge_branding_settings(data)
-        if field in {"card_enabled", "logo_enabled", "card_dark_mode"}:
+        if field in {"card_enabled", "logo_enabled", "card_dark_mode", "persian_bold", "english_bold"}:
             branding[field] = not branding.get(field, False)
             data.setdefault("market", {})["card"] = branding
             save_data(data)
-        kb = create_market_theme_keyboard(data) if field == "card_dark_mode" else create_market_branding_keyboard(data)
+        kb = create_market_theme_keyboard(data) if field == "card_dark_mode" else create_market_fonts_keyboard(data) if field in {"persian_bold", "english_bold"} else create_market_branding_keyboard(data)
         await q.edit_message_text("🎨 Market Card Settings", reply_markup=kb)
     elif q.data=="admin:market_card_logo_upload":
         STATE.flow, STATE.step, STATE.admin_id, STATE.message_id, STATE.pending_key = "market_card_cfg", "waiting_logo", uid, q.message.message_id, "logo_path"
         await q.edit_message_text("لوگوی کارت را به صورت photo یا فایل تصویر ارسال کنید.", reply_markup=build_back_kb("admin:market_branding"))
     elif q.data.startswith("admin:market_card_text:"):
         field = q.data.rsplit(":", 1)[1]
-        if field not in {"branding_text", "branding_channel_id", "watermark_text", "watermark_position", "card_theme", "card_primary_color", "card_secondary_color"}: return
+        if field not in {"branding_text", "branding_channel_id", "watermark_text", "watermark_position", "card_theme", "card_primary_color", "card_secondary_color", "manual_colors"}: return
         STATE.flow, STATE.step, STATE.admin_id, STATE.message_id, STATE.pending_key = "market_card_cfg", "waiting_text", uid, q.message.message_id, field
         await q.edit_message_text(f"مقدار جدید برای {field} را ارسال کنید.", reply_markup=build_back_kb("admin:market_branding"))
     elif q.data.startswith("admin:market_card_number:"):
@@ -1640,10 +1800,17 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cp = update.channel_post
         await maybe_report_watch_hit(update, context, "channel_edit", cp.text or cp.caption or "")
         return
+    is_edited_message = False
     if getattr(update, "edited_message", None):
+        is_edited_message = True
+        update.message = update.edited_message
         data = load_data()
-        await maybe_send_market_response(update.edited_message, data, source="message", is_edit=True)
-        return
+        edit_source = "group" if update.effective_chat and update.effective_chat.type in {"group", "supergroup"} else "message"
+        if await maybe_send_market_response(update.message, data, source=edit_source, is_edit=True):
+            return
+        if update.effective_chat and update.effective_chat.type in {"group", "supergroup"}:
+            await maybe_report_watch_hit(update, context, "group", update.message.text or update.message.caption or "")
+            return
     if not update.message or not update.effective_user: return
     if STATE.admin_id == (update.effective_user.id if update.effective_user else None) and STATE.flow == "db_import" and STATE.step == "waiting_document":
         txt_cmd = (update.message.text or "").strip().lower() if update.message else ""
@@ -1769,18 +1936,45 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="✅ لوگوی کارت ذخیره و فعال شد.", reply_markup=create_market_branding_keyboard(data)); return
         if STATE.step=="waiting_text":
             value = txt.strip()
+            if field == "manual_colors":
+                parts = [x.strip() for x in re.split(r"[,،\s]+", value) if x.strip()]
+                if len(parts) < 2 or not all(re.fullmatch(r"#?[0-9a-fA-F]{6}", x) for x in parts[:2]):
+                    await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="دو رنگ معتبر ارسال کنید. نمونه: #2336ff #8a2be2", reply_markup=build_back_kb("admin:market_theme")); return
+                branding["card_primary_color"] = parts[0] if parts[0].startswith("#") else f"#{parts[0]}"
+                branding["card_secondary_color"] = parts[1] if parts[1].startswith("#") else f"#{parts[1]}"
+                data.setdefault("market", {})["card"] = branding
+                save_data(data)
+                STATE.flow = STATE.step = STATE.pending_key = None
+                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="✅ رنگ‌های دستی ذخیره شد. برای مشاهده Preview بگیرید.", reply_markup=create_market_theme_keyboard(data)); return
             if field in {"card_primary_color", "card_secondary_color"} and not re.fullmatch(r"#?[0-9a-fA-F]{6}", value):
                 await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="رنگ نامعتبر است. نمونه: #2336ff", reply_markup=build_back_kb("admin:market_theme")); return
             if field in {"card_primary_color", "card_secondary_color"} and not value.startswith("#"):
                 value = f"#{value}"
-            if field in {"watermark_position"} and value not in {"bottom_right", "bottom_left", "top_right", "top_left"}:
-                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="position معتبر: bottom_right, bottom_left, top_right, top_left", reply_markup=build_back_kb("admin:market_branding")); return
+            if field == "branding_channel_id":
+                try:
+                    if value and int(value) >= 0:
+                        raise ValueError()
+                except Exception:
+                    await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="Channel ID نامعتبر است. نمونه معتبر: -1001234567890", reply_markup=build_back_kb("admin:market_branding")); return
+                if value:
+                    try:
+                        me = await context.bot.get_chat_member(int(value), context.bot.id)
+                        value = str(int(value))
+                        feedback = f"✅ Channel ID ذخیره شد. وضعیت ربات: {getattr(me, 'status', 'unknown')}"
+                    except Exception as exc:
+                        feedback = f"⚠️ Channel ID ذخیره شد اما اعتبارسنجی دسترسی ناموفق بود: {exc}"
+                else:
+                    feedback = "✅ Channel ID پاک شد."
+            else:
+                feedback = f"✅ {field} بروزرسانی شد."
+            if field in {"watermark_position"} and value not in WATERMARK_POSITIONS:
+                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="از دکمه‌های موقعیت Watermark استفاده کنید.", reply_markup=create_watermark_position_keyboard()); return
             branding[field] = value[:256]
             data.setdefault("market", {})["card"] = branding
             save_data(data)
             STATE.flow = STATE.step = STATE.pending_key = None
             kb = create_market_theme_keyboard(data) if field.startswith("card_") else create_market_branding_keyboard(data)
-            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"✅ {field} بروزرسانی شد.", reply_markup=kb); return
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=feedback, reply_markup=kb); return
         if STATE.step=="waiting_number":
             try:
                 value = int(float(txt.strip()))
@@ -1828,7 +2022,12 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save_data(data)
             STATE.flow = STATE.step = STATE.pending_key = None
             kb = create_market_cache_keyboard(data) if field in {"cache_ttl_seconds", "stale_ttl_seconds"} else create_market_stars_keyboard(data)
-            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"✅ {field} بروزرسانی شد: {value}", reply_markup=kb); return
+            suffix = ""
+            if field in {"stars_unit_amount", "stars_unit_usd", "stars_manual_override_usd"}:
+                unit = max(float(settings.get("stars_unit_amount") or 1000), 1.0)
+                effective = float(settings.get("stars_manual_override_usd") or settings.get("stars_unit_usd") or 0) / unit
+                suffix = f"\nPreview: 2000 Stars ≈ {effective * 2000:.4f} USD"
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"✅ {field} بروزرسانی شد: {value}{suffix}", reply_markup=kb); return
         if STATE.step=="waiting_quick_assets":
             raw_items = [x.strip() for x in re.split(r"[,،\s]+", txt) if x.strip()]
             normalized = normalize_asset_list(raw_items, settings.get("quick_assets", []))
@@ -1924,7 +2123,7 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not data.get("active", False) and not is_admin(uid, data):
         return
 
-    if await maybe_send_market_response(update.message, data, source="message"):
+    if not is_edited_message and await maybe_send_market_response(update.message, data, source="message"):
         return
 
     shortcuts=db.load_shortcuts()
@@ -1967,7 +2166,7 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             if not is_admin(uid,data): await send_formatted_message(update.message, resp, data); return
 
-    if await maybe_send_market_response(update.message, data, source="message"):
+    if not is_edited_message and await maybe_send_market_response(update.message, data, source="message"):
         return
 
     if data["active"] and not is_admin(uid,data): await send_formatted_message(update.message, data.get("offline_message",""), data)
