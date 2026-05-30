@@ -712,20 +712,22 @@ async def maybe_send_market_response(message, data: dict[str, Any], *, source: s
         return True
     if dedupe_key:
         db.set_json(dedupe_key, {"processed_at": int(time.time()), "intent": intent.kind})
+    cache = await MARKET_SERVICE.refresh_if_needed(market_settings)
     try:
-        response = render_market_response(text, market_settings, MARKET_SERVICE.read_cache())
+        response = render_market_response(text, market_settings, cache)
     except Exception as exc:
         logging.exception("market_response_failed reason=%s", exc)
         response = "⚠️ پردازش تبدیل بازار ناموفق بود، اما ربات پایدار است."
     if not response:
         return False
-    await send_formatted_message(message, response, data)
     if branding.get("card_enabled", False):
         try:
             image_bytes = await asyncio.to_thread(render_market_card, response, branding)
-            await message.reply_photo(photo=BytesIO(image_bytes), caption=str(branding.get("branding_channel_id") or "")[:1000] or None)
+            await message.reply_photo(photo=BytesIO(image_bytes), caption=response[:1000])
+            return True
         except Exception as exc:
             logging.warning("market_card_send_failed reason=%s", exc)
+    await send_formatted_message(message, response, data)
     return True
 
 def is_spam(text: str, shortcuts: dict[str, str]) -> bool:

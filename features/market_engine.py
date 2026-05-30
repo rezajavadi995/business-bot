@@ -276,6 +276,8 @@ class MarketRateService:
     def __init__(self, store: JsonStore | None = None):
         self.store = store
         self._stop = asyncio.Event()
+        self._refresh_lock = asyncio.Lock()
+        self._last_refresh_started_at = 0
 
     def bind_store(self, store: JsonStore) -> None:
         self.store = store
@@ -284,11 +286,27 @@ class MarketRateService:
         if not self.store:
             return {}
         cache = self.store.get_json(CACHE_KEY, {})
-        return cache if isinstance(cache, dict) else {}
+        return dict(cache) if isinstance(cache, dict) else {}
 
     def write_cache(self, cache: dict[str, Any]) -> None:
         if self.store:
-            self.store.set_json(CACHE_KEY, cache)
+            self.store.set_json(CACHE_KEY, dict(cache))
+
+    def cache_is_fresh(self, settings: dict[str, Any]) -> bool:
+        status = cache_status(self.read_cache(), settings)
+        return bool(status.get("fresh") and status.get("usable"))
+
+    async def refresh_if_needed(self, settings: dict[str, Any], *, force: bool = False) -> dict[str, Any]:
+        if not settings.get("market_api_enabled", True):
+            return self.read_cache()
+        if not force and self.cache_is_fresh(settings):
+            return self.read_cache()
+        if self._refresh_lock.locked() and not force:
+            return self.read_cache()
+        async with self._refresh_lock:
+            if not force and self.cache_is_fresh(settings):
+                return self.read_cache()
+            return await self.refresh(settings, _locked=True)
 
     async def run_forever(self, settings_getter) -> None:
         await asyncio.sleep(2)
@@ -302,25 +320,20 @@ class MarketRateService:
             except asyncio.TimeoutError:
                 pass
 
-    async def refresh(self, settings: dict[str, Any]) -> dict[str, Any]:
+    async def refresh(self, settings: dict[str, Any], _locked: bool = False) -> dict[str, Any]:
+        if not _locked:
+            async with self._refresh_lock:
+                return await self.refresh(settings, _locked=True)
+        self._last_refresh_started_at = int(time.time())
         try:
-            payload = await asyncio.to_thread(self._fetch_rates, settings)
-            old = self.read_cache()
-            merged_rates = dict(old.get("rates_usd", {}) if isinstance(old.get("rates_usd"), dict) else {})
-            merged_rates.update(payload.get("rates_usd", {}) if isinstance(payload.get("rates_usd"), dict) else {})
-            old_meta = old.get("meta", {}) if isinstance(old.get("meta"), dict) else {}
-            new_meta = payload.get("meta", {}) if isinstance(payload.get("meta"), dict) else {}
-            merged_meta = dict(old_meta)
-            for key, value in new_meta.items():
-                if isinstance(value, dict) and isinstance(merged_meta.get(key), dict):
-                    nested = dict(merged_meta[key])
-                    nested.update({k: v for k, v in value.items() if v not in ({}, [], None)})
-                    merged_meta[key] = nested
-                elif value not in ({}, [], None):
-                    merged_meta[key] = value
-            merged = {**old, **payload, "rates_usd": merged_rates, "meta": merged_meta, "updated_at": int(time.time()), "last_error": None}
-            self.write_cache(merged)
-            return merged
+            timeout = float(settings.get("request_timeout_seconds", 8) or 8) + 5.0
+            payload = await asyncio.wait_for(asyncio.to_thread(self._fetch_rates, settings), timeout=timeout)
+            rates = payload.get("rates_usd", {}) if isinstance(payload.get("rates_usd"), dict) else {}
+            if not any(asset not in {"usd", "usdt", "stars"} for asset in rates):
+                raise RuntimeError("refresh returned no external market rates")
+            cache = {**payload, "rates_usd": dict(rates), "meta": payload.get("meta", {}) if isinstance(payload.get("meta"), dict) else {}, "updated_at": int(time.time()), "last_error": None}
+            self.write_cache(cache)
+            return cache
         except Exception as exc:
             logging.warning("market_refresh_failed reason=%s", safe_error(exc))
             cache = self.read_cache()
@@ -513,7 +526,7 @@ def format_number(value: float, asset: str | None = None) -> str:
 
 
 def asset_label(asset: str) -> str:
-    return {"irt": "toman", "irr": "rial", "usd": "dollar", "eur": "euro", "stars": "STARS"}.get(asset, asset.upper())
+    return {"irt": "تومان", "irr": "ریال", "usd": "USD", "eur": "EUR", "stars": "Stars", "usdt": "USDT"}.get(asset, asset.upper())
 
 
 def format_timestamp(ts: int) -> str:
@@ -529,7 +542,7 @@ def render_conversion(intent: MarketIntent, settings: dict[str, Any], cache: dic
     if intent.amount is None or not intent.source:
         return None
     targets = [intent.target] if intent.target else [a for a in settings.get("default_conversion_targets", DEFAULT_CONVERSION_TARGETS) if a != intent.source]
-    lines = [f"✨ {format_number(intent.amount, intent.source)} {asset_label(intent.source)} :", ""]
+    lines = [f"✨ تبدیل {format_number(intent.amount, intent.source)} {asset_label(intent.source)}", ""]
     results = []
     for target in targets:
         if not target or target == intent.source:
@@ -563,12 +576,12 @@ def render_price(intent: MarketIntent, settings: dict[str, Any], cache: dict[str
     change = (crypto_meta.get("24h_change") or {}).get(asset)
     high = (crypto_meta.get("24h_high") or {}).get(asset)
     low = (crypto_meta.get("24h_low") or {}).get(asset)
-    lines = [f"🪙 {asset_label(asset)}", f"💵 ${format_number(float(usd), 'usd')}"]
+    lines = [f"🪙 قیمت {asset_label(asset)}", f"💵 {format_number(float(usd), 'usd')} USD"]
     if isinstance(change, (int, float)):
         arrow = "📈" if change >= 0 else "📉"
         lines.append(f"{arrow} 24h: {change:+.2f}%")
     if isinstance(high, (int, float)) and isinstance(low, (int, float)):
-        lines.append(f"🔼 High: ${format_number(float(high), 'usd')} | 🔽 Low: ${format_number(float(low), 'usd')}")
+        lines.append(f"🔼 High: {format_number(float(high), 'usd')} USD | 🔽 Low: {format_number(float(low), 'usd')} USD")
     if age > 90:
         lines.append("⚠️ نرخ از کش قبلی خوانده شد.")
     lines.append(f"⏱ {format_timestamp(int(cache.get('updated_at') or 0))}")
@@ -614,7 +627,7 @@ def render_fear_greed(cache: dict[str, Any]) -> str:
 def unavailable_message(cache: dict[str, Any]) -> str:
     err = cache.get("last_error") if isinstance(cache, dict) else None
     suffix = f"\nجزئیات امن خطا: {err}" if err else ""
-    return "⚠️ نرخ معتبر فعلاً در کش بازار موجود نیست. لطفاً کمی بعد دوباره تلاش کنید." + suffix
+    return "⚠️ نرخ معتبر و تازه فعلاً در کش بازار موجود نیست. لطفاً چند لحظه بعد دوباره تلاش کنید." + suffix
 
 
 def render_market_response(text: str, settings: dict[str, Any], cache: dict[str, Any]) -> str | None:
@@ -678,14 +691,17 @@ def cache_status(cache: dict[str, Any], settings: dict[str, Any]) -> dict[str, A
     age = max(0, int(time.time()) - updated_at) if updated_at else None
     rates = cache.get("rates_usd") if isinstance(cache, dict) else None
     rate_count = len(rates) if isinstance(rates, dict) else 0
+    external_rate_count = len([asset for asset in rates if asset not in {"usd", "usdt", "stars"}]) if isinstance(rates, dict) else 0
     ttl = int(settings.get("cache_ttl_seconds", 60) or 60)
     stale_ttl = int(settings.get("stale_ttl_seconds", 86400) or 86400)
+    usable = age is not None and age <= stale_ttl and external_rate_count > 0
     return {
         "updated_at": updated_at,
         "age": age,
         "rate_count": rate_count,
-        "fresh": age is not None and age <= ttl,
-        "usable": age is not None and age <= stale_ttl and rate_count > 0,
+        "external_rate_count": external_rate_count,
+        "fresh": usable and age <= ttl,
+        "usable": usable,
         "last_error": cache.get("last_error") if isinstance(cache, dict) else None,
     }
 
