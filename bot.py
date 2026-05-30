@@ -25,7 +25,7 @@ from features.log_export import build_logs_keyboard, humanize_log_text
 from features.inline_menu import build_inline_menu_admin_kb, paged_rows, CB as IMCB
 from features.inline_actions import ACTION_REGISTRY
 from features.inline_callback import parse as parse_cb, is_valid_im_callback
-from features.market_engine import MARKET_SERVICE, cache_status, market_help_text, merge_market_settings, normalize_asset_list, render_market_response, validate_market_api_key
+from features.market_engine import MARKET_SERVICE, cache_status, market_help_text, merge_market_settings, normalize_asset_list, parse_market_intent, render_market_response, validate_market_api_key
 from features.market_cards import merge_branding_settings, render_market_card
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -683,28 +683,51 @@ async def send_formatted_message(target, text: str, data: dict[str, Any]):
     return await target.reply_text(render_html_text(text, bold=data.get("bold_mode", True)), parse_mode=ParseMode.HTML)
 
 
-async def maybe_send_market_response(message, data: dict[str, Any]) -> bool:
+def market_message_dedupe_key(message, source: str) -> str | None:
+    chat = getattr(message, "chat", None)
+    chat_id = getattr(chat, "id", None)
+    message_id = getattr(message, "message_id", None)
+    if chat_id is None or message_id is None:
+        return None
+    return f"market_processed:{source}:{chat_id}:{message_id}"
+
+
+async def maybe_send_market_response(message, data: dict[str, Any], *, source: str = "message", is_edit: bool = False) -> bool:
     market_settings = merge_market_settings(data)
     branding = merge_branding_settings(data)
     if not data.get("active", False) or not market_settings.get("market_engine_enabled", False):
         return False
+    if is_edit and not market_settings.get("market_process_edited_messages", False):
+        logging.info("market_edit_skipped source=%s msg_id=%s", source, getattr(message, "message_id", None))
+        return False
     text = (getattr(message, "text", None) or "").strip()
     if not text:
         return False
+    intent = parse_market_intent(text)
+    if not intent:
+        return False
+    dedupe_key = market_message_dedupe_key(message, source)
+    if dedupe_key and db.get_json(dedupe_key, False):
+        logging.info("market_duplicate_ignored key=%s", dedupe_key)
+        return True
+    if dedupe_key:
+        db.set_json(dedupe_key, {"processed_at": int(time.time()), "intent": intent.kind})
+    cache = await MARKET_SERVICE.refresh_if_needed(market_settings)
     try:
-        response = render_market_response(text, market_settings, MARKET_SERVICE.read_cache())
+        response = render_market_response(text, market_settings, cache)
     except Exception as exc:
         logging.exception("market_response_failed reason=%s", exc)
         response = "⚠️ پردازش تبدیل بازار ناموفق بود، اما ربات پایدار است."
     if not response:
         return False
-    await send_formatted_message(message, response, data)
     if branding.get("card_enabled", False):
         try:
             image_bytes = await asyncio.to_thread(render_market_card, response, branding)
-            await message.reply_photo(photo=BytesIO(image_bytes), caption=str(branding.get("branding_channel_id") or "")[:1000] or None)
+            await message.reply_photo(photo=BytesIO(image_bytes), caption=response[:1000])
+            return True
         except Exception as exc:
             logging.warning("market_card_send_failed reason=%s", exc)
+    await send_formatted_message(message, response, data)
     return True
 
 def is_spam(text: str, shortcuts: dict[str, str]) -> bool:
@@ -1554,7 +1577,7 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
             except TimedOut:
                 logging.warning("business_inline_menu_send_timeout uid=%s chat_id=%s command=%r", uid, bm.chat.id, txt)
             return
-    if await maybe_send_market_response(bm, data):
+    if await maybe_send_market_response(bm, data, source="business"):
         return
     sc=db.load_shortcuts(); resp=match_shortcut(txt, sc)
     if resp and data.get("self_bot_enabled", False):
@@ -1591,7 +1614,7 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
             return
         logging.info("business_shortcut_sent uid=%s text=%s",uid, txt)
         return
-    if await maybe_send_market_response(bm, data):
+    if await maybe_send_market_response(bm, data, source="business"):
         return
     logging.info("business_shortcut_no_match uid=%s text=%s", uid, txt)
     if data.get("welcome_enabled",True) and (prev is None or int(prev["last_seen_at"] or 0)<=0 or int(time.time())-int(prev["last_seen_at"] or 0)>=WELCOME_COOLDOWN_SECONDS):
@@ -1605,8 +1628,8 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
 async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if getattr(update,"business_message",None): await business_message_handler(update, context); return
     if getattr(update, "edited_business_message", None):
-        update.business_message = update.edited_business_message
-        await business_message_handler(update, context)
+        data = load_data()
+        await maybe_send_market_response(update.edited_business_message, data, source="business", is_edit=True)
         return
     if getattr(update, "channel_post", None):
         cp = update.channel_post
@@ -1618,7 +1641,9 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await maybe_report_watch_hit(update, context, "channel_edit", cp.text or cp.caption or "")
         return
     if getattr(update, "edited_message", None):
-        update.message = update.edited_message
+        data = load_data()
+        await maybe_send_market_response(update.edited_message, data, source="message", is_edit=True)
+        return
     if not update.message or not update.effective_user: return
     if STATE.admin_id == (update.effective_user.id if update.effective_user else None) and STATE.flow == "db_import" and STATE.step == "waiting_document":
         txt_cmd = (update.message.text or "").strip().lower() if update.message else ""
@@ -1647,7 +1672,7 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat and update.effective_chat.type in {"group", "supergroup"}:
         await maybe_report_watch_hit(update, context, "group", update.message.text or update.message.caption or "")
         data = load_data()
-        await maybe_send_market_response(update.message, data)
+        await maybe_send_market_response(update.message, data, source="group")
         return
     # Monitoring is event-driven from business/channel/group updates.
     data=load_data(); uid=update.effective_user.id; src_txt=text_with_custom_emoji_markup(update.message); txt=(update.message.text or "").strip()
@@ -1899,7 +1924,7 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not data.get("active", False) and not is_admin(uid, data):
         return
 
-    if await maybe_send_market_response(update.message, data):
+    if await maybe_send_market_response(update.message, data, source="message"):
         return
 
     shortcuts=db.load_shortcuts()
@@ -1942,7 +1967,7 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             if not is_admin(uid,data): await send_formatted_message(update.message, resp, data); return
 
-    if await maybe_send_market_response(update.message, data):
+    if await maybe_send_market_response(update.message, data, source="message"):
         return
 
     if data["active"] and not is_admin(uid,data): await send_formatted_message(update.message, data.get("offline_message",""), data)
