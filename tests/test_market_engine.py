@@ -51,6 +51,25 @@ class MarketEngineParserTests(unittest.TestCase):
         self.assertEqual(parse_market_intent("قیمت بیت کوین").query_asset, "btc")
         self.assertEqual((parse_market_intent("100 بیت کوین تومان").source, parse_market_intent("100 بیت کوین تومان").target), ("btc", "irt"))
 
+    def test_strict_parser_rejects_natural_language_sentences(self):
+        for raw in [
+            "من امروز بیت خریدم",
+            "من امروز btc خریدم",
+            "please send dollar invoice",
+            "این trx برای تست است",
+        ]:
+            with self.subTest(raw=raw):
+                self.assertIsNone(parse_market_intent(raw))
+
+    def test_strict_parser_rejects_multi_intent_collisions(self):
+        for raw in ["btc trx", "btc dollar trx", "100 btc eth trx", "قیمت btc trx"]:
+            with self.subTest(raw=raw):
+                self.assertIsNone(parse_market_intent(raw))
+
+    def test_alias_normalization_handles_arabic_variants_and_zero_width(self):
+        self.assertEqual(parse_market_intent("قیمت بیت‌کوین").query_asset, "btc")
+        self.assertEqual(parse_market_intent("۱۰۰ تتر تومان").target, "irt")
+
 
 class MarketEngineRenderTests(unittest.TestCase):
     def setUp(self):

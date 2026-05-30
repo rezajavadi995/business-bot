@@ -73,6 +73,7 @@ def default_market_settings() -> dict[str, Any]:
     return {
         "market_engine_enabled": False,
         "market_api_enabled": True,
+        "market_process_edited_messages": False,
         "coingecko_enabled": True,
         "exchangerate_enabled": True,
         "cache_ttl_seconds": int(os.getenv("MARKET_CACHE_TTL_SECONDS", "60") or 60),
@@ -96,6 +97,7 @@ def merge_market_settings(data: dict[str, Any]) -> dict[str, Any]:
         raw.setdefault(key, value)
     raw["market_engine_enabled"] = bool(raw.get("market_engine_enabled", False))
     raw["market_api_enabled"] = bool(raw.get("market_api_enabled", True))
+    raw["market_process_edited_messages"] = bool(raw.get("market_process_edited_messages", False))
     raw["coingecko_enabled"] = bool(raw.get("coingecko_enabled", True))
     raw["exchangerate_enabled"] = bool(raw.get("exchangerate_enabled", True))
     raw["cache_ttl_seconds"] = max(30, min(int(raw.get("cache_ttl_seconds") or 60), 3600))
@@ -132,7 +134,13 @@ def normalize_number(value: str) -> float | None:
 
 def normalize_text(text: str) -> str:
     value = str(text or "").translate(PERSIAN_DIGITS).casefold()
-    value = value.replace("٫", ".").replace("٬", ",")
+    value = (
+        value.replace("ي", "ی")
+        .replace("ك", "ک")
+        .replace("‌", " ")
+        .replace("٫", ".")
+        .replace("٬", ",")
+    )
     value = re.sub(r"\$", " $ ", value)
     value = re.sub(r"([0-9][0-9,]*(?:\.[0-9]+)?)(?=[^\W\d_\$])", r"\1 ", value, flags=re.UNICODE)
     value = re.sub(r"(?<=[^\W\d_])([0-9])", r" \1", value, flags=re.UNICODE)
@@ -148,9 +156,13 @@ def normalize_asset(value: str | None) -> str | None:
 
 
 def extract_assets(words: list[str]) -> list[str]:
-    assets: list[str] = []
+    return [asset for asset, _, _ in extract_asset_matches(words)]
+
+
+def extract_asset_matches(words: list[str]) -> list[tuple[str, int, int]]:
+    matches: list[tuple[str, int, int]] = []
     idx = 0
-    max_alias_words = max(len(alias.split()) for alias in ASSET_ALIASES)
+    max_alias_words = max(len(normalize_text(alias).split()) for alias in ASSET_ALIASES)
     while idx < len(words):
         matched: str | None = None
         matched_len = 0
@@ -162,11 +174,40 @@ def extract_assets(words: list[str]) -> list[str]:
                 matched_len = size
                 break
         if matched:
-            assets.append(matched)
+            matches.append((matched, idx, idx + matched_len))
             idx += matched_len
         else:
             idx += 1
-    return assets
+    return matches
+
+
+def _unique_in_order(values: list[str]) -> list[str]:
+    unique: list[str] = []
+    for value in values:
+        if value not in unique:
+            unique.append(value)
+    return unique
+
+
+def _asset_tokens(words: list[str], matches: list[tuple[str, int, int]]) -> set[int]:
+    tokens: set[int] = set()
+    for _, start, end in matches:
+        tokens.update(range(start, end))
+    return tokens
+
+
+def _number_tokens(words: list[str]) -> set[int]:
+    return {idx for idx, word in enumerate(words) if normalize_number(word) is not None}
+
+
+def _has_only_intent_tokens(words: list[str], matches: list[tuple[str, int, int]], allowed_words: set[str]) -> bool:
+    asset_tokens = _asset_tokens(words, matches)
+    number_tokens = _number_tokens(words)
+    for idx, word in enumerate(words):
+        if idx in asset_tokens or idx in number_tokens or word in allowed_words:
+            continue
+        return False
+    return True
 
 
 def parse_market_intent(text: str) -> MarketIntent | None:
@@ -174,31 +215,61 @@ def parse_market_intent(text: str) -> MarketIntent | None:
     if not normalized or len(normalized) > 160:
         return None
     words = normalized.split()
-    assets = extract_assets(words)
+    if len(words) > 8:
+        return None
+
+    matches = extract_asset_matches(words)
+    assets = [asset for asset, _, _ in matches]
+    unique_assets = _unique_in_order(assets)
     amount: float | None = None
     for word in words:
         amount = normalize_number(word)
         if amount is not None:
             break
 
-    if normalized in {"fear", "fear greed", "fear & greed", "ترس", "طمع", "شاخص ترس"}:
+    price_commands = {"price", "قیمت"}
+    status_commands = {"status", "today", "وضعیت", "امروز"}
+    dominance_commands = {"dominance", "دامیننس"}
+
+    if normalized in {"fear", "fear greed", "fear & greed", "ترس", "طمع", "شاخص ترس"}:  # exact commands only
         return MarketIntent(kind="fear_greed")
-    if normalized in {"trend", "trends", "ترند", "top gainers", "gainers"}:
+    if normalized in {"trend", "trends", "ترند", "top gainers", "gainers"}:  # exact commands only
         return MarketIntent(kind="trending")
-    if "dominance" in words or "دامیننس" in words:
-        if "btc" in assets:
-            return MarketIntent(kind="dominance", query_asset="btc")
-    if any(w in words for w in {"price", "قیمت"}) and assets:
-        return MarketIntent(kind="price", query_asset=assets[0])
-    if any(w in words for w in {"status", "today", "وضعیت", "امروز"}) and assets:
-        return MarketIntent(kind="status", query_asset=assets[0])
-    if amount is None and len(words) <= 3 and assets and assets[0] in CRYPTO_IDS:
-        return MarketIntent(kind="price", query_asset=assets[0])
+
+    # Conversion requests must be compact, intentional commands: an amount plus one
+    # or two known assets and no natural-language filler. This avoids firing on
+    # ordinary sentences that merely contain market keywords.
     if amount is not None and assets:
+        if len(unique_assets) > 2:
+            return None
+        if not _has_only_intent_tokens(words, matches, set()):
+            return None
         source = assets[0]
         target = next((asset for asset in assets[1:] if asset != source), None)
         return MarketIntent(kind="conversion", amount=amount, source=source, target=target)
+
+    if assets:
+        if len(unique_assets) != 1:
+            return None
+        asset = unique_assets[0]
+        command_words = set(words) - {word for _, start, end in matches for word in words[start:end]}
+        if command_words & dominance_commands:
+            if asset == "btc" and _has_only_intent_tokens(words, matches, dominance_commands):
+                return MarketIntent(kind="dominance", query_asset="btc")
+            return None
+        if command_words & price_commands:
+            if _has_only_intent_tokens(words, matches, price_commands):
+                return MarketIntent(kind="price", query_asset=asset)
+            return None
+        if command_words & status_commands:
+            if asset in CRYPTO_IDS and _has_only_intent_tokens(words, matches, status_commands):
+                return MarketIntent(kind="status", query_asset=asset)
+            return None
+        if len(words) <= 3 and len(matches) == 1 and asset in CRYPTO_IDS and _has_only_intent_tokens(words, matches, set()):
+            return MarketIntent(kind="price", query_asset=asset)
+
     return None
+
 
 
 class MarketRateService:
