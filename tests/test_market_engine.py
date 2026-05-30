@@ -1,3 +1,4 @@
+import asyncio
 import time
 import unittest
 from unittest.mock import Mock, patch
@@ -51,6 +52,25 @@ class MarketEngineParserTests(unittest.TestCase):
         self.assertEqual(parse_market_intent("قیمت بیت کوین").query_asset, "btc")
         self.assertEqual((parse_market_intent("100 بیت کوین تومان").source, parse_market_intent("100 بیت کوین تومان").target), ("btc", "irt"))
 
+    def test_strict_parser_rejects_natural_language_sentences(self):
+        for raw in [
+            "من امروز بیت خریدم",
+            "من امروز btc خریدم",
+            "please send dollar invoice",
+            "این trx برای تست است",
+        ]:
+            with self.subTest(raw=raw):
+                self.assertIsNone(parse_market_intent(raw))
+
+    def test_strict_parser_rejects_multi_intent_collisions(self):
+        for raw in ["btc trx", "btc dollar trx", "100 btc eth trx", "قیمت btc trx"]:
+            with self.subTest(raw=raw):
+                self.assertIsNone(parse_market_intent(raw))
+
+    def test_alias_normalization_handles_arabic_variants_and_zero_width(self):
+        self.assertEqual(parse_market_intent("قیمت بیت‌کوین").query_asset, "btc")
+        self.assertEqual(parse_market_intent("۱۰۰ تتر تومان").target, "irt")
+
 
 class MarketEngineRenderTests(unittest.TestCase):
     def setUp(self):
@@ -97,10 +117,37 @@ class MarketEngineAdminSupportTests(unittest.TestCase):
     def test_cache_status_reports_fresh_usable_cache(self):
         data = {}
         settings = merge_market_settings(data)
-        status = cache_status({"updated_at": int(time.time()), "rates_usd": {"usd": 1.0}}, settings)
+        status = cache_status({"updated_at": int(time.time()), "rates_usd": {"usd": 1.0, "trx": 0.12}}, settings)
         self.assertTrue(status["fresh"])
         self.assertTrue(status["usable"])
-        self.assertEqual(status["rate_count"], 1)
+        self.assertEqual(status["rate_count"], 2)
+        self.assertEqual(status["external_rate_count"], 1)
+
+    def test_cache_status_rejects_manual_only_rates_as_unusable(self):
+        data = {}
+        settings = merge_market_settings(data)
+        status = cache_status({"updated_at": int(time.time()), "rates_usd": {"usd": 1.0, "usdt": 1.0, "stars": 0.03}}, settings)
+        self.assertFalse(status["fresh"])
+        self.assertFalse(status["usable"])
+        self.assertEqual(status["external_rate_count"], 0)
+
+    def test_refresh_replaces_old_rates_instead_of_marking_stale_rates_fresh(self):
+        class Store:
+            def __init__(self):
+                self.value = {"updated_at": int(time.time()) - 5000, "rates_usd": {"usd": 1.0, "btc": 70000.0}}
+            def get_json(self, key, default):
+                return self.value
+            def set_json(self, key, value):
+                self.value = value
+
+        async def run_refresh():
+            service = MarketRateService(Store())
+            service._fetch_rates = Mock(return_value={"rates_usd": {"usd": 1.0, "eur": 1.1}, "meta": {"fiat": {"source": "test"}}})
+            return await service.refresh({"request_timeout_seconds": 2})
+
+        cache = asyncio.run(run_refresh())
+        self.assertNotIn("btc", cache["rates_usd"])
+        self.assertIn("eur", cache["rates_usd"])
 
     def test_help_text_includes_admin_section_when_requested(self):
         text = market_help_text(is_admin=True)

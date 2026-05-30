@@ -73,6 +73,7 @@ def default_market_settings() -> dict[str, Any]:
     return {
         "market_engine_enabled": False,
         "market_api_enabled": True,
+        "market_process_edited_messages": False,
         "coingecko_enabled": True,
         "exchangerate_enabled": True,
         "cache_ttl_seconds": int(os.getenv("MARKET_CACHE_TTL_SECONDS", "60") or 60),
@@ -96,6 +97,7 @@ def merge_market_settings(data: dict[str, Any]) -> dict[str, Any]:
         raw.setdefault(key, value)
     raw["market_engine_enabled"] = bool(raw.get("market_engine_enabled", False))
     raw["market_api_enabled"] = bool(raw.get("market_api_enabled", True))
+    raw["market_process_edited_messages"] = bool(raw.get("market_process_edited_messages", False))
     raw["coingecko_enabled"] = bool(raw.get("coingecko_enabled", True))
     raw["exchangerate_enabled"] = bool(raw.get("exchangerate_enabled", True))
     raw["cache_ttl_seconds"] = max(30, min(int(raw.get("cache_ttl_seconds") or 60), 3600))
@@ -132,7 +134,13 @@ def normalize_number(value: str) -> float | None:
 
 def normalize_text(text: str) -> str:
     value = str(text or "").translate(PERSIAN_DIGITS).casefold()
-    value = value.replace("٫", ".").replace("٬", ",")
+    value = (
+        value.replace("ي", "ی")
+        .replace("ك", "ک")
+        .replace("‌", " ")
+        .replace("٫", ".")
+        .replace("٬", ",")
+    )
     value = re.sub(r"\$", " $ ", value)
     value = re.sub(r"([0-9][0-9,]*(?:\.[0-9]+)?)(?=[^\W\d_\$])", r"\1 ", value, flags=re.UNICODE)
     value = re.sub(r"(?<=[^\W\d_])([0-9])", r" \1", value, flags=re.UNICODE)
@@ -148,9 +156,13 @@ def normalize_asset(value: str | None) -> str | None:
 
 
 def extract_assets(words: list[str]) -> list[str]:
-    assets: list[str] = []
+    return [asset for asset, _, _ in extract_asset_matches(words)]
+
+
+def extract_asset_matches(words: list[str]) -> list[tuple[str, int, int]]:
+    matches: list[tuple[str, int, int]] = []
     idx = 0
-    max_alias_words = max(len(alias.split()) for alias in ASSET_ALIASES)
+    max_alias_words = max(len(normalize_text(alias).split()) for alias in ASSET_ALIASES)
     while idx < len(words):
         matched: str | None = None
         matched_len = 0
@@ -162,11 +174,40 @@ def extract_assets(words: list[str]) -> list[str]:
                 matched_len = size
                 break
         if matched:
-            assets.append(matched)
+            matches.append((matched, idx, idx + matched_len))
             idx += matched_len
         else:
             idx += 1
-    return assets
+    return matches
+
+
+def _unique_in_order(values: list[str]) -> list[str]:
+    unique: list[str] = []
+    for value in values:
+        if value not in unique:
+            unique.append(value)
+    return unique
+
+
+def _asset_tokens(words: list[str], matches: list[tuple[str, int, int]]) -> set[int]:
+    tokens: set[int] = set()
+    for _, start, end in matches:
+        tokens.update(range(start, end))
+    return tokens
+
+
+def _number_tokens(words: list[str]) -> set[int]:
+    return {idx for idx, word in enumerate(words) if normalize_number(word) is not None}
+
+
+def _has_only_intent_tokens(words: list[str], matches: list[tuple[str, int, int]], allowed_words: set[str]) -> bool:
+    asset_tokens = _asset_tokens(words, matches)
+    number_tokens = _number_tokens(words)
+    for idx, word in enumerate(words):
+        if idx in asset_tokens or idx in number_tokens or word in allowed_words:
+            continue
+        return False
+    return True
 
 
 def parse_market_intent(text: str) -> MarketIntent | None:
@@ -174,37 +215,69 @@ def parse_market_intent(text: str) -> MarketIntent | None:
     if not normalized or len(normalized) > 160:
         return None
     words = normalized.split()
-    assets = extract_assets(words)
+    if len(words) > 8:
+        return None
+
+    matches = extract_asset_matches(words)
+    assets = [asset for asset, _, _ in matches]
+    unique_assets = _unique_in_order(assets)
     amount: float | None = None
     for word in words:
         amount = normalize_number(word)
         if amount is not None:
             break
 
-    if normalized in {"fear", "fear greed", "fear & greed", "ترس", "طمع", "شاخص ترس"}:
+    price_commands = {"price", "قیمت"}
+    status_commands = {"status", "today", "وضعیت", "امروز"}
+    dominance_commands = {"dominance", "دامیننس"}
+
+    if normalized in {"fear", "fear greed", "fear & greed", "ترس", "طمع", "شاخص ترس"}:  # exact commands only
         return MarketIntent(kind="fear_greed")
-    if normalized in {"trend", "trends", "ترند", "top gainers", "gainers"}:
+    if normalized in {"trend", "trends", "ترند", "top gainers", "gainers"}:  # exact commands only
         return MarketIntent(kind="trending")
-    if "dominance" in words or "دامیننس" in words:
-        if "btc" in assets:
-            return MarketIntent(kind="dominance", query_asset="btc")
-    if any(w in words for w in {"price", "قیمت"}) and assets:
-        return MarketIntent(kind="price", query_asset=assets[0])
-    if any(w in words for w in {"status", "today", "وضعیت", "امروز"}) and assets:
-        return MarketIntent(kind="status", query_asset=assets[0])
-    if amount is None and len(words) <= 3 and assets and assets[0] in CRYPTO_IDS:
-        return MarketIntent(kind="price", query_asset=assets[0])
+
+    # Conversion requests must be compact, intentional commands: an amount plus one
+    # or two known assets and no natural-language filler. This avoids firing on
+    # ordinary sentences that merely contain market keywords.
     if amount is not None and assets:
+        if len(unique_assets) > 2:
+            return None
+        if not _has_only_intent_tokens(words, matches, set()):
+            return None
         source = assets[0]
         target = next((asset for asset in assets[1:] if asset != source), None)
         return MarketIntent(kind="conversion", amount=amount, source=source, target=target)
+
+    if assets:
+        if len(unique_assets) != 1:
+            return None
+        asset = unique_assets[0]
+        command_words = set(words) - {word for _, start, end in matches for word in words[start:end]}
+        if command_words & dominance_commands:
+            if asset == "btc" and _has_only_intent_tokens(words, matches, dominance_commands):
+                return MarketIntent(kind="dominance", query_asset="btc")
+            return None
+        if command_words & price_commands:
+            if _has_only_intent_tokens(words, matches, price_commands):
+                return MarketIntent(kind="price", query_asset=asset)
+            return None
+        if command_words & status_commands:
+            if asset in CRYPTO_IDS and _has_only_intent_tokens(words, matches, status_commands):
+                return MarketIntent(kind="status", query_asset=asset)
+            return None
+        if len(words) <= 3 and len(matches) == 1 and asset in CRYPTO_IDS and _has_only_intent_tokens(words, matches, set()):
+            return MarketIntent(kind="price", query_asset=asset)
+
     return None
+
 
 
 class MarketRateService:
     def __init__(self, store: JsonStore | None = None):
         self.store = store
         self._stop = asyncio.Event()
+        self._refresh_lock = asyncio.Lock()
+        self._last_refresh_started_at = 0
 
     def bind_store(self, store: JsonStore) -> None:
         self.store = store
@@ -213,11 +286,27 @@ class MarketRateService:
         if not self.store:
             return {}
         cache = self.store.get_json(CACHE_KEY, {})
-        return cache if isinstance(cache, dict) else {}
+        return dict(cache) if isinstance(cache, dict) else {}
 
     def write_cache(self, cache: dict[str, Any]) -> None:
         if self.store:
-            self.store.set_json(CACHE_KEY, cache)
+            self.store.set_json(CACHE_KEY, dict(cache))
+
+    def cache_is_fresh(self, settings: dict[str, Any]) -> bool:
+        status = cache_status(self.read_cache(), settings)
+        return bool(status.get("fresh") and status.get("usable"))
+
+    async def refresh_if_needed(self, settings: dict[str, Any], *, force: bool = False) -> dict[str, Any]:
+        if not settings.get("market_api_enabled", True):
+            return self.read_cache()
+        if not force and self.cache_is_fresh(settings):
+            return self.read_cache()
+        if self._refresh_lock.locked() and not force:
+            return self.read_cache()
+        async with self._refresh_lock:
+            if not force and self.cache_is_fresh(settings):
+                return self.read_cache()
+            return await self.refresh(settings, _locked=True)
 
     async def run_forever(self, settings_getter) -> None:
         await asyncio.sleep(2)
@@ -231,25 +320,20 @@ class MarketRateService:
             except asyncio.TimeoutError:
                 pass
 
-    async def refresh(self, settings: dict[str, Any]) -> dict[str, Any]:
+    async def refresh(self, settings: dict[str, Any], _locked: bool = False) -> dict[str, Any]:
+        if not _locked:
+            async with self._refresh_lock:
+                return await self.refresh(settings, _locked=True)
+        self._last_refresh_started_at = int(time.time())
         try:
-            payload = await asyncio.to_thread(self._fetch_rates, settings)
-            old = self.read_cache()
-            merged_rates = dict(old.get("rates_usd", {}) if isinstance(old.get("rates_usd"), dict) else {})
-            merged_rates.update(payload.get("rates_usd", {}) if isinstance(payload.get("rates_usd"), dict) else {})
-            old_meta = old.get("meta", {}) if isinstance(old.get("meta"), dict) else {}
-            new_meta = payload.get("meta", {}) if isinstance(payload.get("meta"), dict) else {}
-            merged_meta = dict(old_meta)
-            for key, value in new_meta.items():
-                if isinstance(value, dict) and isinstance(merged_meta.get(key), dict):
-                    nested = dict(merged_meta[key])
-                    nested.update({k: v for k, v in value.items() if v not in ({}, [], None)})
-                    merged_meta[key] = nested
-                elif value not in ({}, [], None):
-                    merged_meta[key] = value
-            merged = {**old, **payload, "rates_usd": merged_rates, "meta": merged_meta, "updated_at": int(time.time()), "last_error": None}
-            self.write_cache(merged)
-            return merged
+            timeout = float(settings.get("request_timeout_seconds", 8) or 8) + 5.0
+            payload = await asyncio.wait_for(asyncio.to_thread(self._fetch_rates, settings), timeout=timeout)
+            rates = payload.get("rates_usd", {}) if isinstance(payload.get("rates_usd"), dict) else {}
+            if not any(asset not in {"usd", "usdt", "stars"} for asset in rates):
+                raise RuntimeError("refresh returned no external market rates")
+            cache = {**payload, "rates_usd": dict(rates), "meta": payload.get("meta", {}) if isinstance(payload.get("meta"), dict) else {}, "updated_at": int(time.time()), "last_error": None}
+            self.write_cache(cache)
+            return cache
         except Exception as exc:
             logging.warning("market_refresh_failed reason=%s", safe_error(exc))
             cache = self.read_cache()
@@ -442,7 +526,7 @@ def format_number(value: float, asset: str | None = None) -> str:
 
 
 def asset_label(asset: str) -> str:
-    return {"irt": "toman", "irr": "rial", "usd": "dollar", "eur": "euro", "stars": "STARS"}.get(asset, asset.upper())
+    return {"irt": "تومان", "irr": "ریال", "usd": "USD", "eur": "EUR", "stars": "Stars", "usdt": "USDT"}.get(asset, asset.upper())
 
 
 def format_timestamp(ts: int) -> str:
@@ -458,7 +542,7 @@ def render_conversion(intent: MarketIntent, settings: dict[str, Any], cache: dic
     if intent.amount is None or not intent.source:
         return None
     targets = [intent.target] if intent.target else [a for a in settings.get("default_conversion_targets", DEFAULT_CONVERSION_TARGETS) if a != intent.source]
-    lines = [f"✨ {format_number(intent.amount, intent.source)} {asset_label(intent.source)} :", ""]
+    lines = [f"✨ تبدیل {format_number(intent.amount, intent.source)} {asset_label(intent.source)}", ""]
     results = []
     for target in targets:
         if not target or target == intent.source:
@@ -492,12 +576,12 @@ def render_price(intent: MarketIntent, settings: dict[str, Any], cache: dict[str
     change = (crypto_meta.get("24h_change") or {}).get(asset)
     high = (crypto_meta.get("24h_high") or {}).get(asset)
     low = (crypto_meta.get("24h_low") or {}).get(asset)
-    lines = [f"🪙 {asset_label(asset)}", f"💵 ${format_number(float(usd), 'usd')}"]
+    lines = [f"🪙 قیمت {asset_label(asset)}", f"💵 {format_number(float(usd), 'usd')} USD"]
     if isinstance(change, (int, float)):
         arrow = "📈" if change >= 0 else "📉"
         lines.append(f"{arrow} 24h: {change:+.2f}%")
     if isinstance(high, (int, float)) and isinstance(low, (int, float)):
-        lines.append(f"🔼 High: ${format_number(float(high), 'usd')} | 🔽 Low: ${format_number(float(low), 'usd')}")
+        lines.append(f"🔼 High: {format_number(float(high), 'usd')} USD | 🔽 Low: {format_number(float(low), 'usd')} USD")
     if age > 90:
         lines.append("⚠️ نرخ از کش قبلی خوانده شد.")
     lines.append(f"⏱ {format_timestamp(int(cache.get('updated_at') or 0))}")
@@ -543,7 +627,7 @@ def render_fear_greed(cache: dict[str, Any]) -> str:
 def unavailable_message(cache: dict[str, Any]) -> str:
     err = cache.get("last_error") if isinstance(cache, dict) else None
     suffix = f"\nجزئیات امن خطا: {err}" if err else ""
-    return "⚠️ نرخ معتبر فعلاً در کش بازار موجود نیست. لطفاً کمی بعد دوباره تلاش کنید." + suffix
+    return "⚠️ نرخ معتبر و تازه فعلاً در کش بازار موجود نیست. لطفاً چند لحظه بعد دوباره تلاش کنید." + suffix
 
 
 def render_market_response(text: str, settings: dict[str, Any], cache: dict[str, Any]) -> str | None:
@@ -607,14 +691,17 @@ def cache_status(cache: dict[str, Any], settings: dict[str, Any]) -> dict[str, A
     age = max(0, int(time.time()) - updated_at) if updated_at else None
     rates = cache.get("rates_usd") if isinstance(cache, dict) else None
     rate_count = len(rates) if isinstance(rates, dict) else 0
+    external_rate_count = len([asset for asset in rates if asset not in {"usd", "usdt", "stars"}]) if isinstance(rates, dict) else 0
     ttl = int(settings.get("cache_ttl_seconds", 60) or 60)
     stale_ttl = int(settings.get("stale_ttl_seconds", 86400) or 86400)
+    usable = age is not None and age <= stale_ttl and external_rate_count > 0
     return {
         "updated_at": updated_at,
         "age": age,
         "rate_count": rate_count,
-        "fresh": age is not None and age <= ttl,
-        "usable": age is not None and age <= stale_ttl and rate_count > 0,
+        "external_rate_count": external_rate_count,
+        "fresh": usable and age <= ttl,
+        "usable": usable,
         "last_error": cache.get("last_error") if isinstance(cache, dict) else None,
     }
 
