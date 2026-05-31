@@ -70,6 +70,9 @@ class MarketEngineParserTests(unittest.TestCase):
     def test_alias_normalization_handles_arabic_variants_and_zero_width(self):
         self.assertEqual(parse_market_intent("قیمت بیت‌کوین").query_asset, "btc")
         self.assertEqual(parse_market_intent("۱۰۰ تتر تومان").target, "irt")
+        self.assertEqual(parse_market_intent("لیر").query_asset, "try")
+        self.assertEqual(parse_market_intent("روبل").query_asset, "rub")
+        self.assertEqual(parse_market_intent("۱ لیر").source, "try")
 
 
 class MarketEngineRenderTests(unittest.TestCase):
@@ -81,7 +84,9 @@ class MarketEngineRenderTests(unittest.TestCase):
             "rates_usd": {
                 "usd": 1.0,
                 "eur": 1.1,
-                "irt": 0.00002,
+                "try": 0.02177731,
+                "rub": 0.01387425,
+                "irt": 1 / 170820,
                 "trx": 0.12,
                 "ton": 3.0,
                 "stars": 0.03,
@@ -106,6 +111,11 @@ class MarketEngineRenderTests(unittest.TestCase):
         self.assertIn("Top gainers", render_market_response("top gainers", self.settings, self.cache))
         self.assertIn("52.30%", render_market_response("btc dominance", self.settings, self.cache))
         self.assertIn("70/100", render_market_response("fear greed", self.settings, self.cache))
+
+    def test_fiat_price_uses_cached_toman_rate(self):
+        self.assertIn("3,720 toman", render_market_response("لیر", self.settings, self.cache))
+        self.assertIn("2,370 toman", render_market_response("روبل", self.settings, self.cache))
+        self.assertIn("$0.02177731 dollar", render_market_response("۱ لیر", self.settings, self.cache))
 
     def test_stale_cache_fails_safely(self):
         stale = dict(self.cache, updated_at=1)
@@ -164,10 +174,44 @@ class MarketEngineAdminSupportTests(unittest.TestCase):
         service = MarketRateService()
         service._fetch_coingecko = Mock(side_effect=RuntimeError("rate limited"))
         service._fetch_exchange_rates = Mock(return_value={"rates_usd": {"eur": 1.1, "irt": 0.00002}, "meta": {"source": "exchange"}})
+        service._fetch_nobitex = Mock(return_value={"rates_usd": {}, "meta": {"source": "nobitex"}})
         service._fetch_fear_greed = Mock(return_value={})
-        payload = service._fetch_rates({"coingecko_enabled": True, "exchangerate_enabled": True, "stars_unit_amount": 1000, "stars_unit_usd": 30})
+        payload = service._fetch_rates({"coingecko_enabled": True, "exchangerate_enabled": True, "nobitex_enabled": True, "stars_unit_amount": 1000, "stars_unit_usd": 30})
         self.assertIn("irt", payload["rates_usd"])
         self.assertIn("coingecko", payload["meta"]["provider_errors"])
+
+    def test_nobitex_irt_rates_override_official_irr_rates(self):
+        service = MarketRateService()
+        service._fetch_coingecko = Mock(return_value={"rates_usd": {"trx": 0.30}, "meta": {}})
+        service._fetch_exchange_rates = Mock(return_value={"rates_usd": {"irt": 0.0000075}, "meta": {"source": "exchange"}})
+        service._fetch_nobitex = Mock(return_value={"rates_usd": {"irt": 1 / 170_820, "usdt": 1.0, "trx": 59042 / 170820}, "meta": {"source": "nobitex", "24h_change": {"trx": 0.2}}})
+        service._fetch_fear_greed = Mock(return_value={})
+
+        payload = service._fetch_rates({"coingecko_enabled": True, "exchangerate_enabled": True, "nobitex_enabled": True, "stars_unit_amount": 1000, "stars_unit_usd": 30})
+
+        self.assertAlmostEqual(payload["rates_usd"]["irt"], 1 / 170_820)
+        self.assertAlmostEqual(payload["rates_usd"]["trx"], 59042 / 170820)
+        self.assertEqual(payload["meta"]["crypto"]["24h_change"]["trx"], 0.2)
+
+
+    def test_nobitex_fetch_uses_symbol_markets_for_local_crypto_rates(self):
+        service = MarketRateService()
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "status": "ok",
+            "stats": {
+                "usdt-rls": {"latest": "1708200"},
+                "trx-rls": {"latest": "590420", "dayHigh": "602220", "dayLow": "584410", "dayChange": "0.2"},
+            },
+        }
+        with patch("features.market_engine.requests.get", return_value=response) as mock_get:
+            payload = service._fetch_nobitex({}, 3)
+
+        self.assertEqual(mock_get.call_args.kwargs["params"]["srcCurrency"], "usdt,btc,eth,trx,ton")
+        self.assertAlmostEqual(payload["rates_usd"]["irt"], 1 / 170_820)
+        self.assertAlmostEqual(payload["rates_usd"]["trx"], 59042 / 170820)
+        self.assertEqual(payload["meta"]["24h_change"]["trx"], 0.2)
 
     @patch("features.market_engine.requests.get")
     def test_validate_exchangerate_key_uses_real_validation_endpoint_shape(self, mock_get):

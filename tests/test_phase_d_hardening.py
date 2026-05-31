@@ -1,3 +1,4 @@
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -49,6 +50,53 @@ class DummyContext:
     def __init__(self):
         self.bot = DummyBot()
 
+
+
+class MarketSecretBackupTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old_db = bot.db
+        self.old_env_path = bot.ENV_PATH
+        self.old_token = os.environ.get("BOT_TOKEN")
+        self.old_admin = os.environ.get("ADMIN_ID")
+        self.old_cg = os.environ.get("COINGECKO_API_KEY")
+        self.old_ex = os.environ.get("EXCHANGERATE_API_KEY")
+        bot.db = bot.DB(Path(self.tmp.name) / "bot.db")
+        bot.db.init()
+        bot.ENV_PATH = Path(self.tmp.name) / ".env"
+        os.environ["BOT_TOKEN"] = "token-for-secret-tests"
+        os.environ["ADMIN_ID"] = "42"
+
+    def tearDown(self):
+        bot.db = self.old_db
+        bot.ENV_PATH = self.old_env_path
+        for key, value in {
+            "BOT_TOKEN": self.old_token,
+            "ADMIN_ID": self.old_admin,
+            "COINGECKO_API_KEY": self.old_cg,
+            "EXCHANGERATE_API_KEY": self.old_ex,
+        }.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        self.tmp.cleanup()
+
+    def test_market_api_secrets_backup_and_restore_without_plaintext(self):
+        os.environ["COINGECKO_API_KEY"] = "cg-secret"
+        os.environ["EXCHANGERATE_API_KEY"] = "ex-secret"
+        bot.backup_market_api_secrets()
+        payload = bot.db.get_json("market_api_secrets", {})
+
+        self.assertNotIn("cg-secret", str(payload))
+        self.assertNotIn("ex-secret", str(payload))
+
+        os.environ.pop("COINGECKO_API_KEY", None)
+        os.environ.pop("EXCHANGERATE_API_KEY", None)
+        bot.restore_market_api_secrets()
+
+        self.assertEqual(os.environ["COINGECKO_API_KEY"], "cg-secret")
+        self.assertEqual(os.environ["EXCHANGERATE_API_KEY"], "ex-secret")
 
 class PhaseDCallbackLimitTests(unittest.TestCase):
     def setUp(self):
