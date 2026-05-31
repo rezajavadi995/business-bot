@@ -20,8 +20,10 @@ ASSET_ALIASES: dict[str, str] = {
     "trx": "trx", "tron": "trx", "ترون": "trx",
     "ton": "ton", "تون": "ton", "the open network": "ton",
     "usdt": "usdt", "tether": "usdt", "تتر": "usdt",
-    "usd": "usd", "dollar": "usd", "دلار": "usd", "$": "usd",
+    "usd": "usd", "dollar": "usd", "دلار": "usd", "دلار آمریکا": "usd", "$": "usd",
     "eur": "eur", "euro": "eur", "یورو": "eur",
+    "try": "try", "tl": "try", "lira": "try", "turkish lira": "try", "لیر": "try", "لیر ترکیه": "try",
+    "rub": "rub", "ruble": "rub", "rouble": "rub", "russian ruble": "rub", "روبل": "rub", "روبل روسیه": "rub",
     "irt": "irt", "toman": "irt", "tomans": "irt", "تومان": "irt", "تومن": "irt",
     "irr": "irr", "rial": "irr", "ریال": "irr",
     "stars": "stars", "star": "stars", "استارز": "stars", "استار": "stars",
@@ -34,7 +36,7 @@ CRYPTO_IDS: dict[str, str] = {
     "ton": "the-open-network",
     "usdt": "tether",
 }
-FIAT_ASSETS = {"usd", "eur", "irt", "irr"}
+FIAT_ASSETS = {"usd", "eur", "try", "rub", "irt", "irr"}
 SPECIAL_ASSETS = {"stars"}
 SUPPORTED_ASSETS = set(CRYPTO_IDS) | FIAT_ASSETS | SPECIAL_ASSETS
 DEFAULT_QUICK_ASSETS = ["btc", "eth", "trx", "ton", "usdt"]
@@ -76,6 +78,7 @@ def default_market_settings() -> dict[str, Any]:
         "market_process_edited_messages": False,
         "coingecko_enabled": True,
         "exchangerate_enabled": True,
+        "nobitex_enabled": True,
         "cache_ttl_seconds": int(os.getenv("MARKET_CACHE_TTL_SECONDS", "60") or 60),
         "stale_ttl_seconds": int(os.getenv("MARKET_STALE_TTL_SECONDS", "86400") or 86400),
         "request_timeout_seconds": float(os.getenv("MARKET_API_TIMEOUT_SECONDS", "8") or 8),
@@ -100,6 +103,7 @@ def merge_market_settings(data: dict[str, Any]) -> dict[str, Any]:
     raw["market_process_edited_messages"] = bool(raw.get("market_process_edited_messages", False))
     raw["coingecko_enabled"] = bool(raw.get("coingecko_enabled", True))
     raw["exchangerate_enabled"] = bool(raw.get("exchangerate_enabled", True))
+    raw["nobitex_enabled"] = bool(raw.get("nobitex_enabled", True))
     raw["cache_ttl_seconds"] = max(30, min(int(raw.get("cache_ttl_seconds") or 60), 3600))
     raw["stale_ttl_seconds"] = max(raw["cache_ttl_seconds"], min(int(raw.get("stale_ttl_seconds") or 86400), 24 * 3600))
     raw["request_timeout_seconds"] = max(2.0, min(float(raw.get("request_timeout_seconds") or 8), 20.0))
@@ -265,7 +269,7 @@ def parse_market_intent(text: str) -> MarketIntent | None:
             if asset in CRYPTO_IDS and _has_only_intent_tokens(words, matches, status_commands):
                 return MarketIntent(kind="status", query_asset=asset)
             return None
-        if len(words) <= 3 and len(matches) == 1 and asset in CRYPTO_IDS and _has_only_intent_tokens(words, matches, set()):
+        if len(words) <= 3 and len(matches) == 1 and asset in SUPPORTED_ASSETS and _has_only_intent_tokens(words, matches, set()):
             return MarketIntent(kind="price", query_asset=asset)
 
     return None
@@ -346,6 +350,7 @@ class MarketRateService:
         timeout = float(settings.get("request_timeout_seconds", 8) or 8)
         crypto: dict[str, Any] = {}
         fiat: dict[str, Any] = {}
+        local: dict[str, Any] = {}
         errors: dict[str, str] = {}
         if settings.get("coingecko_enabled", True):
             try:
@@ -359,11 +364,27 @@ class MarketRateService:
             except Exception as exc:
                 errors["exchangerate"] = safe_error(exc)
                 logging.warning("market_provider_failed provider=exchangerate reason=%s", errors["exchangerate"])
+        if settings.get("nobitex_enabled", True):
+            try:
+                local = self._fetch_nobitex(settings, timeout)
+            except Exception as exc:
+                errors["nobitex"] = safe_error(exc)
+                logging.warning("market_provider_failed provider=nobitex reason=%s", errors["nobitex"])
         rates_usd: dict[str, float] = {"usd": 1.0}
         sentiment = self._fetch_fear_greed(timeout)
-        meta: dict[str, Any] = {"crypto": crypto.get("meta", {}), "fiat": fiat.get("meta", {}), "fear_greed": sentiment, "provider_errors": errors}
+        crypto_meta = dict(crypto.get("meta", {})) if isinstance(crypto.get("meta", {}), dict) else {}
+        local_meta = local.get("meta", {}) if isinstance(local.get("meta", {}), dict) else {}
+        for key in ("24h_change", "24h_high", "24h_low"):
+            merged = dict(crypto_meta.get(key, {})) if isinstance(crypto_meta.get(key, {}), dict) else {}
+            local_values = local_meta.get(key, {}) if isinstance(local_meta.get(key, {}), dict) else {}
+            merged.update(local_values)
+            crypto_meta[key] = merged
+        if local_meta.get("source"):
+            crypto_meta["local_source"] = local_meta.get("source")
+        meta: dict[str, Any] = {"crypto": crypto_meta, "fiat": fiat.get("meta", {}), "local": local_meta, "fear_greed": sentiment, "provider_errors": errors}
         rates_usd.update(crypto.get("rates_usd", {}))
         rates_usd.update(fiat.get("rates_usd", {}))
+        rates_usd.update(local.get("rates_usd", {}))
         stars_usd = stars_unit_usd(settings)
         if stars_usd > 0:
             rates_usd["stars"] = stars_usd
@@ -459,22 +480,84 @@ class MarketRateService:
 
     def _fetch_exchange_rates(self, settings: dict[str, Any], timeout: float) -> dict[str, Any]:
         key = os.getenv("EXCHANGERATE_API_KEY", "").strip()
-        if not key:
-            return {"rates_usd": {}, "meta": {"source": "exchangerate", "status": "missing_key"}}
-        url = f"https://v6.exchangerate-api.com/v6/{key}/latest/USD"
+        if key:
+            url = f"https://v6.exchangerate-api.com/v6/{key}/latest/USD"
+        else:
+            url = "https://open.er-api.com/v6/latest/USD"
         response = requests.get(url, timeout=timeout)
         response.raise_for_status()
         body = response.json()
-        rates = body.get("conversion_rates", {}) if isinstance(body, dict) else {}
+        rates = body.get("conversion_rates") or body.get("rates") or {} if isinstance(body, dict) else {}
         out: dict[str, float] = {"usd": 1.0}
-        eur = rates.get("EUR")
-        irr = rates.get("IRR")
-        if isinstance(eur, (int, float)) and eur > 0:
-            out["eur"] = 1.0 / float(eur)
+        for code, asset in {"EUR": "eur", "TRY": "try", "RUB": "rub"}.items():
+            rate = rates.get(code) if isinstance(rates, dict) else None
+            if isinstance(rate, (int, float)) and rate > 0:
+                out[asset] = 1.0 / float(rate)
+        irr = rates.get("IRR") if isinstance(rates, dict) else None
         if isinstance(irr, (int, float)) and irr > 0:
             out["irr"] = 1.0 / float(irr)
             out["irt"] = 10.0 / float(irr)
-        return {"rates_usd": out, "meta": {"source": "exchangerate", "result": body.get("result")}}
+        source = "exchangerate" if key else "open-er-api"
+        return {"rates_usd": out, "meta": {"source": source, "result": body.get("result") if isinstance(body, dict) else None}}
+
+    def _fetch_nobitex(self, settings: dict[str, Any], timeout: float) -> dict[str, Any]:
+        src = ",".join(["usdt", *CRYPTO_IDS.values()])
+        response = requests.get(
+            "https://apiv2.nobitex.ir/market/stats",
+            params={"srcCurrency": src, "dstCurrency": "rls"},
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        body = response.json()
+        stats = body.get("stats", {}) if isinstance(body, dict) else {}
+        rates: dict[str, float] = {}
+        changes: dict[str, float] = {}
+        highs: dict[str, float] = {}
+        lows: dict[str, float] = {}
+
+        usdt_toman = self._nobitex_toman(stats, "usdt")
+        if not usdt_toman:
+            return {"rates_usd": {}, "meta": {"source": "nobitex", "status": body.get("status") if isinstance(body, dict) else None}}
+        rates["irr"] = 1.0 / (usdt_toman * 10.0)
+        rates["irt"] = 1.0 / usdt_toman
+        rates["usdt"] = 1.0
+
+        id_to_symbol = {coin_id: symbol for symbol, coin_id in CRYPTO_IDS.items()}
+        for coin_id, symbol in id_to_symbol.items():
+            if symbol == "usdt":
+                continue
+            toman = self._nobitex_toman(stats, coin_id)
+            if not toman:
+                continue
+            rates[symbol] = toman / usdt_toman
+            high_toman = self._nobitex_toman(stats, coin_id, field="dayHigh")
+            low_toman = self._nobitex_toman(stats, coin_id, field="dayLow")
+            if high_toman:
+                highs[symbol] = high_toman / usdt_toman
+            if low_toman:
+                lows[symbol] = low_toman / usdt_toman
+            change = self._nobitex_number(stats, coin_id, "dayChange")
+            if change is not None:
+                changes[symbol] = change
+        return {"rates_usd": rates, "meta": {"source": "nobitex", "quote": "USDTIRT", "usdt_toman": usdt_toman, "24h_change": changes, "24h_high": highs, "24h_low": lows}}
+
+    @staticmethod
+    def _nobitex_number(stats: dict[str, Any], source: str, field: str) -> float | None:
+        if not isinstance(stats, dict):
+            return None
+        row = stats.get(f"{source}-rls") or stats.get(f"{source}-irt") or stats.get(f"{source.upper()}IRT")
+        if not isinstance(row, dict):
+            return None
+        try:
+            value = float(row.get(field))
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    @classmethod
+    def _nobitex_toman(cls, stats: dict[str, Any], source: str, field: str = "latest") -> float | None:
+        value = cls._nobitex_number(stats, source, field)
+        return value / 10.0 if value else None
 
 
 def build_top_gainers(changes: dict[str, float]) -> list[dict[str, Any]]:
@@ -517,6 +600,9 @@ def format_number(value: float, asset: str | None = None) -> str:
         decimals = 6 if abs(value) < 100 else 3
     if asset in {"irt", "irr"}:
         decimals = 0
+    if asset == "usd":
+        abs_value = abs(value)
+        decimals = 8 if abs_value < 0.1 else 4 if abs_value < 1 else 3 if abs_value < 10 else 2
     if asset == "stars":
         decimals = 0
     text = f"{value:,.{decimals}f}"
@@ -526,38 +612,81 @@ def format_number(value: float, asset: str | None = None) -> str:
 
 
 def asset_label(asset: str) -> str:
-    return {"irt": "تومان", "irr": "ریال", "usd": "USD", "eur": "EUR", "stars": "Stars", "usdt": "USDT"}.get(asset, asset.upper())
+    return {"irt": "تومان", "irr": "ریال", "usd": "دلار آمریکا", "eur": "یورو", "try": "لیر ترکیه", "rub": "روبل روسیه", "stars": "Stars", "usdt": "USDT"}.get(asset, asset.upper())
+
+
+def _gregorian_to_jalali(year: int, month: int, day: int) -> tuple[int, int, int]:
+    g_days_in_month = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    j_days_in_month = [31, 31, 31, 31, 31, 31, 30, 30, 30, 30, 30, 29]
+    gy = year - 1600
+    gm = month - 1
+    gd = day - 1
+    g_day_no = 365 * gy + (gy + 3) // 4 - (gy + 99) // 100 + (gy + 399) // 400
+    for idx in range(gm):
+        g_day_no += g_days_in_month[idx]
+    if gm > 1 and ((gy + 1600) % 4 == 0 and ((gy + 1600) % 100 != 0 or (gy + 1600) % 400 == 0)):
+        g_day_no += 1
+    g_day_no += gd
+    j_day_no = g_day_no - 79
+    j_np = j_day_no // 12053
+    j_day_no %= 12053
+    jy = 979 + 33 * j_np + 4 * (j_day_no // 1461)
+    j_day_no %= 1461
+    if j_day_no >= 366:
+        jy += (j_day_no - 1) // 365
+        j_day_no = (j_day_no - 1) % 365
+    jm = 0
+    while jm < 11 and j_day_no >= j_days_in_month[jm]:
+        j_day_no -= j_days_in_month[jm]
+        jm += 1
+    return jy, jm + 1, j_day_no + 1
 
 
 def format_timestamp(ts: int) -> str:
     if not ts:
         return "نامشخص"
     try:
-        return datetime.fromtimestamp(ts, ZoneInfo("Asia/Tehran")).strftime("%Y/%m/%d | %H:%M:%S")
+        dt = datetime.fromtimestamp(ts, ZoneInfo("Asia/Tehran"))
     except Exception:
-        return datetime.utcfromtimestamp(ts).strftime("%Y/%m/%d | %H:%M:%S")
+        dt = datetime.utcfromtimestamp(ts)
+    jy, jm, jd = _gregorian_to_jalali(dt.year, dt.month, dt.day)
+    return f"{jy:04d}/{jm:02d}/{jd:02d} | {dt:%H:%M:%S}"
 
 
 def render_conversion(intent: MarketIntent, settings: dict[str, Any], cache: dict[str, Any]) -> str | None:
     if intent.amount is None or not intent.source:
         return None
-    targets = [intent.target] if intent.target else [a for a in settings.get("default_conversion_targets", DEFAULT_CONVERSION_TARGETS) if a != intent.source]
-    lines = [f"✨ تبدیل {format_number(intent.amount, intent.source)} {asset_label(intent.source)}", ""]
-    results = []
-    for target in targets:
-        if not target or target == intent.source:
-            continue
-        result = convert_amount(cache, intent.amount, intent.source, target, int(settings.get("stale_ttl_seconds", 3600)))
-        if result:
-            results.append(result)
-            prefix = "💸" if target in {"irt", "irr"} else "💵" if target in {"usd", "eur"} else "🌀"
-            lines.append(f"{prefix} {format_number(result.value, target)} {asset_label(target)}")
-    if not results:
+    stale_ttl = int(settings.get("stale_ttl_seconds", 3600))
+
+    if intent.target:
+        result = convert_amount(cache, intent.amount, intent.source, intent.target, stale_ttl)
+        if not result:
+            return unavailable_message(cache)
+        lines = [f"🔄 {format_number(intent.amount, intent.source)} {intent.source} = {format_number(result.value, intent.target)} {asset_label(intent.target)}"]
+        toman = convert_amount(cache, intent.amount, intent.source, "irt", stale_ttl)
+        usd_value = intent.amount * result.source_usd
+        if toman:
+            lines.append(f"💸 {format_number(toman.value, 'irt')} toman")
+        lines.append(f"💵 ${format_number(usd_value, 'usd')} dollar")
+        if result.stale:
+            lines.append("⚠️ نرخ‌ها از کش قبلی استفاده شده‌اند.")
+        lines.append(f"🪙 {format_timestamp(result.updated_at)}")
+        return "\n".join(lines)
+
+    toman = convert_amount(cache, intent.amount, intent.source, "irt", stale_ttl)
+    usd = convert_amount(cache, intent.amount, intent.source, "usd", stale_ttl)
+    if not toman and not usd:
         return unavailable_message(cache)
-    first = results[0]
-    if first.stale:
-        lines.append("\n⚠️ نرخ‌ها از کش قبلی استفاده شده‌اند.")
-    lines.append(f"\n🪙 {format_timestamp(first.updated_at)}")
+    lines = [f"✨ {format_number(intent.amount, intent.source)} {asset_label(intent.source)} :"]
+    if toman:
+        lines.append(f"💸 {format_number(toman.value, 'irt')} toman")
+    if usd:
+        lines.append(f"💵 ${format_number(usd.value, 'usd')} dollar")
+    first = toman or usd
+    if first and first.stale:
+        lines.append("⚠️ نرخ‌ها از کش قبلی استفاده شده‌اند.")
+    if first:
+        lines.append(f"🪙 {format_timestamp(first.updated_at)}")
     return "\n".join(lines)
 
 
@@ -576,15 +705,24 @@ def render_price(intent: MarketIntent, settings: dict[str, Any], cache: dict[str
     change = (crypto_meta.get("24h_change") or {}).get(asset)
     high = (crypto_meta.get("24h_high") or {}).get(asset)
     low = (crypto_meta.get("24h_low") or {}).get(asset)
-    lines = [f"🪙 قیمت {asset_label(asset)}", f"💵 {format_number(float(usd), 'usd')} USD"]
+    irt = rates.get("irt") if isinstance(rates, dict) else None
+    toman = float(usd) / float(irt) if isinstance(irt, (int, float)) and irt > 0 else None
+    lines = [f"✨ 1 {asset_label(asset)} :"]
+    if toman is not None:
+        lines.append(f"💸 {format_number(toman, 'irt')} toman")
+    lines.append(f"💵 ${format_number(float(usd), 'usd')} dollar")
     if isinstance(change, (int, float)):
-        arrow = "📈" if change >= 0 else "📉"
-        lines.append(f"{arrow} 24h: {change:+.2f}%")
+        arrow = "↗️" if change >= 0 else "↘️"
+        lines.append(f"{'🟢' if change >= 0 else '🔴'} {abs(change):.2f}%{arrow}")
+        lines.append(f"24h: {change:+.2f}%")
     if isinstance(high, (int, float)) and isinstance(low, (int, float)):
-        lines.append(f"🔼 High: {format_number(float(high), 'usd')} USD | 🔽 Low: {format_number(float(low), 'usd')} USD")
+        lines.append("High & Low 📉")
+        if isinstance(irt, (int, float)) and irt > 0:
+            lines.append(f"💸 {format_number(float(high) / float(irt), 'irt')} / {format_number(float(low) / float(irt), 'irt')} toman")
+        lines.append(f"💵 {format_number(float(high), 'usd')} / {format_number(float(low), 'usd')} dollar")
     if age > 90:
         lines.append("⚠️ نرخ از کش قبلی خوانده شد.")
-    lines.append(f"⏱ {format_timestamp(int(cache.get('updated_at') or 0))}")
+    lines.append(f"🪙 {format_timestamp(int(cache.get('updated_at') or 0))}")
     return "\n".join(lines)
 
 
