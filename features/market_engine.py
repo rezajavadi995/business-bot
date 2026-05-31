@@ -697,7 +697,6 @@ def render_conversion(intent: MarketIntent, settings: dict[str, Any], cache: dic
         lines.append(f"🇮🇷 تومان: <b>{format_number(toman.value, 'irt')}</b>")
     if usd:
         lines.append(f"💵 دلار: <b>${format_number(usd.value, 'usd')}</b>")
-        lines.append(f"<code>${format_number(usd.value, 'usd')} dollar</code>")
     first = toman or usd
     if first and first.stale:
         lines.append("⚠️ <i>نرخ از کش قبلی خوانده شده است.</i>")
@@ -727,7 +726,6 @@ def render_price(intent: MarketIntent, settings: dict[str, Any], cache: dict[str
     lines.append(f"💵 دلاری: <b>${format_number(float(usd), 'usd')}</b>")
     if toman is not None:
         lines.append(f"🇮🇷 تومانی: <b>{format_number(toman, 'irt')}</b>")
-        lines.append(f"<code>{format_number(toman, 'irt')} toman</code>")
     lines.append("</blockquote>")
     if isinstance(change, (int, float)):
         direction = "رشد" if change >= 0 else "افت"

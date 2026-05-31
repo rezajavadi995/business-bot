@@ -463,6 +463,7 @@ def load_data() -> dict[str, Any]:
     if not isinstance(data.get("welcome_text"), str):
         data["welcome_text"] = str(data.get("welcome_text") or d["welcome_text"])
     merge_market_settings(data)
+    merge_branding_settings(data)
     return data
 
 def save_data(data: dict[str, Any]) -> None: db.set_json("settings", data)
@@ -1044,35 +1045,53 @@ def smart_rate_limit(uid: int, bucket: str, action_key: str, window_sec: int, ma
     return False
 
 
-def callback_rate_key(uid: int) -> str:
-    return f"rate2:{CALLBACK_RATE_BUCKET}:{uid}"
+def callback_action_slug(action_key: str | None) -> str:
+    normalized = normalize_trigger(action_key or "-") or "-"
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:20]
 
 
-def callback_cooldown_key(uid: int) -> str:
-    return f"cooldown:{CALLBACK_RATE_BUCKET}:{uid}"
+def callback_rate_key(uid: int, action_key: str | None = None) -> str:
+    if action_key is None:
+        return f"rate2:{CALLBACK_RATE_BUCKET}:{uid}"
+    return f"rate2:{CALLBACK_RATE_BUCKET}:{uid}:{callback_action_slug(action_key)}"
+
+
+def callback_cooldown_key(uid: int, action_key: str | None = None) -> str:
+    if action_key is None:
+        return f"cooldown:{CALLBACK_RATE_BUCKET}:{uid}"
+    return f"cooldown:{CALLBACK_RATE_BUCKET}:{uid}:{callback_action_slug(action_key)}"
 
 
 def reset_callback_session(uid: int) -> None:
+    # Keep this backward-compatible for old global buckets, but per-button limits
+    # intentionally survive menu reopens until their own 20-minute window expires.
     db.set_json(callback_rate_key(uid), [])
     db.set_json(callback_cooldown_key(uid), 0)
 
 
 def callback_button_rate_limited(uid: int, action_key: str) -> bool:
     now = int(time.time())
-    cooldown_until = int(db.get_json(callback_cooldown_key(uid), 0) or 0)
+    action_key = normalize_trigger(action_key) or str(action_key or "-")
+    cooldown_until = int(db.get_json(callback_cooldown_key(uid, action_key), 0) or 0)
     if cooldown_until > now:
         return True
-    raw_events = db.get_json(callback_rate_key(uid), [])
+    raw_events = db.get_json(callback_rate_key(uid, action_key), [])
     events = []
     for item in raw_events if isinstance(raw_events, list) else []:
-        if isinstance(item, dict) and str(item.get("t", "")).isdigit():
+        if isinstance(item, int) or str(item).isdigit():
+            t = int(item)
+        elif isinstance(item, dict) and str(item.get("t", "")).isdigit():
             t = int(item["t"])
-            if now - t < CALLBACK_COOLDOWN_SECONDS:
-                events.append({"t": t, "k": str(item.get("k") or "-")})
-    events.append({"t": now, "k": normalize_trigger(action_key) or str(action_key or "-")})
-    db.set_json(callback_rate_key(uid), events)
+        else:
+            continue
+        if now - t < CALLBACK_COOLDOWN_SECONDS:
+            events.append(t)
+    events.append(now)
+    db.set_json(callback_rate_key(uid, action_key), events)
     if len(events) > CALLBACK_ALLOWED_INTERACTIONS:
-        db.set_json(callback_cooldown_key(uid), now + CALLBACK_COOLDOWN_SECONDS)
+        until = now + CALLBACK_COOLDOWN_SECONDS
+        db.set_json(callback_cooldown_key(uid, action_key), until)
+        db.set_soft_ban(uid, until, spam_delta=1)
         return True
     return False
 
@@ -1231,7 +1250,7 @@ async def disable_callback_markup(q) -> None:
 
 
 async def block_banned_callback(q, data: dict[str, Any]) -> None:
-    await safe_callback_answer(q, "🚫 شما موقتاً محدود هستید. بعداً دوباره تلاش کنید.", show_alert=True)
+    await safe_callback_answer(q, "🚫 شما موقتاً محدود شدید. ۲۰ دقیقه دیگر دوباره تلاش کنید.", show_alert=True)
 
 
 async def block_rate_limited_callback(q, data: dict[str, Any], cooldown_seconds: int = CALLBACK_COOLDOWN_SECONDS) -> None:
