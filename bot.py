@@ -1898,6 +1898,7 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
     if prev and int(prev["soft_ban_until"] or 0) > int(time.time()):
         return
     db.upsert_user(uid,(bm.from_user.username if bm.from_user else "") or "",(bm.from_user.full_name if bm.from_user else bm.chat.full_name) or "",None,False,"business",src_txt)
+    await send_business_welcome_once(bm, context, data, uid, prev)
     if data.get("active", False) and data.get("inline_menu_enabled", False):
         menu = db.menu_by_command(txt)
         if menu:
