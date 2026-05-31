@@ -302,13 +302,13 @@ Business messages pass through:
 3. Global active/admin guard.
 4. Soft-ban guard.
 5. User upsert/activity tracking.
-6. Welcome first-interaction check.
-7. Inline menu command handling.
-8. Market response handling.
-9. Self-bot shortcut handling.
+6. Inline menu command handling.
+7. Market response handling.
+8. Self-bot shortcut handling.
+9. Welcome first-interaction fallback when no higher-priority flow consumed the update.
 10. Final no-match log.
 
-Business welcome detection now supports text, sticker, voice, voice note/video note, video, GIF/animation, document, photo, and media-group interactions.
+Business welcome detection now supports text/caption, sticker, voice, voice note/video note, video, GIF/animation, document, photo, media-group, audio, contact, and location interactions. Welcome is intentionally deferred until after market/menu/shortcut routing to prevent duplicate responses for valid commands such as `btc`.
 
 ### Private messages
 
@@ -471,9 +471,9 @@ Watch hits use source/chat/message/keyword dedupe to avoid repeated monitoring r
 
 ### Callback cooldown
 
-Non-admin callback users are allowed 5 menu/button interactions per 20-minute cooldown window. On the next interaction, the user is soft-banned for 20 minutes. Admin users are exempt from this callback limit.
+Non-admin callback users are allowed 5 total menu/button callback interactions per 20-minute cooldown window from a shared callback bucket. On the next interaction, a callback-only cooldown alert is shown for 20 minutes. Admin users are exempt from this callback limit.
 
-Callback hardening also keeps callback data within Telegram’s 64-byte limit and avoids disabling working keyboards just because one user hits a cooldown.
+Callback hardening also keeps callback data within Telegram’s 64-byte limit, avoids disabling working keyboards just because one user hits a cooldown, and resets stale callback counters when a user opens a fresh menu session.
 
 ### Cache consistency
 
@@ -501,6 +501,9 @@ Detection covers the first business interaction after the welcome cooldown, incl
 - Document.
 - Photo.
 - Media groups.
+- Audio.
+- Contact.
+- Location.
 
 The default welcome cooldown is 24 hours per tracked user.
 
@@ -597,7 +600,7 @@ Check:
 
 ### Callback users get cooldown alerts
 
-Non-admin users get 5 allowed callback interactions per 20-minute window. Admin users are exempt. If a regular user exceeds the limit, wait for the cooldown or inspect that user in the admin report.
+Non-admin users get 5 allowed callback interactions per 20-minute shared callback window. Admin users are exempt. If a regular user exceeds the limit, wait for the callback cooldown or have the user open a fresh menu session.
 
 ### Welcome does not send on media
 

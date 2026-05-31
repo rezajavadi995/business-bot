@@ -8,6 +8,7 @@ import sqlite3
 import time
 from datetime import datetime
 from io import BytesIO
+from contextlib import contextmanager
 from dataclasses import dataclass
 import tempfile
 from zoneinfo import ZoneInfo
@@ -39,6 +40,7 @@ START_TIME = int(time.time())
 SOFT_BAN_SECONDS = 20 * 60
 CALLBACK_COOLDOWN_SECONDS = 20 * 60
 CALLBACK_ALLOWED_INTERACTIONS = 5
+CALLBACK_RATE_BUCKET = "callback_button"
 WELCOME_COOLDOWN_SECONDS = 24 * 60 * 60
 BUSINESS_UPDATE_FRESHNESS_SECONDS = 120
 
@@ -62,8 +64,20 @@ STATE = State()
 
 class DB:
     def __init__(self, path: Path): self.path = path
+    @contextmanager
     def conn(self):
-        c = sqlite3.connect(self.path); c.row_factory = sqlite3.Row; return c
+        c = sqlite3.connect(self.path, timeout=30)
+        c.row_factory = sqlite3.Row
+        c.execute("PRAGMA busy_timeout=5000")
+        c.execute("PRAGMA foreign_keys=ON")
+        try:
+            yield c
+            c.commit()
+        except Exception:
+            c.rollback()
+            raise
+        finally:
+            c.close()
     def init(self):
         with self.conn() as c:
             c.execute("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
@@ -115,10 +129,83 @@ class DB:
                 new_value TEXT,
                 created_at INTEGER NOT NULL
             )""")
-            self._migrate_users(c)
+            self._migrate_schema(c)
+
+    def _table_columns(self, c: sqlite3.Connection, table: str) -> set[str]:
+        return {r["name"] for r in c.execute(f"PRAGMA table_info({table})").fetchall()}
+
+    def _add_missing_columns(self, c: sqlite3.Connection, table: str, migrations: dict[str, str]) -> None:
+        cols = self._table_columns(c, table)
+        for col, sql in migrations.items():
+            if col not in cols:
+                logging.info("db_migration_add_column table=%s column=%s", table, col)
+                c.execute(sql)
+
+    def _migrate_schema(self, c: sqlite3.Connection) -> None:
+        self._add_missing_columns(c, "kv", {
+            "k": "ALTER TABLE kv ADD COLUMN k TEXT",
+            "v": "ALTER TABLE kv ADD COLUMN v TEXT NOT NULL DEFAULT ''",
+        })
+        self._migrate_users(c)
+        self._add_missing_columns(c, "shortcuts", {
+            "name": "ALTER TABLE shortcuts ADD COLUMN name TEXT",
+            "response": "ALTER TABLE shortcuts ADD COLUMN response TEXT NOT NULL DEFAULT ''",
+        })
+        self._add_missing_columns(c, "feedbacks", {
+            "user_id": "ALTER TABLE feedbacks ADD COLUMN user_id INTEGER",
+            "username": "ALTER TABLE feedbacks ADD COLUMN username TEXT",
+            "full_name": "ALTER TABLE feedbacks ADD COLUMN full_name TEXT",
+            "message": "ALTER TABLE feedbacks ADD COLUMN message TEXT",
+            "created_at": "ALTER TABLE feedbacks ADD COLUMN created_at INTEGER DEFAULT 0",
+        })
+        self._add_missing_columns(c, "watch_settings", {
+            "k": "ALTER TABLE watch_settings ADD COLUMN k TEXT",
+            "v": "ALTER TABLE watch_settings ADD COLUMN v TEXT NOT NULL DEFAULT ''",
+        })
+        self._add_missing_columns(c, "keyword_hits", {
+            "keyword": "ALTER TABLE keyword_hits ADD COLUMN keyword TEXT NOT NULL DEFAULT ''",
+            "user_id": "ALTER TABLE keyword_hits ADD COLUMN user_id INTEGER",
+            "username": "ALTER TABLE keyword_hits ADD COLUMN username TEXT",
+            "full_name": "ALTER TABLE keyword_hits ADD COLUMN full_name TEXT",
+            "chat_id": "ALTER TABLE keyword_hits ADD COLUMN chat_id INTEGER DEFAULT 0",
+            "chat_title": "ALTER TABLE keyword_hits ADD COLUMN chat_title TEXT",
+            "text": "ALTER TABLE keyword_hits ADD COLUMN text TEXT",
+            "created_at": "ALTER TABLE keyword_hits ADD COLUMN created_at INTEGER DEFAULT 0",
+        })
+        self._add_missing_columns(c, "menus", {
+            "command": "ALTER TABLE menus ADD COLUMN command TEXT NOT NULL DEFAULT ''",
+            "preview_text": "ALTER TABLE menus ADD COLUMN preview_text TEXT NOT NULL DEFAULT ''",
+            "is_active": "ALTER TABLE menus ADD COLUMN is_active INTEGER DEFAULT 1",
+            "created_at": "ALTER TABLE menus ADD COLUMN created_at INTEGER DEFAULT 0",
+            "updated_at": "ALTER TABLE menus ADD COLUMN updated_at INTEGER DEFAULT 0",
+        })
+        self._add_missing_columns(c, "menu_buttons", {
+            "menu_id": "ALTER TABLE menu_buttons ADD COLUMN menu_id INTEGER DEFAULT 0",
+            "button_text": "ALTER TABLE menu_buttons ADD COLUMN button_text TEXT NOT NULL DEFAULT ''",
+            "sort_order": "ALTER TABLE menu_buttons ADD COLUMN sort_order INTEGER DEFAULT 0",
+            "action_type": "ALTER TABLE menu_buttons ADD COLUMN action_type TEXT NOT NULL DEFAULT 'just_text'",
+            "action_payload": "ALTER TABLE menu_buttons ADD COLUMN action_payload TEXT NOT NULL DEFAULT ''",
+            "is_active": "ALTER TABLE menu_buttons ADD COLUMN is_active INTEGER DEFAULT 1",
+            "created_at": "ALTER TABLE menu_buttons ADD COLUMN created_at INTEGER DEFAULT 0",
+            "updated_at": "ALTER TABLE menu_buttons ADD COLUMN updated_at INTEGER DEFAULT 0",
+        })
+        self._add_missing_columns(c, "admin_states", {
+            "admin_id": "ALTER TABLE admin_states ADD COLUMN admin_id INTEGER DEFAULT 0",
+            "state": "ALTER TABLE admin_states ADD COLUMN state TEXT NOT NULL DEFAULT ''",
+            "payload": "ALTER TABLE admin_states ADD COLUMN payload TEXT NOT NULL DEFAULT '{}'",
+            "updated_at": "ALTER TABLE admin_states ADD COLUMN updated_at INTEGER DEFAULT 0",
+        })
+        self._add_missing_columns(c, "admin_logs", {
+            "admin_id": "ALTER TABLE admin_logs ADD COLUMN admin_id INTEGER DEFAULT 0",
+            "action": "ALTER TABLE admin_logs ADD COLUMN action TEXT NOT NULL DEFAULT ''",
+            "target_type": "ALTER TABLE admin_logs ADD COLUMN target_type TEXT NOT NULL DEFAULT ''",
+            "target_id": "ALTER TABLE admin_logs ADD COLUMN target_id INTEGER",
+            "old_value": "ALTER TABLE admin_logs ADD COLUMN old_value TEXT",
+            "new_value": "ALTER TABLE admin_logs ADD COLUMN new_value TEXT",
+            "created_at": "ALTER TABLE admin_logs ADD COLUMN created_at INTEGER DEFAULT 0",
+        })
 
     def _migrate_users(self, c: sqlite3.Connection) -> None:
-        cols = {r["name"] for r in c.execute("PRAGMA table_info(users)").fetchall()}
         migrations = {
             "username": "ALTER TABLE users ADD COLUMN username TEXT",
             "full_name": "ALTER TABLE users ADD COLUMN full_name TEXT",
@@ -131,9 +218,7 @@ class DB:
             "spam_score": "ALTER TABLE users ADD COLUMN spam_score INTEGER DEFAULT 0",
             "last_message": "ALTER TABLE users ADD COLUMN last_message TEXT",
         }
-        for col, sql in migrations.items():
-            if col not in cols:
-                c.execute(sql)
+        self._add_missing_columns(c, "users", migrations)
     def get_json(self, key: str, default: Any) -> Any:
         with self.conn() as c:
             row = c.execute("SELECT v FROM kv WHERE k=?", (key,)).fetchone()
@@ -832,30 +917,45 @@ def smart_rate_limit(uid: int, bucket: str, action_key: str, window_sec: int, ma
     return False
 
 
+def callback_rate_key(uid: int) -> str:
+    return f"rate2:{CALLBACK_RATE_BUCKET}:{uid}"
+
+
+def callback_cooldown_key(uid: int) -> str:
+    return f"cooldown:{CALLBACK_RATE_BUCKET}:{uid}"
+
+
+def reset_callback_session(uid: int) -> None:
+    db.set_json(callback_rate_key(uid), [])
+    db.set_json(callback_cooldown_key(uid), 0)
+
+
+def callback_button_rate_limited(uid: int, action_key: str) -> bool:
+    now = int(time.time())
+    cooldown_until = int(db.get_json(callback_cooldown_key(uid), 0) or 0)
+    if cooldown_until > now:
+        return True
+    raw_events = db.get_json(callback_rate_key(uid), [])
+    events = []
+    for item in raw_events if isinstance(raw_events, list) else []:
+        if isinstance(item, dict) and str(item.get("t", "")).isdigit():
+            t = int(item["t"])
+            if now - t < CALLBACK_COOLDOWN_SECONDS:
+                events.append({"t": t, "k": str(item.get("k") or "-")})
+    events.append({"t": now, "k": normalize_trigger(action_key) or str(action_key or "-")})
+    db.set_json(callback_rate_key(uid), events)
+    if len(events) > CALLBACK_ALLOWED_INTERACTIONS:
+        db.set_json(callback_cooldown_key(uid), now + CALLBACK_COOLDOWN_SECONDS)
+        return True
+    return False
+
+
 def inline_button_rate_limited(uid: int, button_id: int) -> bool:
-    return smart_rate_limit(
-        uid,
-        "inline_button",
-        str(button_id),
-        CALLBACK_COOLDOWN_SECONDS,
-        CALLBACK_ALLOWED_INTERACTIONS,
-        CALLBACK_COOLDOWN_SECONDS,
-        CALLBACK_ALLOWED_INTERACTIONS,
-        CALLBACK_COOLDOWN_SECONDS,
-    )
+    return callback_button_rate_limited(uid, f"im:btn:{button_id}")
 
 
 def user_button_rate_limited(uid: int, callback_data: str) -> bool:
-    return smart_rate_limit(
-        uid,
-        "user_button",
-        callback_data,
-        CALLBACK_COOLDOWN_SECONDS,
-        CALLBACK_ALLOWED_INTERACTIONS,
-        CALLBACK_COOLDOWN_SECONDS,
-        CALLBACK_ALLOWED_INTERACTIONS,
-        CALLBACK_COOLDOWN_SECONDS,
-    )
+    return callback_button_rate_limited(uid, callback_data)
 
 
 def menu_command_rate_limited(uid: int, command: str) -> bool:
@@ -1742,6 +1842,10 @@ def message_interaction_text(message) -> str:
         return "[photo]"
     if getattr(message, "audio", None):
         return "[audio]"
+    if getattr(message, "contact", None):
+        return "[contact]"
+    if getattr(message, "location", None):
+        return "[location]"
     return "[interaction]"
 
 
@@ -1802,6 +1906,8 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
                 logging.warning("business_menu_command_rate_limited uid=%s command=%r", uid, txt)
                 return
             buttons = db.menu_buttons(menu["id"])
+            if not is_admin(uid, data):
+                reset_callback_session(uid)
             out = render_html_text(menu["preview_text"], bold=data.get("bold_mode", True))
             kwargs = {"chat_id": bm.chat.id, "text": out, "parse_mode": ParseMode.HTML, "reply_markup": build_menu_markup(buttons)}
             bc = getattr(bm, "business_connection_id", None)
@@ -1851,6 +1957,8 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
         logging.info("business_shortcut_sent uid=%s text=%s",uid, txt)
         return
     if await maybe_send_market_response(bm, data, source="business"):
+        return
+    if await send_business_welcome_once(bm, context, data, uid, prev):
         return
     logging.info("business_shortcut_no_match uid=%s text=%s", uid, txt)
 
@@ -1966,6 +2074,8 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logging.warning("menu_command_rate_limited uid=%s command=%r", uid, txt)
                 return
             btns=db.menu_buttons(m["id"])
+            if not is_admin(uid, data):
+                reset_callback_session(uid)
             if is_admin(uid, data):
                 await delete_admin_trigger_message(update.message, context)
                 await context.bot.send_message(chat_id=update.effective_chat.id, text=render_html_text(m["preview_text"], bold=data.get("bold_mode", True)), parse_mode=ParseMode.HTML, reply_markup=build_menu_markup(btns))
@@ -1976,6 +2086,8 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not data.get("active", False):
             return
         logging.info("user_menu_open uid=%s", uid)
+        if not is_admin(uid, data):
+            reset_callback_session(uid)
         await update.message.reply_text("منوی کاربر", reply_markup=create_menu_keyboard())
         return
 
