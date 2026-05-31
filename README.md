@@ -1,340 +1,642 @@
-# Telegram Business Bot — Dynamic Market & Conversion Engine
+# Telegram Business Bot
 
-Production-oriented Telegram Business Bot with a modular admin panel, DB-backed FSM, inline menu engine, self-bot shortcuts, welcome system, monitoring, formatted/premium-emoji message delivery, and the **Dynamic Market & Conversion Engine**.
+Production-oriented Telegram Business Bot for Telegram Business/private messaging with an admin panel, inline menus, monitoring, welcome messages, formatted replies, and a Dynamic Market & Conversion Engine.
 
-> وضعیت اولیه امن است: `global robot status = OFF` و `conversion engine = OFF`. تا وقتی ادمین فعال نکند، موتور بازار پاسخ نمی‌دهد و API updater هم quota مصرف نمی‌کند.
+> **Current project status:** Phase A, Phase B, Phase C, and Phase D hardening are implemented in code. This repository still requires owner-run live Telegram validation before any production rollout. Do not treat local tests as proof of live production readiness.
+
+---
+
+## Table of contents
+
+- [Architecture](#architecture)
+- [Repository layout](#repository-layout)
+- [Installation](#installation)
+- [Manage command](#manage-command)
+- [Running modes](#running-modes)
+- [Environment variables](#environment-variables)
+- [Admin panel](#admin-panel)
+- [Messaging lifecycle](#messaging-lifecycle)
+- [Market & Conversion Engine](#market--conversion-engine)
+- [Branding and market cards](#branding-and-market-cards)
+- [Cache, dedupe, and lifecycle safety](#cache-dedupe-and-lifecycle-safety)
+- [Welcome system](#welcome-system)
+- [Watch/monitoring system](#watchmonitoring-system)
+- [Redis preparation](#redis-preparation)
+- [Troubleshooting](#troubleshooting)
+- [Local checks](#local-checks)
+- [Final live-testing checklist](#final-live-testing-checklist)
 
 ---
 
 ## Architecture
 
-### Runtime
-- Python async runtime: `python-telegram-bot`
-- Storage: SQLite (`bot.db`)
-- Settings: DB `kv/settings` + environment `.env`
-- Entry point: `bot.py`
+The bot intentionally keeps the current production-oriented architecture instead of using a clean-slate rewrite.
 
-### Main modules
-- `bot.py` — bot bootstrap, admin panel, delivery flows, callbacks, FSM wiring.
-- `features/inline_menu.py` — inline menu admin keyboards and pagination.
-- `features/inline_actions.py` — inline button action registry.
-- `features/inline_callback.py` — callback namespace helpers and length safety.
-- `features/log_export.py` — admin log export helpers.
-- `features/market_engine.py` — parser, alias normalization, cache-first rate engine, API clients, conversion rendering, help text.
-- `features/market_cards.py` — local Pillow card rendering, branding defaults, theme/watermark/logo support.
+### Runtime
+
+- **Language/runtime:** Python async runtime.
+- **Telegram framework:** `python-telegram-bot`.
+- **Primary storage:** SQLite database at `bot.db`.
+- **Runtime settings:** DB-backed `kv` settings merged with `.env` values.
+- **Entrypoint:** `bot.py`.
+- **Market rendering:** Pillow-based local image generation.
+- **Logging:** `logs/bot.log` plus systemd journal when systemd mode is enabled.
+
+### Main flow boundaries
+
+1. **Parser layer**
+   - Strictly parses market/conversion intents.
+   - Normalizes aliases, Persian digits, and compact formats.
+   - Rejects natural language, duplicate aliases, and multi-intent collisions.
+
+2. **Engine/cache layer**
+   - Owns cache refresh, stale-cache detection, provider calls, validation, and rate snapshots.
+   - Handlers read cache snapshots instead of calling APIs directly.
+
+3. **Delivery/routing layer**
+   - Routes business, private, group, channel, edited-message, callback, admin, FSM, and feedback paths.
+   - Enforces dedupe and sends exactly one market delivery mode per consumed market message.
+
+4. **UI/card layer**
+   - Owns admin keyboards, inline menu configuration, branding settings, font/theme/palette previews, and market image rendering.
 
 ---
 
-## Setup
+## Repository layout
+
+```text
+.
+├── bot.py                         # Bot bootstrap, DB wrapper, admin panel, routing, callbacks, delivery
+├── install.sh                     # Server installer and manage-command installer
+├── requirements.txt               # Python dependencies
+├── README.md                      # This document
+├── features/
+│   ├── inline_actions.py           # Inline button action registry
+│   ├── inline_callback.py          # Callback namespace and 64-byte safety helpers
+│   ├── inline_menu.py              # Inline menu admin keyboards and pagination
+│   ├── log_export.py               # Log listing/export helpers
+│   ├── market_cards.py             # Market card renderer, themes, palettes, fonts, logo support
+│   └── market_engine.py            # Parser, aliases, cache service, providers, conversion renderer
+└── tests/
+    ├── test_market_cards.py        # Branding/card rendering tests
+    ├── test_market_engine.py       # Parser/engine/cache tests
+    └── test_phase_d_hardening.py   # Phase D callback/welcome lifecycle tests
+```
+
+Runtime-created paths:
+
+```text
+bot.db                 # SQLite database
+.env                   # Secrets and environment configuration
+logs/bot.log           # App log file
+assets/market/         # Uploaded market-card logos/assets
+.venv/                 # Python virtual environment
+```
+
+---
+
+## Installation
+
+### One-liner installer
+
+For a fresh Debian/Ubuntu server, run the installer as root from a trusted checkout or the published repository URL:
 
 ```bash
-python -m venv .venv
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/rezajavadi995/business-bot/main/install.sh)"
+```
+
+Alternative local install from a cloned checkout:
+
+```bash
+git clone https://github.com/rezajavadi995/business-bot.git
+cd business-bot
+sudo bash install.sh
+```
+
+The installer:
+
+- Checks OS, architecture, disk space, and internet connectivity.
+- Repairs common `apt/dpkg` lock/state issues.
+- Installs Python, pip, venv support, git, curl, and base dependencies.
+- Creates `.venv`.
+- Installs `requirements.txt`.
+- Ensures `.env` contains `BOT_TOKEN` and `ADMIN_ID` keys.
+- Installs the global `/usr/local/bin/manage` command.
+
+### Manual development setup
+
+```bash
+python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env  # if available, otherwise create .env manually
-python bot.py
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -r requirements.txt
+cp .env.example .env 2>/dev/null || touch .env
 ```
 
 Minimum `.env`:
 
 ```env
-BOT_TOKEN=
-ADMIN_ID=
+BOT_TOKEN=123456:telegram-token
+ADMIN_ID=123456789
 FORCE_JOIN_CHANNEL=
-COINGECKO_API_KEY=
-EXCHANGERATE_API_KEY=
-MARKET_CACHE_TTL_SECONDS=60
-MARKET_STALE_TTL_SECONDS=86400
-MARKET_API_TIMEOUT_SECONDS=8
 ```
 
-API keys are optional at boot. Admins can set and validate them later from the panel.
+Then start locally:
+
+```bash
+python bot.py
+```
 
 ---
 
-## Global lock behavior
+## Manage command
 
-The global robot status is authoritative.
+The installer creates a global command:
 
-If global status is **OFF**:
-- Welcome/self/inline/market features show lock state in the admin panel.
-- Conversion Engine is globally inactive.
-- Market parsing/replies do not run.
-- Background updater does not call APIs.
+```bash
+manage
+```
 
-If global status returns **ON** and Conversion Engine was enabled:
-- Lock disappears.
-- Cache updater resumes.
-- Market parsing and replies resume automatically.
+`manage` can be run from anywhere and points back to the installed project directory. Menu options include:
 
----
+1. Set Telegram bot token.
+2. Set admin numeric ID.
+3. Set mandatory join channel.
+4. Send a test message to admin.
+5. Run bot without systemd.
+6. Enable and start systemd service.
+7. Show systemd status.
+8. Show bot process/service status.
+9. Recover/reset systemd service.
+10. Show recent logs.
+11. Show recent errors.
+12. Full uninstall.
+13. Exit.
 
-## Market cache system
+### Symlink/global usage note
 
-Message handlers **never call external APIs directly**. The flow is:
+`install.sh` writes an executable management script to:
 
 ```text
-Background updater -> CoinGecko / ExchangeRate / safe optional sources -> SQLite cache -> handlers read cache only
+/usr/local/bin/manage
 ```
 
-Cache controls:
-- `cache_ttl_seconds`: normal refresh interval, clamped between 30 and 3600 seconds.
-- `stale_ttl_seconds`: safe stale fallback window, clamped up to 86400 seconds.
-- Provider failures are isolated: if CoinGecko fails, ExchangeRate rates can still refresh, and vice versa.
-- Existing cached rates are merged with partial successful refreshes to avoid losing unrelated prices.
+Because `/usr/local/bin` is normally on `PATH`, this behaves like a global symlink/launcher for the project. If a server image does not include `/usr/local/bin` in `PATH`, run it directly:
 
-Fallback behavior:
-- Empty/expired cache returns a safe Persian fallback message.
-- API exceptions are sanitized before logs/admin display.
-- The bot must not crash or freeze because of a market provider failure.
+```bash
+/usr/local/bin/manage
+```
 
 ---
 
-## API setup
+## Running modes
 
-Open admin panel:
+### Systemd mode
+
+Recommended for persistent server operation:
+
+```bash
+manage
+# choose option 6: Enable and start systemd
+```
+
+Useful systemd commands:
+
+```bash
+systemctl status business-bot.service --no-pager
+journalctl -u business-bot.service -n 300 --no-pager
+journalctl -u business-bot.service -p err -n 200 --no-pager
+systemctl restart business-bot.service
+```
+
+The generated service uses:
+
+```text
+WorkingDirectory=<project_dir>
+ExecStart=<project_dir>/.venv/bin/python <project_dir>/bot.py
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+```
+
+### Non-systemd mode
+
+Useful for local development, debugging, or temporary shell sessions:
+
+```bash
+manage
+# choose option 5: Run bot without systemd
+```
+
+Or manually:
+
+```bash
+cd /path/to/business-bot
+source .venv/bin/activate
+python bot.py
+```
+
+---
+
+## Environment variables
+
+Core variables:
+
+| Variable | Required | Purpose |
+| --- | --- | --- |
+| `BOT_TOKEN` | Yes | Telegram bot token. |
+| `ADMIN_ID` | Yes | Numeric Telegram user ID for the primary admin. |
+| `FORCE_JOIN_CHANNEL` | Optional | Mandatory channel ID used by join-gate features when configured. |
+
+Market/provider variables:
+
+| Variable | Required | Purpose |
+| --- | --- | --- |
+| `COINGECKO_API_KEY` | Optional | CoinGecko API key for market data. Can be set from admin panel. |
+| `EXCHANGERATE_API_KEY` | Optional | ExchangeRate API key for fiat rates. Can be set from admin panel. |
+| `MARKET_CACHE_TTL_SECONDS` | Optional | Normal cache refresh interval. |
+| `MARKET_STALE_TTL_SECONDS` | Optional | Maximum stale fallback window. |
+| `MARKET_API_TIMEOUT_SECONDS` | Optional | Provider request timeout. |
+
+Future Redis-related variables are intentionally not required yet. See [Redis preparation](#redis-preparation).
+
+---
+
+## Admin panel
+
+Open the panel as the configured admin:
+
+```text
+/panel
+panel
+```
+
+Major admin areas:
+
+- Global bot ON/OFF.
+- Text editing and feature toggles.
+- Self-bot shortcut management.
+- Welcome toggle and welcome text configuration.
+- Inline Menu Engine.
+- Conversion Engine / market settings.
+- Market API key setup and validation.
+- Market cache controls.
+- Market branding/card settings.
+- Database export/import.
+- Log viewer/export.
+- Feedback messages.
+- User report/status.
+
+Global OFF is authoritative for non-admin behavior. Market parsing/replies and API updater activity remain locked unless the global bot and Conversion Engine are enabled.
+
+---
+
+## Messaging lifecycle
+
+### Business messages
+
+Business messages pass through:
+
+1. Freshness guard for stale Telegram business updates.
+2. Watch/monitoring report check.
+3. Global active/admin guard.
+4. Soft-ban guard.
+5. User upsert/activity tracking.
+6. Welcome first-interaction check.
+7. Inline menu command handling.
+8. Market response handling.
+9. Self-bot shortcut handling.
+10. Final no-match log.
+
+Business welcome detection now supports text, sticker, voice, voice note/video note, video, GIF/animation, document, photo, and media-group interactions.
+
+### Private messages
+
+Private messages preserve admin/FSM precedence:
+
+1. DB import/document flow.
+2. Admin panel commands.
+3. Help commands.
+4. Admin FSM states.
+5. Soft-ban guard.
+6. User upsert/activity tracking.
+7. Inline menu commands.
+8. User menu.
+9. Market response.
+10. Spam/feedback/self-bot/offline fallback.
+
+### Group/channel messages
+
+- Group and supergroup messages first run watch/monitoring checks.
+- Group market parsing then runs with group-scoped dedupe.
+- Channel posts are monitored.
+- Edited channel posts are monitored as `channel_edit`.
+
+### Edited messages
+
+Edited message behavior is controlled by the market setting `market_process_edited_messages`.
+
+- If disabled, edited market messages are ignored by the market pipeline.
+- If enabled, edited messages use the same message ID and source-aware dedupe key.
+- Edited group messages preserve watch/monitoring routing when not consumed by market processing.
+- Edited private messages can continue through normal private routing when not consumed by market processing.
+
+---
+
+## Market & Conversion Engine
+
+### Parser hardening
+
+Supported examples:
+
+```text
+btc
+trx
+100trx
+100 trx
+100 trx toman
+2000stars
+2000 استارز
+۲۰۰۰ استارز
+```
+
+The parser intentionally rejects natural sentences such as a normal invoice/message containing a market keyword. It also rejects ambiguous multi-intent or duplicate-alias input.
+
+Supported alias families include:
+
+| Alias examples | Asset |
+| --- | --- |
+| `btc`, `bitcoin`, `بیت کوین` | BTC |
+| `trx`, `tron`, `ترون` | TRX |
+| `ton`, `تون` | TON |
+| `usdt`, `tether`, `تتر` | USDT |
+| `usd`, `$`, `دلار` | USD |
+| `toman`, `تومان`, `تومن` | IRT |
+| `rial`, `ریال` | IRR |
+| `stars`, `استارز` | Telegram Stars |
+
+### API and cache flow
+
+Handlers do not directly depend on live provider calls. The intended data path is:
+
+```text
+Background updater / refresh_if_needed
+        -> provider clients
+        -> validated cache snapshot
+        -> render_market_response
+        -> exactly one delivery path
+```
+
+Admin path:
 
 ```text
 /panel -> Conversion Engine -> Market API Configuration
 ```
 
 Admin can:
+
 - Enable/disable API updater.
-- Enable/disable CoinGecko.
-- Enable/disable ExchangeRate.
+- Enable/disable providers.
 - Set CoinGecko API key.
 - Set ExchangeRate API key.
 - Validate saved keys.
-- Test live requests.
-- View cache status.
+- Run test requests.
+- View live cache status.
+- Force refresh cache.
 
-When setting a key, the bot performs a real validation request before saving to `.env`:
-- Success: key is saved and `os.environ` is updated for current runtime.
-- Failure: key is not saved; admin sees the safe failure reason.
+### Delivery modes
 
-Secrets are masked in status output.
-
----
-
-## Supported aliases
-
-Examples:
-
-| Alias | Normalized asset |
-| --- | --- |
-| `ترون`, `trx`, `tron` | `trx` |
-| `تون`, `ton`, `the open network` | `ton` |
-| `تتر`, `usdt`, `tether` | `usdt` |
-| `دلار`, `usd`, `$` | `usd` |
-| `تومان`, `تومن`, `toman` | `irt` |
-| `ریال`, `rial` | `irr` |
-| `استارز`, `stars` | `stars` |
-| `بیت کوین`, `bitcoin`, `btc` | `btc` |
-
-Parser supports Persian digits, English digits, decimals, comma-separated numbers, no-space formats, `$100`, and `100$`.
-
----
-
-## Conversion examples
+When market cards are enabled:
 
 ```text
-۲۰۰۰ استارز
-2000 stars
-۲۰۰۰استارز
-1000stars
-۲۰ ترون
-20 trx
-1200000 تومان تتر
-100 ترون تومان
-100 trx toman
-۱ دلار
-100 usd trx
-100$ trx
-$100 trx
-۲۰۰۰ استارز ترون
-100 eur toman
+one photo + caption
 ```
 
-Supported conversion directions:
-- crypto -> crypto
-- crypto -> fiat
-- fiat -> crypto
-- fiat -> fiat
-- stars -> crypto
-- stars -> fiat
-- toman -> crypto
-- toman -> fiat
-- crypto -> toman
+When market cards are disabled:
+
+```text
+one formatted text reply
+```
+
+If card rendering or photo delivery fails, the bot falls back to one text message.
 
 ---
 
-## Market lookup examples
+## Branding and market cards
 
-```text
-btc
-price trx
-eth price
-trx status
-btc today
-trend
-top gainers
-btc dominance
-fear greed
-```
-
-Status replies include cached price, 24h percentage change, and 24h high/low when available.
-
----
-
-## Stars rate system
-
-Telegram Stars do not have a stable public conversion API. The bot uses admin-configured rates:
-
-```text
-/panel -> Conversion Engine -> Stars Rate Settings
-```
-
-Admin can configure:
-- Unit stars, e.g. `1000`.
-- Unit USD, e.g. `30`.
-- Manual override USD.
-- Auto multiplier toggle.
-
-Conversion flow:
-
-```text
-stars -> configured USD value -> target asset
-```
-
----
-
-## Branding and image cards
+Admin path:
 
 ```text
 /panel -> Conversion Engine -> Market Branding
-/panel -> Conversion Engine -> Theme Settings
 ```
 
-Admin can configure:
+Branding supports:
+
 - Card ON/OFF.
 - Branding text.
 - Branding channel/caption text.
+- Channel validation.
+- Logo upload/remove.
+- Logo ON/OFF.
 - Watermark text.
-- Watermark position: `bottom_right`, `bottom_left`, `top_right`, `top_left`.
-- Logo upload and logo ON/OFF.
-- Text opacity.
-- Theme name.
-- Primary/secondary colors.
-- Dark mode.
-- Preview card.
+- Watermark positions.
+- Theme selection.
+- Palette selection.
+- Independent Persian/English fonts.
+- Independent Persian/English bold settings.
+- Text opacity controls.
+- Preview/confirmation flows.
 
-Image rendering is local via Pillow. If rendering fails, text replies still send successfully.
+The renderer includes RTL support through `arabic_reshaper` and `python-bidi` when available, with fallback behavior if shaping dependencies are unavailable.
 
-Logo files are stored under:
-
-```text
-assets/market/
-```
-
-Preserve that directory if you expect logos to survive deployments.
+Runtime setting changes are DB-backed and should apply without restarting the bot.
 
 ---
 
-## Admin guide
+## Cache, dedupe, and lifecycle safety
 
-Primary admin commands:
+### Market dedupe
+
+Market messages use a source-aware dedupe key:
 
 ```text
-/panel
-panel
-/broadcast <text>
-/help_market
-/help convert
+market_processed:<source>:<chat_id>:<message_id>
 ```
 
-Market admin buttons:
-- Conversion Engine ON/OFF
-- Market API Configuration
-- Stars Rate Settings
-- Cache Settings
-- Market Branding
-- Test APIs
-- Live Cache Status
-- Quick Assets
-- Conversion Help
-- Market Card Preview
-- Theme Settings
+This prevents duplicate market delivery for the same Telegram message while allowing later messages from the same user to be processed normally.
 
-Admin UX prefers editing existing admin messages where safe to avoid keyboard spam.
+### Watch dedupe
+
+Watch hits use source/chat/message/keyword dedupe to avoid repeated monitoring reports for the same watched event.
+
+### Callback cooldown
+
+Non-admin callback users are allowed 5 menu/button interactions per 20-minute cooldown window. On the next interaction, the user is soft-banned for 20 minutes. Admin users are exempt from this callback limit.
+
+Callback hardening also keeps callback data within Telegram’s 64-byte limit and avoids disabling working keyboards just because one user hits a cooldown.
+
+### Cache consistency
+
+The market service uses refresh locking and cache usability checks to avoid stale or partially invalid provider data being treated as fresh. Manual-only rates do not make the cache fresh unless required external rates are present.
 
 ---
 
-## User help
+## Welcome system
 
-Users can ask:
+Welcome is DB-backed and controlled from the admin panel:
 
 ```text
-/help_market
-/help convert
-help convert
-راهنمای تبدیل
-راهنمای بازار
+/panel -> Welcome toggle
+/panel -> Welcome configuration
 ```
 
-The help response includes conversion examples, price/status examples, and supported aliases.
+Detection covers the first business interaction after the welcome cooldown, including:
+
+- Text.
+- Sticker.
+- Voice.
+- Voice note / video note.
+- Video.
+- GIF / animation.
+- Document.
+- Photo.
+- Media groups.
+
+The default welcome cooldown is 24 hours per tracked user.
 
 ---
 
-## Delivery behavior
+## Watch/monitoring system
 
-Market responses use the existing formatted delivery pipeline.
+The watch system can report keyword hits from:
 
-Ordering is intentionally non-invasive:
-1. Existing admin/FSM flows.
-2. Pending feedback flow.
-3. Inline menu commands.
-4. Self-bot shortcuts.
-5. Market parser/response.
-6. Existing offline fallback.
+- Business private messages.
+- Groups/supergroups.
+- Channel posts.
+- Edited channel posts.
+- Edited group messages when market processing does not consume them.
 
-This prevents market replies from shadowing feedback or configured shortcuts.
+Reports include source, keyword, user/chat metadata, total keyword hit count, and forwarded message context when forwarding is possible.
+
+---
+
+## Redis preparation
+
+Redis is not required by the current runtime and no destructive Redis migration is included.
+
+The current project already uses storage boundaries that can be extended later. A future Redis implementation should preserve SQLite compatibility and support:
+
+- Cache persistence.
+- Dedupe persistence.
+- TTL-backed keys.
+- Distributed locking for multi-process deployments.
+- Redis enable/disable from admin/server menus.
+- Redis install/configuration from admin-server tooling.
+- Redis credential prompt/validation/save flow.
+- Runtime configuration viewer with masked secrets.
+
+Expected future configuration visibility:
+
+- Admin ID.
+- Force-join channel ID.
+- Redis configuration and URI.
+- API settings and provider status.
+- Masked API keys.
+- Important runtime settings.
 
 ---
 
 ## Troubleshooting
 
+### Bot does not start
+
+Check:
+
+```bash
+source .venv/bin/activate
+python -m py_compile bot.py
+python bot.py
+```
+
+Common causes:
+
+- `BOT_TOKEN` missing.
+- Dependencies not installed.
+- Wrong Python/venv path.
+- Broken `.env` file.
+
+### Systemd service fails
+
+```bash
+systemctl status business-bot.service --no-pager
+journalctl -u business-bot.service -p err -n 200 --no-pager
+manage
+# choose option 9: recover/reset
+```
+
 ### Conversion replies say cache is unavailable
-- Turn global bot ON.
-- Turn Conversion Engine ON.
-- Ensure API updater is ON.
-- Validate API keys in Market API Configuration.
-- Open Live Cache Status.
-- Use Refresh Cache Now.
 
-### API key does not save
-The bot validates keys before saving. If validation fails due to invalid key, network outage, provider downtime, or rate limit, the key is not saved.
+Check:
 
-### Image cards do not send
-- Ensure `Pillow==10.4.0` is installed from `requirements.txt`.
-- Ensure Cards are ON in Market Branding.
-- If image rendering fails, text replies still send.
-- Check logs for `market_card_send_failed`.
+- Global bot status is ON.
+- Conversion Engine is ON.
+- API updater is ON.
+- Provider keys are saved and valid if required.
+- Live cache status is fresh.
+- Force refresh cache from admin panel.
 
-### Global OFF but APIs still expected to update
-They will not. The background updater obeys global lock and Conversion Engine state.
+### Market cards do not send
+
+Check:
+
+- `Pillow` is installed from `requirements.txt`.
+- Market cards are enabled.
+- Font files/fallback fonts are available.
+- Logo file still exists under `assets/market/` if logo is enabled.
+- Logs for `market_card_send_failed`.
+
+### Callback users get cooldown alerts
+
+Non-admin users get 5 allowed callback interactions per 20-minute window. Admin users are exempt. If a regular user exceeds the limit, wait for the cooldown or inspect that user in the admin report.
+
+### Welcome does not send on media
+
+Check:
+
+- Global bot status is ON for non-admin users.
+- Welcome is enabled.
+- User is not soft-banned.
+- The user has not received welcome within the 24-hour cooldown window.
+- The update is a business message update received by the bot.
 
 ---
 
-## Programmatic checks
+## Local checks
+
+Recommended local checks before any handoff:
 
 ```bash
-python -m unittest tests.test_market_engine
-python -m py_compile bot.py features/inline_menu.py features/inline_actions.py features/inline_callback.py features/market_engine.py features/market_cards.py tests/test_market_engine.py
+python3 -m unittest tests.test_market_engine tests.test_market_cards tests.test_phase_d_hardening
+python3 -m py_compile bot.py features/inline_menu.py features/inline_actions.py features/inline_callback.py features/market_engine.py features/market_cards.py tests/test_market_engine.py tests/test_market_cards.py tests/test_phase_d_hardening.py
 git diff --check
 ```
 
+These checks are local and simulated; they do not replace real Telegram API/live-flow validation.
+
 ---
 
-## Production readiness
+## Final live-testing checklist
 
-After Phase 4, the market engine is ready for controlled live testing, not uncontrolled mass rollout. Start with a small admin-controlled test group, verify provider limits, cache status, conversion accuracy, card rendering, and business delivery behavior before wider usage.
+Before any production-style rollout, the owner should validate in a controlled Telegram environment:
+
+- `btc` produces exactly one market response.
+- `1 trx` produces exactly one conversion response.
+- `100 trx toman` produces exactly one conversion response.
+- Card ON sends one image with caption and no second text message.
+- Card OFF sends one text message.
+- Edited messages obey `market_process_edited_messages`.
+- Edited group messages still trigger watch/monitoring when not consumed by market processing.
+- Inline/menu buttons allow repeated normal use and enforce cooldown only after the configured limit.
+- Admin callbacks are not rate-limited.
+- Welcome sends on first supported media/text interaction after cooldown.
+- Branding, fonts, palettes, logo upload/remove, and previews persist across runtime changes.

@@ -37,6 +37,8 @@ load_dotenv(ENV_PATH)
 
 START_TIME = int(time.time())
 SOFT_BAN_SECONDS = 20 * 60
+CALLBACK_COOLDOWN_SECONDS = 20 * 60
+CALLBACK_ALLOWED_INTERACTIONS = 5
 WELCOME_COOLDOWN_SECONDS = 24 * 60 * 60
 BUSINESS_UPDATE_FRESHNESS_SECONDS = 120
 
@@ -831,7 +833,29 @@ def smart_rate_limit(uid: int, bucket: str, action_key: str, window_sec: int, ma
 
 
 def inline_button_rate_limited(uid: int, button_id: int) -> bool:
-    return smart_rate_limit(uid, "inline_button", str(button_id), 60, 30, 12, 6)
+    return smart_rate_limit(
+        uid,
+        "inline_button",
+        str(button_id),
+        CALLBACK_COOLDOWN_SECONDS,
+        CALLBACK_ALLOWED_INTERACTIONS,
+        CALLBACK_COOLDOWN_SECONDS,
+        CALLBACK_ALLOWED_INTERACTIONS,
+        CALLBACK_COOLDOWN_SECONDS,
+    )
+
+
+def user_button_rate_limited(uid: int, callback_data: str) -> bool:
+    return smart_rate_limit(
+        uid,
+        "user_button",
+        callback_data,
+        CALLBACK_COOLDOWN_SECONDS,
+        CALLBACK_ALLOWED_INTERACTIONS,
+        CALLBACK_COOLDOWN_SECONDS,
+        CALLBACK_ALLOWED_INTERACTIONS,
+        CALLBACK_COOLDOWN_SECONDS,
+    )
 
 
 def menu_command_rate_limited(uid: int, command: str) -> bool:
@@ -980,13 +1004,12 @@ async def disable_callback_markup(q) -> None:
 
 
 async def block_banned_callback(q, data: dict[str, Any]) -> None:
-    await disable_callback_markup(q)
     await safe_callback_answer(q, "🚫 شما موقتاً محدود هستید. بعداً دوباره تلاش کنید.", show_alert=True)
 
 
-async def block_rate_limited_callback(q, data: dict[str, Any]) -> None:
-    await disable_callback_markup(q)
-    await safe_callback_answer(q, "🚫 محدودیت ضداسپم فعال شد. ۵ دقیقه بعد دوباره تلاش کنید.", show_alert=True)
+async def block_rate_limited_callback(q, data: dict[str, Any], cooldown_seconds: int = CALLBACK_COOLDOWN_SECONDS) -> None:
+    minutes = max(1, int(cooldown_seconds // 60))
+    await safe_callback_answer(q, f"🚫 محدودیت ضداسپم فعال شد. {minutes} دقیقه بعد دوباره تلاش کنید.", show_alert=True)
 
 async def send_or_replace_button_response(q, context: ContextTypes.DEFAULT_TYPE, button_id: int, payload: str, data: dict[str, Any]):
     if not q.message:
@@ -1301,7 +1324,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if row_user and int(row_user["soft_ban_until"] or 0) > int(time.time()):
                 await block_banned_callback(q, data)
                 return
-            if smart_rate_limit(uid, "user_button", q.data, 60, 25, 20, 8):
+            if user_button_rate_limited(uid, q.data):
                 await block_rate_limited_callback(q, data)
                 return
         await safe_callback_answer(q)
@@ -1696,6 +1719,54 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+
+def message_interaction_text(message) -> str:
+    text = (getattr(message, "text", None) or getattr(message, "caption", None) or "").strip()
+    if text:
+        return text
+    if getattr(message, "media_group_id", None):
+        return "[media group]"
+    if getattr(message, "sticker", None):
+        return "[sticker]"
+    if getattr(message, "voice", None):
+        return "[voice]"
+    if getattr(message, "video_note", None):
+        return "[voice note]"
+    if getattr(message, "video", None):
+        return "[video]"
+    if getattr(message, "animation", None):
+        return "[gif]"
+    if getattr(message, "document", None):
+        return "[document]"
+    if getattr(message, "photo", None):
+        return "[photo]"
+    if getattr(message, "audio", None):
+        return "[audio]"
+    return "[interaction]"
+
+
+def is_welcome_due(prev) -> bool:
+    now = int(time.time())
+    return prev is None or int(prev["last_seen_at"] or 0) <= 0 or now - int(prev["last_seen_at"] or 0) >= WELCOME_COOLDOWN_SECONDS
+
+
+async def send_business_welcome_once(message, context: ContextTypes.DEFAULT_TYPE, data: dict[str, Any], uid: int, prev) -> bool:
+    if not data.get("welcome_enabled", True) or not is_welcome_due(prev):
+        return False
+    try:
+        out_welcome = render_html_text(data.get("welcome_text", "خوش آمدید"), bold=data.get("bold_mode", True))
+        await context.bot.send_message(
+            chat_id=message.chat.id,
+            text=out_welcome,
+            parse_mode=ParseMode.HTML,
+            business_connection_id=getattr(message, "business_connection_id", None),
+        )
+        logging.info("welcome_trigger_business uid=%s", uid)
+        return True
+    except Exception as exc:
+        logging.exception("welcome_business_failed uid=%s reason=%s", uid, exc)
+        return False
+
 def is_fresh_business_update(message_date) -> bool:
     if message_date is None:
         return True
@@ -1706,12 +1777,16 @@ def is_fresh_business_update(message_date) -> bool:
 
 async def business_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bm=getattr(update,"business_message",None)
-    if not bm or not bm.text: return
+    if not bm: return
     if not is_fresh_business_update(getattr(bm, "date", None)):
         logging.info("business_update_skipped_stale msg_id=%s date=%s", getattr(bm, "message_id", None), getattr(bm, "date", None))
         return
-    data=load_data(); src_txt=text_with_custom_emoji_markup(bm); txt=(bm.text or "").strip(); uid=(bm.from_user.id if bm.from_user else bm.chat.id)
-    await maybe_report_watch_hit(update, context, "business", bm.text or "")
+    data=load_data()
+    text_markup = text_with_custom_emoji_markup(bm) if getattr(bm, "text", None) else ""
+    src_txt = text_markup or message_interaction_text(bm)
+    txt=(getattr(bm, "text", None) or getattr(bm, "caption", None) or "").strip()
+    uid=(bm.from_user.id if bm.from_user else bm.chat.id)
+    await maybe_report_watch_hit(update, context, "business", txt)
     if not data.get("active", False) and not is_admin(uid, data):
         logging.info("business_ignored_bot_inactive uid=%s", uid)
         return
@@ -1719,6 +1794,7 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
     if prev and int(prev["soft_ban_until"] or 0) > int(time.time()):
         return
     db.upsert_user(uid,(bm.from_user.username if bm.from_user else "") or "",(bm.from_user.full_name if bm.from_user else bm.chat.full_name) or "",None,False,"business",src_txt)
+    await send_business_welcome_once(bm, context, data, uid, prev)
     if data.get("active", False) and data.get("inline_menu_enabled", False):
         menu = db.menu_by_command(txt)
         if menu:
@@ -1777,13 +1853,6 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
     if await maybe_send_market_response(bm, data, source="business"):
         return
     logging.info("business_shortcut_no_match uid=%s text=%s", uid, txt)
-    if data.get("welcome_enabled",True) and (prev is None or int(prev["last_seen_at"] or 0)<=0 or int(time.time())-int(prev["last_seen_at"] or 0)>=WELCOME_COOLDOWN_SECONDS):
-        try:
-            out_welcome = render_html_text(data.get("welcome_text", "خوش آمدید"), bold=data.get("bold_mode", True))
-            await context.bot.send_message(chat_id=bm.chat.id, text=out_welcome, parse_mode=ParseMode.HTML, business_connection_id=getattr(bm,"business_connection_id",None))
-            logging.info("welcome_trigger_business uid=%s", uid)
-        except Exception as exc:
-            logging.exception("welcome_business_failed uid=%s reason=%s", uid, exc)
 
 async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if getattr(update,"business_message",None): await business_message_handler(update, context); return
