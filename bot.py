@@ -750,7 +750,8 @@ def create_market_branding_keyboard(data: dict[str, Any]) -> InlineKeyboardMarku
     branding = merge_branding_settings(data)
     return InlineKeyboardMarkup([
         [create_primary_button(f"Cards: {'ON' if branding.get('card_enabled') else 'OFF'}", "admin:market_card_bool:card_enabled")],
-        [create_primary_button("Fonts", "admin:market_fonts"), create_primary_button("Text opacity", "admin:market_opacity_menu")],
+        [create_primary_button(f"Card style: {branding.get('card_style', 'classic')}", "admin:market_card_style_toggle")],
+        [create_primary_button("Fonts", "admin:market_fonts"), create_primary_button(f"Text opacity: {branding.get('text_opacity')}", "admin:market_opacity_menu")],
         [create_primary_button("Branding text", "admin:market_card_text:branding_text"), create_primary_button("Watermark text", "admin:market_card_text:watermark_text")],
         [create_primary_button("Branding channel ID", "admin:market_card_text:branding_channel_id"), create_primary_button(f"Logo: {'ON' if branding.get('logo_enabled') else 'OFF'}", "admin:market_card_bool:logo_enabled")],
         [create_primary_button("Upload/Replace logo", "admin:market_card_logo_upload"), create_danger_button("Remove logo", "admin:market_logo_remove")],
@@ -962,13 +963,13 @@ async def maybe_send_market_response(message, data: dict[str, Any], *, source: s
     branding = merge_branding_settings(data)
     if not data.get("active", False) or not market_settings.get("market_engine_enabled", False):
         return False
-    if is_edit and not market_settings.get("market_process_edited_messages", False):
-        logging.info("market_edit_skipped source=%s msg_id=%s", source, getattr(message, "message_id", None))
-        return False
-    text = (getattr(message, "text", None) or "").strip()
+    text = (getattr(message, "text", None) or getattr(message, "caption", None) or "").strip()
     if not text:
         return False
     intent = parse_market_intent(text)
+    if is_edit and not market_settings.get("market_process_edited_messages", False) and not intent:
+        logging.info("market_edit_skipped source=%s msg_id=%s", source, getattr(message, "message_id", None))
+        return False
     if not intent:
         return False
     dedupe_key = market_message_dedupe_key(message, source)
@@ -988,11 +989,11 @@ async def maybe_send_market_response(message, data: dict[str, Any], *, source: s
     if branding.get("card_enabled", False):
         try:
             image_bytes = await asyncio.to_thread(render_market_card, response, branding)
-            await message.reply_photo(photo=BytesIO(image_bytes), caption=response[:1000])
+            await message.reply_photo(photo=BytesIO(image_bytes), caption=render_html_text(response[:1000], bold=False), parse_mode=ParseMode.HTML)
             return True
         except Exception as exc:
             logging.warning("market_card_send_failed reason=%s", exc)
-    await send_formatted_message(message, response, data)
+    await message.reply_text(render_html_text(response, bold=False), parse_mode=ParseMode.HTML)
     return True
 
 def is_spam(text: str, shortcuts: dict[str, str]) -> bool:
@@ -1884,9 +1885,15 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data.setdefault("market", {})["card"] = branding
         save_data(data)
         await q.edit_message_text("✅ Palette اعمال شد.", reply_markup=create_market_theme_keyboard(data))
+    elif q.data=="admin:market_card_style_toggle":
+        branding = merge_branding_settings(data)
+        branding["card_style"] = "advanced" if branding.get("card_style") != "advanced" else "classic"
+        data.setdefault("market", {})["card"] = branding
+        save_data(data)
+        await q.edit_message_text("✅ نوع کارت تغییر کرد. برای دیدن نتیجه Preview بگیرید.", reply_markup=create_market_branding_keyboard(data))
     elif q.data=="admin:market_opacity_menu":
         STATE.flow, STATE.step, STATE.admin_id, STATE.message_id, STATE.pending_key = "market_card_cfg", "waiting_number", uid, q.message.message_id, "text_opacity"
-        await q.edit_message_text("Opacity متن را بین 40 تا 255 ارسال کنید. پس از ذخیره Preview بگیرید.", reply_markup=build_back_kb("admin:market_branding"))
+        await q.edit_message_text("Opacity متن میزان شفافیت نوشته‌های روی کارت است؛ عدد 255 کاملاً پررنگ و 40 خیلی کم‌رنگ است. مقدار 40 تا 255 را ارسال کنید و بعد Preview بگیرید.", reply_markup=build_back_kb("admin:market_branding"))
     elif q.data=="admin:market_logo_remove":
         branding = merge_branding_settings(data)
         branding["logo_enabled"] = False
@@ -1896,7 +1903,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("✅ لوگو حذف/غیرفعال شد.", reply_markup=create_market_branding_keyboard(data))
     elif q.data=="admin:market_card_preview":
         branding = merge_branding_settings(data)
-        sample = "✨ 2,000 STARS :\n\n💸 5,234,610 toman\n🌀 16.845 TON\n💵 $30 dollar\n\n🪙 1405/03/04 | 05:52:46"
+        sample = "<b>🔺 قیمت TRX</b>\n<blockquote>💰 <b>جزئیات قیمت</b>\n💵 دلاری: <b>$0.3456</b>\n🇮🇷 تومانی: <b>59,042</b>\n</blockquote>\n<blockquote>📊 <b>تغییرات روزانه</b>\n🟢 رشد: <b>0.20%</b></blockquote>\n🕘 <code>1405/03/10 | 06:28:42</code>"
         try:
             image_bytes = await asyncio.to_thread(render_market_card, sample, branding)
             await context.bot.send_photo(chat_id=uid, photo=BytesIO(image_bytes), caption="Market Card Preview")
@@ -2557,14 +2564,25 @@ def get_market_runtime_settings() -> dict[str, Any]:
 async def post_init(app: Application) -> None:
     MARKET_SERVICE.bind_store(db)
     restore_market_api_secrets()
-    asyncio.create_task(MARKET_SERVICE.run_forever(get_market_runtime_settings))
+    app.bot_data["market_task"] = asyncio.create_task(MARKET_SERVICE.run_forever(get_market_runtime_settings))
+
+
+async def post_shutdown(app: Application) -> None:
+    MARKET_SERVICE.stop()
+    task = app.bot_data.get("market_task")
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 def main() -> None:
     setup_logging(); db.init(); MARKET_SERVICE.bind_store(db); restore_market_api_secrets(); backup_market_api_secrets(); save_data(load_data())
     token=os.getenv("BOT_TOKEN")
     if not token: raise RuntimeError("BOT_TOKEN is missing")
-    app=Application.builder().token(token).post_init(post_init).build()
+    app=Application.builder().token(token).post_init(post_init).post_shutdown(post_shutdown).build()
     app.add_handler(CommandHandler("start", start)); app.add_handler(CommandHandler("panel", panel)); app.add_handler(CommandHandler("help_market", help_market)); app.add_handler(CommandHandler("help", help_command)); app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CallbackQueryHandler(callbacks)); app.add_handler(MessageHandler(filters.ALL, all_messages)); app.add_error_handler(on_error)
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
