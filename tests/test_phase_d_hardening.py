@@ -110,32 +110,37 @@ class PhaseDCallbackLimitTests(unittest.TestCase):
         bot.db = self.old_db
         self.tmp.cleanup()
 
-    def test_callback_buttons_allow_five_then_twenty_minute_cooldown_without_global_soft_ban(self):
+    def test_callback_buttons_allow_five_per_button_then_twenty_minute_ban(self):
         for _ in range(bot.CALLBACK_ALLOWED_INTERACTIONS):
             self.assertFalse(bot.inline_button_rate_limited(101, 77))
 
         self.assertTrue(bot.inline_button_rate_limited(101, 77))
         row = bot.db.get_user(101)
-        self.assertEqual(int(row["soft_ban_until"] or 0), 0)
-        cooldown_until = int(bot.db.get_json(bot.callback_cooldown_key(101), 0) or 0)
+        remaining_ban = int(row["soft_ban_until"] or 0) - int(__import__("time").time())
+        self.assertGreaterEqual(remaining_ban, bot.CALLBACK_COOLDOWN_SECONDS - 2)
+        self.assertEqual(int(row["spam_score"] or 0), 1)
+        cooldown_until = int(bot.db.get_json(bot.callback_cooldown_key(101, "im:btn:77"), 0) or 0)
         remaining = cooldown_until - int(__import__("time").time())
         self.assertGreaterEqual(remaining, bot.CALLBACK_COOLDOWN_SECONDS - 2)
 
-    def test_inline_and_user_buttons_share_one_callback_bucket(self):
+    def test_inline_and_user_buttons_have_independent_buckets(self):
         for idx in range(3):
             self.assertFalse(bot.inline_button_rate_limited(101, idx))
         for idx in range(2):
             self.assertFalse(bot.user_button_rate_limited(101, f"user:services:{idx}"))
 
+        self.assertFalse(bot.user_button_rate_limited(101, "user:contact"))
+        for _ in range(bot.CALLBACK_ALLOWED_INTERACTIONS - 1):
+            self.assertFalse(bot.user_button_rate_limited(101, "user:contact"))
         self.assertTrue(bot.user_button_rate_limited(101, "user:contact"))
 
-    def test_new_menu_session_reset_clears_old_callback_usage(self):
+    def test_menu_session_reset_does_not_clear_per_button_cooldown(self):
         for _ in range(bot.CALLBACK_ALLOWED_INTERACTIONS):
             self.assertFalse(bot.inline_button_rate_limited(101, 77))
         self.assertTrue(bot.inline_button_rate_limited(101, 77))
 
         bot.reset_callback_session(101)
-        self.assertFalse(bot.inline_button_rate_limited(101, 77))
+        self.assertTrue(bot.inline_button_rate_limited(101, 77))
 
 
 class PhaseDWelcomeInteractionTests(unittest.TestCase):
