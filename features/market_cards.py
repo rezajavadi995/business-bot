@@ -5,6 +5,7 @@ import importlib
 import importlib.util
 import json
 import re
+import math
 import time
 from io import BytesIO
 from pathlib import Path
@@ -20,27 +21,40 @@ _DEFAULT_SERIF_BOLD = str(_FONT_DIR / "DejaVuSerif-Bold.ttf")
 _DEFAULT_MONO = str(_FONT_DIR / "DejaVuSansMono.ttf")
 _DEFAULT_MONO_BOLD = str(_FONT_DIR / "DejaVuSansMono-Bold.ttf")
 
+
+def _first_existing_font(*names: str, fallback: str = _DEFAULT_REGULAR) -> str:
+    roots = [Path("/usr/share/fonts"), Path.home() / ".local/share/fonts"]
+    lowered = [name.lower() for name in names]
+    for root in roots:
+        if not root.exists():
+            continue
+        for path in root.rglob("*.ttf"):
+            stem = path.name.lower().replace(" ", "").replace("-", "_")
+            if any(name in stem for name in lowered):
+                return str(path)
+    return fallback
+
 PERSIAN_FONT_CHOICES: dict[str, dict[str, str]] = {
-    "vazir": {"label": "Vazir", "regular": _DEFAULT_REGULAR, "bold": _DEFAULT_BOLD},
-    "shabnam": {"label": "Shabnam", "regular": _DEFAULT_REGULAR, "bold": _DEFAULT_BOLD},
-    "sahel": {"label": "Sahel", "regular": _DEFAULT_REGULAR, "bold": _DEFAULT_BOLD},
-    "samim": {"label": "Samim", "regular": _DEFAULT_REGULAR, "bold": _DEFAULT_BOLD},
-    "yekan": {"label": "Yekan", "regular": _DEFAULT_REGULAR, "bold": _DEFAULT_BOLD},
-    "iransans": {"label": "IRANSans", "regular": _DEFAULT_REGULAR, "bold": _DEFAULT_BOLD},
-    "estedad": {"label": "Estedad", "regular": _DEFAULT_REGULAR, "bold": _DEFAULT_BOLD},
-    "nahid": {"label": "Nahid", "regular": _DEFAULT_SERIF, "bold": _DEFAULT_SERIF_BOLD},
-    "parastoo": {"label": "Parastoo", "regular": _DEFAULT_SERIF, "bold": _DEFAULT_SERIF_BOLD},
-    "tanha": {"label": "Tanha", "regular": _DEFAULT_MONO, "bold": _DEFAULT_MONO_BOLD},
+    "vazir": {"label": "Vazir", "regular": _first_existing_font("vazir"), "bold": _first_existing_font("vazir_bold", "vazir-bold", fallback=_DEFAULT_BOLD)},
+    "shabnam": {"label": "Shabnam", "regular": _first_existing_font("shabnam"), "bold": _first_existing_font("shabnam_bold", "shabnam-bold", fallback=_DEFAULT_BOLD)},
+    "sahel": {"label": "Sahel", "regular": _first_existing_font("sahel"), "bold": _first_existing_font("sahel_bold", "sahel-bold", fallback=_DEFAULT_BOLD)},
+    "samim": {"label": "Samim", "regular": _first_existing_font("samim"), "bold": _first_existing_font("samim_bold", "samim-bold", fallback=_DEFAULT_BOLD)},
+    "yekan": {"label": "Yekan", "regular": _first_existing_font("yekan", "b_yekan"), "bold": _first_existing_font("yekan_bold", "b_yekan_bold", fallback=_DEFAULT_BOLD)},
+    "iransans": {"label": "IRANSans", "regular": _first_existing_font("iransans", "iran_sans"), "bold": _first_existing_font("iransans_bold", "iran_sans_bold", fallback=_DEFAULT_BOLD)},
+    "estedad": {"label": "Estedad", "regular": _first_existing_font("estedad"), "bold": _first_existing_font("estedad_bold", "estedad-bold", fallback=_DEFAULT_BOLD)},
+    "nahid": {"label": "Nahid", "regular": _first_existing_font("nahid", fallback=_DEFAULT_REGULAR), "bold": _first_existing_font("nahid", fallback=_DEFAULT_BOLD)},
+    "parastoo": {"label": "Parastoo", "regular": _first_existing_font("parastoo", fallback=_DEFAULT_REGULAR), "bold": _first_existing_font("parastoo_bold", "parastoo-bold", fallback=_DEFAULT_BOLD)},
+    "tanha": {"label": "Tanha", "regular": _first_existing_font("tanha", fallback=_DEFAULT_MONO), "bold": _first_existing_font("tanha_bold", "tanha-bold", fallback=_DEFAULT_MONO_BOLD)},
 }
 
 ENGLISH_FONT_CHOICES: dict[str, dict[str, str]] = {
-    "inter": {"label": "Inter", "regular": _DEFAULT_REGULAR, "bold": _DEFAULT_BOLD},
-    "roboto": {"label": "Roboto", "regular": _DEFAULT_REGULAR, "bold": _DEFAULT_BOLD},
-    "open_sans": {"label": "Open Sans", "regular": _DEFAULT_REGULAR, "bold": _DEFAULT_BOLD},
-    "montserrat": {"label": "Montserrat", "regular": _DEFAULT_BOLD, "bold": _DEFAULT_BOLD},
-    "lato": {"label": "Lato", "regular": _DEFAULT_REGULAR, "bold": _DEFAULT_BOLD},
-    "poppins": {"label": "Poppins", "regular": _DEFAULT_REGULAR, "bold": _DEFAULT_BOLD},
-    "nunito": {"label": "Nunito", "regular": _DEFAULT_REGULAR, "bold": _DEFAULT_BOLD},
+    "inter": {"label": "Inter", "regular": _first_existing_font("inter"), "bold": _first_existing_font("inter_bold", "inter-bold", fallback=_DEFAULT_BOLD)},
+    "roboto": {"label": "Roboto", "regular": _first_existing_font("roboto"), "bold": _first_existing_font("roboto_bold", "roboto-bold", fallback=_DEFAULT_BOLD)},
+    "open_sans": {"label": "Open Sans", "regular": _first_existing_font("opensans", "open_sans"), "bold": _first_existing_font("opensans_bold", "open_sans_bold", fallback=_DEFAULT_BOLD)},
+    "montserrat": {"label": "Montserrat", "regular": _first_existing_font("montserrat", fallback=_DEFAULT_SERIF), "bold": _first_existing_font("montserrat_bold", fallback=_DEFAULT_SERIF_BOLD)},
+    "lato": {"label": "Lato", "regular": _first_existing_font("lato", fallback=_DEFAULT_SERIF), "bold": _first_existing_font("lato_bold", fallback=_DEFAULT_SERIF_BOLD)},
+    "poppins": {"label": "Poppins", "regular": _first_existing_font("poppins", fallback=_DEFAULT_MONO), "bold": _first_existing_font("poppins_bold", fallback=_DEFAULT_MONO_BOLD)},
+    "nunito": {"label": "Nunito", "regular": _first_existing_font("nunito", fallback=_DEFAULT_REGULAR), "bold": _first_existing_font("nunito_bold", fallback=_DEFAULT_BOLD)},
     "serif": {"label": "Serif", "regular": _DEFAULT_SERIF, "bold": _DEFAULT_SERIF_BOLD},
     "mono": {"label": "Mono", "regular": _DEFAULT_MONO, "bold": _DEFAULT_MONO_BOLD},
     "display": {"label": "Display", "regular": _DEFAULT_SERIF_BOLD, "bold": _DEFAULT_SERIF_BOLD},
@@ -114,6 +128,7 @@ def default_branding_settings() -> dict[str, Any]:
         "english_font": "inter",
         "persian_bold": False,
         "english_bold": False,
+        "card_style": "classic",
     }
 
 
@@ -145,6 +160,8 @@ def merge_branding_settings(data: dict[str, Any]) -> dict[str, Any]:
             branding[position_field] = fallback
     if branding.get("card_theme") not in CARD_THEMES:
         branding["card_theme"] = "glass"
+    if branding.get("card_style") not in {"classic", "advanced"}:
+        branding["card_style"] = "classic"
     market["card"] = branding
     return branding
 
@@ -219,8 +236,20 @@ def _line_wrap(draw, text: str, font, max_width: int) -> list[str]:
     return lines
 
 
+def _strip_html(text: str) -> str:
+    return re.sub(r"<[^>]+>", "", str(text or ""))
+
+
+def _image_text(text: str) -> str:
+    replacements = {"💸": "IRT", "💵": "USD", "🪙": "TIME", "🕘": "TIME", "✨": "", "🔄": "", "🔁": "", "🔺": "TRX", "🟢": "+", "🔴": "-", "📊": "CHART", "📈": "HIGH", "📉": "LOW", "🇮🇷": "IRT", "💰": "PRICE"}
+    clean = _strip_html(text)
+    for emoji, label in replacements.items():
+        clean = clean.replace(emoji, label)
+    return clean
+
+
 def _draw_text(draw, xy: tuple[int, int], text: str, font, fill, *, anchor: str | None = None) -> None:
-    draw.text(xy, _display_text(text), font=font, fill=fill, anchor=anchor)
+    draw.text(xy, _display_text(_image_text(text)), font=font, fill=fill, anchor=anchor)
 
 
 def _watermark_xy(position: str, width: int, height: int, tw: int, th: int, margin_x: int = 105, margin_y: int = 105) -> tuple[int, int]:
@@ -278,13 +307,15 @@ def render_market_card(response_text: str, branding: dict[str, Any]) -> bytes:
     fill = (255, 255, 255, int(branding.get("text_opacity", 220))) if dark else (28, 33, 55, int(branding.get("text_opacity", 220)))
     muted = (220, 225, 255, 190) if dark else (80, 87, 120, 190)
 
+    if branding.get("card_style") == "advanced":
+        return render_advanced_market_card(response_text, branding)
+
     branding_text = str(branding.get("branding_text") or "Market Bot")[:64]
     branding_font = title_font if not _is_rtl(branding_text) else _load_font(font_mod, persian_path, 56)
     branding_display = _display_text(branding_text)
     branding_bbox = draw.textbbox((0, 0), branding_display, font=branding_font)
     branding_x, branding_y = _watermark_xy(str(branding.get("branding_position") or "top_left"), width, height, branding_bbox[2] - branding_bbox[0], 110, margin_y=145)
     _draw_text(draw, (branding_x, branding_y), branding_text, branding_font, fill)
-    _draw_text(draw, (branding_x, branding_y + 70), "Dynamic Market & Conversion Engine", small_font, muted)
     logo_path = Path(str(branding.get("logo_path") or ""))
     if branding.get("logo_enabled", False) and logo_path.exists():
         logo = image_mod.open(logo_path).convert("RGBA").resize((112, 112))
@@ -323,3 +354,103 @@ def render_market_card(response_text: str, branding: dict[str, Any]) -> bytes:
         _CARD_CACHE.clear()
     _CARD_CACHE[cache_key] = (now, data)
     return data
+
+
+_ASSET_THEME_COLORS: dict[str, tuple[str, str]] = {
+    "TRX": ("#ff1744", "#ff5f7e"),
+    "USDT": ("#16c784", "#7ee8c7"),
+    "TON": ("#0098ea", "#75d0ff"),
+    "BTC": ("#f7931a", "#ffd36c"),
+    "ETH": ("#627eea", "#9eb0ff"),
+}
+
+
+def _extract_card_facts(response_text: str) -> dict[str, Any]:
+    plain = _strip_html(response_text)
+    upper = plain.upper()
+    symbol = next((asset for asset in _ASSET_THEME_COLORS if re.search(rf"\b{asset}\b", upper)), "USDT")
+    usd_match = re.search(r"\$\s*([0-9][0-9,]*(?:\.\d+)?)", plain)
+    toman_match = re.search(r"(?:تومان|IRT|تومانی)[^0-9]*([0-9][0-9,]*(?:\.\d+)?)|([0-9][0-9,]*(?:\.\d+)?)\s*(?:تومان|toman)", plain, re.IGNORECASE)
+    pct_match = re.search(r"([+-]?\d+(?:\.\d+)?)\s*%", plain)
+    return {
+        "symbol": symbol,
+        "usd": usd_match.group(1) if usd_match else "1",
+        "toman": (toman_match.group(1) or toman_match.group(2)) if toman_match else "-",
+        "change": float(pct_match.group(1)) if pct_match else 0.0,
+    }
+
+
+def _draw_badge(draw, xy: tuple[int, int], text: str, font, fill: tuple[int, int, int, int], bg: tuple[int, int, int, int]) -> None:
+    x, y = xy
+    bbox = draw.textbbox((0, 0), text, font=font)
+    draw.rounded_rectangle((x, y, x + bbox[2] - bbox[0] + 34, y + 46), radius=12, fill=bg)
+    draw.text((x + 17, y + 7), text, font=font, fill=fill)
+
+
+def render_advanced_market_card(response_text: str, branding: dict[str, Any]) -> bytes:
+    image_mod = importlib.import_module("PIL.Image")
+    draw_mod = importlib.import_module("PIL.ImageDraw")
+    font_mod = importlib.import_module("PIL.ImageFont")
+    facts = _extract_card_facts(response_text)
+    primary_hex, secondary_hex = _ASSET_THEME_COLORS.get(facts["symbol"], (str(branding.get("card_primary_color") or "#2336ff"), str(branding.get("card_secondary_color") or "#8a2be2")))
+    primary = _hex_to_rgb(primary_hex, (35, 54, 255))
+    secondary = _hex_to_rgb(secondary_hex, (138, 43, 226))
+    width, height = 1080, 720
+    text_alpha = max(40, min(int(branding.get("text_opacity") or 220), 255))
+    base = image_mod.new("RGB", (width, height), primary)
+    px = base.load()
+    for x in range(width):
+        ratio = x / max(width - 1, 1)
+        r = int(primary[0] * (1 - ratio) + secondary[0] * ratio)
+        g = int(primary[1] * (1 - ratio) + secondary[1] * ratio)
+        b = int(primary[2] * (1 - ratio) + secondary[2] * ratio)
+        for y in range(height):
+            shade = 0.84 + 0.16 * math.sin((x + y) / 180)
+            px[x, y] = (int(r * shade), int(g * shade), int(b * shade))
+    base = base.convert("RGBA")
+    draw = draw_mod.Draw(base)
+    english_choice = ENGLISH_FONT_CHOICES.get(str(branding.get("english_font") or "inter"), ENGLISH_FONT_CHOICES["inter"])
+    persian_choice = PERSIAN_FONT_CHOICES.get(str(branding.get("persian_font") or "vazir"), PERSIAN_FONT_CHOICES["vazir"])
+    en_bold = _load_font(font_mod, _font_path(english_choice, True), 60)
+    en = _load_font(font_mod, _font_path(english_choice, False), 34)
+    fa = _load_font(font_mod, _font_path(persian_choice, False), 34)
+    small = _load_font(font_mod, _font_path(english_choice, False), 24)
+    draw.rounded_rectangle((76, 72, width - 76, height - 112), radius=54, fill=(255, 255, 255, 238))
+    draw.ellipse((122, 118, 174, 170), fill=primary + (255,))
+    draw.text((195, 116), facts["symbol"], font=en_bold, fill=(18, 24, 38, text_alpha))
+    pair = f"{facts['symbol']} / USD"
+    draw.text((width - 300, 126), pair, font=en, fill=(150, 155, 165, 255))
+    draw.text((135, 200), f"${facts['usd']}", font=_load_font(font_mod, _font_path(english_choice, True), 88), fill=(10, 12, 18, text_alpha))
+    change = facts["change"]
+    change_color = (0, 190, 100, 255) if change >= 0 else (238, 67, 75, 255)
+    draw.text((138, 315), f"{change:+.2f}%", font=en_bold, fill=change_color)
+    chart_left, chart_top, chart_right, chart_bottom = 160, 390, 930, 560
+    for i in range(5):
+        y = chart_top + i * ((chart_bottom - chart_top) // 4)
+        draw.line((chart_left, y, chart_right, y), fill=(225, 230, 235, 255), width=2)
+    points = []
+    seed = sum(ord(c) for c in facts["symbol"])
+    for i in range(44):
+        x = chart_left + int(i * (chart_right - chart_left) / 43)
+        drift = (change / 100) * (i / 43) * -90
+        wave = math.sin(i / 3 + seed) * 18 + math.sin(i / 7 + seed / 3) * 24
+        y = int((chart_top + chart_bottom) / 2 + wave + drift)
+        points.append((x, max(chart_top + 8, min(chart_bottom - 8, y))))
+    for a, b in zip(points, points[1:]):
+        draw.line((a, b), fill=change_color, width=5)
+    for idx, point in enumerate(points[::5]):
+        draw.ellipse((point[0] - 4, point[1] - 4, point[0] + 4, point[1] + 4), fill=change_color)
+    watermark = str(branding.get("watermark_text") or branding.get("branding_channel_id") or "")[:64]
+    footer = f"{str(branding.get('branding_text') or 'Market Bot')[:32]}"
+    if watermark:
+        footer = f"{footer} | {watermark}"
+    draw.text((width // 2, 622), footer, font=small, fill=(255, 255, 255, min(text_alpha, 230)), anchor="mm")
+    # Text panel with drawn labels instead of image emoji glyphs.
+    draw.rounded_rectangle((76, height - 100, width - 76, height - 18), radius=24, fill=(24, 27, 36, 215))
+    _draw_badge(draw, (112, height - 82), "IRT", fa, (255, 255, 255, 255), (45, 145, 73, 255))
+    draw.text((200, height - 75), f"{facts['toman']} تومان", font=fa, fill=(255, 255, 255, text_alpha))
+    _draw_badge(draw, (520, height - 82), "USD", en, (255, 255, 255, 255), (75, 105, 160, 255))
+    draw.text((630, height - 75), f"${facts['usd']}", font=en, fill=(255, 255, 255, text_alpha))
+    out = BytesIO()
+    base.convert("RGB").save(out, format="PNG", optimize=True)
+    return out.getvalue()
