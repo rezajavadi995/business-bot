@@ -193,6 +193,26 @@ class MarketEngineAdminSupportTests(unittest.TestCase):
         self.assertAlmostEqual(payload["rates_usd"]["trx"], 59042 / 170820)
         self.assertEqual(payload["meta"]["crypto"]["24h_change"]["trx"], 0.2)
 
+
+    def test_nobitex_fetch_uses_symbol_markets_for_local_crypto_rates(self):
+        service = MarketRateService()
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "status": "ok",
+            "stats": {
+                "usdt-rls": {"latest": "1708200"},
+                "trx-rls": {"latest": "590420", "dayHigh": "602220", "dayLow": "584410", "dayChange": "0.2"},
+            },
+        }
+        with patch("features.market_engine.requests.get", return_value=response) as mock_get:
+            payload = service._fetch_nobitex({}, 3)
+
+        self.assertEqual(mock_get.call_args.kwargs["params"]["srcCurrency"], "usdt,btc,eth,trx,ton")
+        self.assertAlmostEqual(payload["rates_usd"]["irt"], 1 / 170_820)
+        self.assertAlmostEqual(payload["rates_usd"]["trx"], 59042 / 170820)
+        self.assertEqual(payload["meta"]["24h_change"]["trx"], 0.2)
+
     @patch("features.market_engine.requests.get")
     def test_validate_exchangerate_key_uses_real_validation_endpoint_shape(self, mock_get):
         response = Mock()

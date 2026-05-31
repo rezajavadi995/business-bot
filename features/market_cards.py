@@ -104,6 +104,8 @@ def default_branding_settings() -> dict[str, Any]:
         "logo_path": "",
         "text_opacity": 220,
         "watermark_position": "bottom_right",
+        "branding_position": "top_left",
+        "price_position": "center_left",
         "card_theme": "glass",
         "card_primary_color": "#2336ff",
         "card_secondary_color": "#8a2be2",
@@ -138,8 +140,9 @@ def merge_branding_settings(data: dict[str, Any]) -> dict[str, Any]:
         branding["persian_font"] = "vazir"
     if branding.get("english_font") not in ENGLISH_FONT_CHOICES:
         branding["english_font"] = "inter"
-    if branding.get("watermark_position") not in WATERMARK_POSITIONS:
-        branding["watermark_position"] = "bottom_right"
+    for position_field, fallback in {"watermark_position": "bottom_right", "branding_position": "top_left", "price_position": "center_left"}.items():
+        if branding.get(position_field) not in WATERMARK_POSITIONS:
+            branding[position_field] = fallback
     if branding.get("card_theme") not in CARD_THEMES:
         branding["card_theme"] = "glass"
     market["card"] = branding
@@ -276,18 +279,33 @@ def render_market_card(response_text: str, branding: dict[str, Any]) -> bytes:
     muted = (220, 225, 255, 190) if dark else (80, 87, 120, 190)
 
     branding_text = str(branding.get("branding_text") or "Market Bot")[:64]
-    _draw_text(draw, (105, 145), branding_text, title_font if not _is_rtl(branding_text) else _load_font(font_mod, persian_path, 56), fill)
-    _draw_text(draw, (105, 215), "Dynamic Market & Conversion Engine", small_font, muted)
+    branding_font = title_font if not _is_rtl(branding_text) else _load_font(font_mod, persian_path, 56)
+    branding_display = _display_text(branding_text)
+    branding_bbox = draw.textbbox((0, 0), branding_display, font=branding_font)
+    branding_x, branding_y = _watermark_xy(str(branding.get("branding_position") or "top_left"), width, height, branding_bbox[2] - branding_bbox[0], 110, margin_y=145)
+    _draw_text(draw, (branding_x, branding_y), branding_text, branding_font, fill)
+    _draw_text(draw, (branding_x, branding_y + 70), "Dynamic Market & Conversion Engine", small_font, muted)
     logo_path = Path(str(branding.get("logo_path") or ""))
     if branding.get("logo_enabled", False) and logo_path.exists():
         logo = image_mod.open(logo_path).convert("RGBA").resize((112, 112))
         base.alpha_composite(logo, (width - 220, 140))
 
-    y = 310
-    for line in _line_wrap(draw, response_text, body_font_fa if _is_rtl(response_text) else body_font_en, width - 210)[:13]:
+    wrapped_lines = _line_wrap(draw, response_text, body_font_fa if _is_rtl(response_text) else body_font_en, width - 210)[:13]
+    line_metrics = []
+    max_line_width = 0
+    total_height = 0
+    for line in wrapped_lines:
         font = body_font_fa if _is_rtl(line) else body_font_en
-        _draw_text(draw, (105, y), line, font, fill)
-        y += 58 if line else 34
+        bbox = draw.textbbox((0, 0), _display_text(line), font=font)
+        line_width = bbox[2] - bbox[0]
+        line_height = 58 if line else 34
+        line_metrics.append((line, font, line_width, line_height))
+        max_line_width = max(max_line_width, line_width)
+        total_height += line_height
+    x, y = _watermark_xy(str(branding.get("price_position") or "center_left"), width, height, max_line_width, total_height, margin_y=310)
+    for line, font, _, line_height in line_metrics:
+        _draw_text(draw, (x, y), line, font, fill)
+        y += line_height
 
     watermark = str(branding.get("watermark_text") or "")[:64]
     if watermark:

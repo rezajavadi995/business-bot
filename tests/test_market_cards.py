@@ -19,13 +19,15 @@ class MarketCardBrandingTests(unittest.TestCase):
         self.assertIn(branding["persian_font"], PERSIAN_FONT_CHOICES)
         self.assertIn(branding["english_font"], ENGLISH_FONT_CHOICES)
         self.assertIn(branding["watermark_position"], WATERMARK_POSITIONS)
+        self.assertIn(branding["branding_position"], WATERMARK_POSITIONS)
+        self.assertIn(branding["price_position"], WATERMARK_POSITIONS)
         self.assertGreaterEqual(len(PERSIAN_FONT_CHOICES), 10)
         self.assertGreaterEqual(len(ENGLISH_FONT_CHOICES), 10)
         self.assertGreaterEqual(len(CARD_THEMES), 10)
         self.assertGreaterEqual(len(COLOR_PALETTES), 15)
 
     def test_persian_text_rendering_generates_card(self):
-        data = {"market": {"card": {"persian_bold": True, "english_bold": True, "watermark_position": "center"}}}
+        data = {"market": {"card": {"persian_bold": True, "english_bold": True, "watermark_position": "center", "branding_position": "top_center", "price_position": "center"}}}
         branding = merge_branding_settings(data)
         image = render_market_card("قیمت بیت‌کوین\n💵 70,000 USD\n✨ تبدیل 100 ترون", branding)
         self.assertGreater(len(image), 1000)

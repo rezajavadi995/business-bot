@@ -501,7 +501,7 @@ class MarketRateService:
         return {"rates_usd": out, "meta": {"source": source, "result": body.get("result") if isinstance(body, dict) else None}}
 
     def _fetch_nobitex(self, settings: dict[str, Any], timeout: float) -> dict[str, Any]:
-        src = ",".join(["usdt", *CRYPTO_IDS.values()])
+        src = ",".join(["usdt", *[symbol for symbol in CRYPTO_IDS if symbol != "usdt"]])
         response = requests.get(
             "https://apiv2.nobitex.ir/market/stats",
             params={"srcCurrency": src, "dstCurrency": "rls"},
@@ -522,21 +522,20 @@ class MarketRateService:
         rates["irt"] = 1.0 / usdt_toman
         rates["usdt"] = 1.0
 
-        id_to_symbol = {coin_id: symbol for symbol, coin_id in CRYPTO_IDS.items()}
-        for coin_id, symbol in id_to_symbol.items():
+        for symbol in CRYPTO_IDS:
             if symbol == "usdt":
                 continue
-            toman = self._nobitex_toman(stats, coin_id)
+            toman = self._nobitex_toman(stats, symbol)
             if not toman:
                 continue
             rates[symbol] = toman / usdt_toman
-            high_toman = self._nobitex_toman(stats, coin_id, field="dayHigh")
-            low_toman = self._nobitex_toman(stats, coin_id, field="dayLow")
+            high_toman = self._nobitex_toman(stats, symbol, field="dayHigh")
+            low_toman = self._nobitex_toman(stats, symbol, field="dayLow")
             if high_toman:
                 highs[symbol] = high_toman / usdt_toman
             if low_toman:
                 lows[symbol] = low_toman / usdt_toman
-            change = self._nobitex_number(stats, coin_id, "dayChange")
+            change = self._nobitex_number(stats, symbol, "dayChange")
             if change is not None:
                 changes[symbol] = change
         return {"rates_usd": rates, "meta": {"source": "nobitex", "quote": "USDTIRT", "usdt_toman": usdt_toman, "24h_change": changes, "24h_high": highs, "24h_low": lows}}

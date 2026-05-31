@@ -1,4 +1,7 @@
 import asyncio
+import base64
+import hashlib
+import hmac
 import html
 import json
 import logging
@@ -513,6 +516,9 @@ def build_watch_keyword_pick_keyboard(keywords: list[str], prefix: str, map_key:
 
 
 
+
+MARKET_SECRET_ENV_KEYS = ("COINGECKO_API_KEY", "EXCHANGERATE_API_KEY")
+
 def mask_secret(value: str | None) -> str:
     raw = str(value or "")
     if not raw:
@@ -522,7 +528,7 @@ def mask_secret(value: str | None) -> str:
     return f"{raw[:4]}...{raw[-4:]}"
 
 
-def set_env_value(key: str, value: str) -> None:
+def set_env_value(key: str, value: str, *, update_backup: bool = True) -> None:
     key = str(key or "").strip()
     value = str(value or "").strip()
     if not re.fullmatch(r"[A-Z0-9_]+", key):
@@ -541,7 +547,74 @@ def set_env_value(key: str, value: str) -> None:
         lines.append(rendered)
     ENV_PATH.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
     os.environ[key] = value
+    if update_backup and key in MARKET_SECRET_ENV_KEYS:
+        backup_market_api_secrets()
 
+
+
+
+def _market_secret_key() -> bytes:
+    raw = f"{os.getenv('BOT_TOKEN', '')}:{os.getenv('ADMIN_ID', '')}"
+    return hashlib.sha256(raw.encode("utf-8")).digest()
+
+
+def _secret_stream(key: bytes, nonce: bytes, size: int) -> bytes:
+    out = bytearray()
+    counter = 0
+    while len(out) < size:
+        out.extend(hashlib.sha256(key + nonce + counter.to_bytes(4, "big")).digest())
+        counter += 1
+    return bytes(out[:size])
+
+
+def _xor_secret(raw: bytes, stream: bytes) -> bytes:
+    return bytes(byte ^ stream[idx] for idx, byte in enumerate(raw))
+
+
+def encrypt_market_secret(value: str) -> str:
+    raw = str(value or "").encode("utf-8")
+    if not raw:
+        return ""
+    key = _market_secret_key()
+    nonce = os.urandom(16)
+    encrypted = _xor_secret(raw, _secret_stream(key, nonce, len(raw)))
+    tag = hmac.new(key, nonce + encrypted, hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(nonce + tag + encrypted).decode("ascii")
+
+
+def decrypt_market_secret(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        payload = base64.urlsafe_b64decode(raw.encode("ascii"))
+        nonce, tag, encrypted = payload[:16], payload[16:48], payload[48:]
+        key = _market_secret_key()
+        expected = hmac.new(key, nonce + encrypted, hashlib.sha256).digest()
+        if not hmac.compare_digest(tag, expected):
+            return ""
+        return _xor_secret(encrypted, _secret_stream(key, nonce, len(encrypted))).decode("utf-8")
+    except Exception:
+        return ""
+
+
+def backup_market_api_secrets() -> None:
+    secrets = {key: encrypt_market_secret(os.getenv(key, "")) for key in MARKET_SECRET_ENV_KEYS if os.getenv(key, "").strip()}
+    if secrets:
+        db.set_json("market_api_secrets", {"v": 1, "keys": secrets, "updated_at": int(time.time())})
+
+
+def restore_market_api_secrets() -> None:
+    payload = db.get_json("market_api_secrets", {})
+    secrets = payload.get("keys", {}) if isinstance(payload, dict) else {}
+    if not isinstance(secrets, dict):
+        return
+    for key in MARKET_SECRET_ENV_KEYS:
+        if os.getenv(key, "").strip():
+            continue
+        value = decrypt_market_secret(str(secrets.get(key) or ""))
+        if value:
+            set_env_value(key, value, update_backup=False)
 
 def format_market_status(data: dict[str, Any]) -> str:
     settings = merge_market_settings(data)
@@ -553,6 +626,7 @@ def format_market_status(data: dict[str, Any]) -> str:
         f"API Updater: {'ON' if settings.get('market_api_enabled') else 'OFF'}\n"
         f"CoinGecko: {'ON' if settings.get('coingecko_enabled') else 'OFF'} | key: {mask_secret(os.getenv('COINGECKO_API_KEY'))}\n"
         f"ExchangeRate: {'ON' if settings.get('exchangerate_enabled') else 'OFF'} | key: {mask_secret(os.getenv('EXCHANGERATE_API_KEY'))}\n"
+        f"Nobitex local: {'ON' if settings.get('nobitex_enabled') else 'OFF'}\n"
         f"Cache TTL: {settings.get('cache_ttl_seconds')}s | stale fallback: {settings.get('stale_ttl_seconds')}s\n"
         f"Cache rates: {status['rate_count']} | fresh: {status['fresh']} | usable: {status['usable']}\n"
         f"Last update: {format_ts(status['updated_at'])}\n"
@@ -581,6 +655,7 @@ def create_market_api_keyboard(data: dict[str, Any]) -> InlineKeyboardMarkup:
         [create_primary_button(f"API Updater: {'ON' if settings.get('market_api_enabled') else 'OFF'}", "admin:market_api_toggle:market_api_enabled")],
         [create_primary_button(f"CoinGecko API: {'ON' if settings.get('coingecko_enabled') else 'OFF'}", "admin:market_api_toggle:coingecko_enabled")],
         [create_primary_button(f"ExchangeRate API: {'ON' if settings.get('exchangerate_enabled') else 'OFF'}", "admin:market_api_toggle:exchangerate_enabled")],
+        [create_primary_button(f"Nobitex Local Rates: {'ON' if settings.get('nobitex_enabled') else 'OFF'}", "admin:market_api_toggle:nobitex_enabled")],
         [create_primary_button("Set CoinGecko API Key", "admin:market_set_key:coingecko"), create_primary_button("Validate CoinGecko", "admin:market_validate:coingecko")],
         [create_primary_button("Set ExchangeRate API Key", "admin:market_set_key:exchangerate"), create_primary_button("Validate ExchangeRate", "admin:market_validate:exchangerate")],
         [create_primary_button("Test Live Requests", "admin:market_test"), create_danger_button("بازگشت", "admin:market_root")],
@@ -638,11 +713,24 @@ def create_market_confirm_keyboard(apply_cb: str, back_cb: str) -> InlineKeyboar
     return InlineKeyboardMarkup([[create_primary_button("Apply", apply_cb), create_danger_button("Back", back_cb)]])
 
 
-def create_watermark_position_keyboard() -> InlineKeyboardMarkup:
+def create_position_settings_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [create_primary_button("Watermark Position", "admin:market_positions:watermark")],
+        [create_primary_button("Price Text Position", "admin:market_positions:price")],
+        [create_primary_button("Branding Text Position", "admin:market_positions:branding")],
+        [create_danger_button("بازگشت", "admin:market_branding")],
+    ])
+
+
+def create_market_position_keyboard(kind: str) -> InlineKeyboardMarkup:
     order = ["top_left", "top_center", "top_right", "center_left", "center", "center_right", "bottom_left", "bottom_center", "bottom_right"]
-    rows = button_grid([(WATERMARK_POSITIONS[key], f"admin:market_position_preview:{key}") for key in order], 3)
-    rows.append([create_danger_button("بازگشت", "admin:market_branding")])
+    rows = button_grid([(WATERMARK_POSITIONS[key], f"admin:market_position_preview:{kind}:{key}") for key in order], 3)
+    rows.append([create_danger_button("بازگشت", "admin:market_positions")])
     return InlineKeyboardMarkup(rows)
+
+
+def create_watermark_position_keyboard() -> InlineKeyboardMarkup:
+    return create_market_position_keyboard("watermark")
 
 
 def create_market_theme_select_keyboard() -> InlineKeyboardMarkup:
@@ -666,7 +754,7 @@ def create_market_branding_keyboard(data: dict[str, Any]) -> InlineKeyboardMarku
         [create_primary_button("Branding text", "admin:market_card_text:branding_text"), create_primary_button("Watermark text", "admin:market_card_text:watermark_text")],
         [create_primary_button("Branding channel ID", "admin:market_card_text:branding_channel_id"), create_primary_button(f"Logo: {'ON' if branding.get('logo_enabled') else 'OFF'}", "admin:market_card_bool:logo_enabled")],
         [create_primary_button("Upload/Replace logo", "admin:market_card_logo_upload"), create_danger_button("Remove logo", "admin:market_logo_remove")],
-        [create_primary_button("Watermark position", "admin:market_watermark_positions")],
+        [create_primary_button("Position Settings", "admin:market_positions")],
         [create_primary_button("Preview", "admin:market_card_preview"), create_danger_button("بازگشت", "admin:market_root")],
     ])
 
@@ -1491,6 +1579,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data["welcome_enabled"]=not data.get("welcome_enabled",False)
             save_data(data)
         elif q.data=="admin:db_export":
+            backup_market_api_secrets()
             stamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
             await context.bot.send_document(chat_id=uid, document=DB_PATH.open("rb"), filename=f"bot-backup-{stamp}.db")
         handled_panel_ui = await render_admin_panel(update, context, data, edit=True, query=q)
@@ -1638,7 +1727,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif q.data.startswith("admin:market_api_toggle:"):
         key = q.data.rsplit(":", 1)[1]
         settings = merge_market_settings(data)
-        if key in {"market_api_enabled", "coingecko_enabled", "exchangerate_enabled"}:
+        if key in {"market_api_enabled", "coingecko_enabled", "exchangerate_enabled", "nobitex_enabled"}:
             settings[key] = not settings.get(key, True)
             data["market"] = settings
             save_data(data)
@@ -1711,27 +1800,43 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data.setdefault("market", {})["card"] = branding
         save_data(data)
         await q.edit_message_text("✅ فونت اعمال شد.", reply_markup=create_market_fonts_keyboard(data))
+    elif q.data=="admin:market_positions":
+        await q.edit_message_text("Position Settings", reply_markup=create_position_settings_keyboard())
     elif q.data=="admin:market_watermark_positions":
         await q.edit_message_text("Watermark position را انتخاب کنید:", reply_markup=create_watermark_position_keyboard())
+    elif q.data.startswith("admin:market_positions:"):
+        kind = q.data.rsplit(":", 1)[1]
+        if kind not in {"watermark", "price", "branding"}: return
+        await q.edit_message_text("Position را انتخاب کنید:", reply_markup=create_market_position_keyboard(kind))
     elif q.data.startswith("admin:market_position_preview:"):
-        pos = q.data.rsplit(":", 1)[1]
-        if pos not in WATERMARK_POSITIONS: return
+        parts = q.data.split(":")
+        if len(parts) == 4:
+            kind, pos = parts[2], parts[3]
+        else:
+            kind, pos = "watermark", q.data.rsplit(":", 1)[1]
+        field_map = {"watermark": "watermark_position", "price": "price_position", "branding": "branding_position"}
+        if kind not in field_map or pos not in WATERMARK_POSITIONS: return
         branding = merge_branding_settings(data)
-        preview_branding = dict(branding, watermark_position=pos)
+        preview_branding = dict(branding, **{field_map[kind]: pos})
         try:
-            image_bytes = await asyncio.to_thread(render_market_card, "Market card preview\nنمونه متن فارسی", preview_branding)
-            await context.bot.send_photo(chat_id=uid, photo=BytesIO(image_bytes), caption=f"Preview: {WATERMARK_POSITIONS[pos]}")
+            image_bytes = await asyncio.to_thread(render_market_card, "✨ 1 TRX :\n💸 59,042 toman\n💵 $0.3456 dollar\nنمونه متن فارسی", preview_branding)
+            await context.bot.send_photo(chat_id=uid, photo=BytesIO(image_bytes), caption=f"Preview: {kind} / {WATERMARK_POSITIONS[pos]}")
         except Exception as exc:
             logging.warning("market_position_preview_failed reason=%s", exc)
-        await q.edit_message_text("این موقعیت ذخیره شود؟", reply_markup=create_market_confirm_keyboard(f"admin:market_position_apply:{pos}", "admin:market_watermark_positions"))
+        await q.edit_message_text("این موقعیت ذخیره شود؟", reply_markup=create_market_confirm_keyboard(f"admin:market_position_apply:{kind}:{pos}", f"admin:market_positions:{kind}"))
     elif q.data.startswith("admin:market_position_apply:"):
-        pos = q.data.rsplit(":", 1)[1]
-        if pos not in WATERMARK_POSITIONS: return
+        parts = q.data.split(":")
+        if len(parts) == 4:
+            kind, pos = parts[2], parts[3]
+        else:
+            kind, pos = "watermark", q.data.rsplit(":", 1)[1]
+        field_map = {"watermark": "watermark_position", "price": "price_position", "branding": "branding_position"}
+        if kind not in field_map or pos not in WATERMARK_POSITIONS: return
         branding = merge_branding_settings(data)
-        branding["watermark_position"] = pos
+        branding[field_map[kind]] = pos
         data.setdefault("market", {})["card"] = branding
         save_data(data)
-        await q.edit_message_text("✅ Watermark position ذخیره شد.", reply_markup=create_market_branding_keyboard(data))
+        await q.edit_message_text("✅ Position ذخیره شد.", reply_markup=create_position_settings_keyboard())
     elif q.data=="admin:market_theme_select":
         await q.edit_message_text("Theme را انتخاب کنید:", reply_markup=create_market_theme_select_keyboard())
     elif q.data.startswith("admin:market_theme_preview:"):
@@ -2054,6 +2159,7 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if DB_PATH.exists():
             DB_PATH.replace(backup_old)
         tmp.replace(DB_PATH)
+        restore_market_api_secrets()
         STATE.flow = STATE.step = None
         await update.message.reply_text("✅ دیتابیس جدید جایگزین شد. ربات در حال ریلود...")
         os.execlp("python", "python", str(BASE_DIR / "bot.py"))
@@ -2192,8 +2298,8 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     feedback = "✅ Channel ID پاک شد."
             else:
                 feedback = f"✅ {field} بروزرسانی شد."
-            if field in {"watermark_position"} and value not in WATERMARK_POSITIONS:
-                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="از دکمه‌های موقعیت Watermark استفاده کنید.", reply_markup=create_watermark_position_keyboard()); return
+            if field in {"watermark_position", "branding_position", "price_position"} and value not in WATERMARK_POSITIONS:
+                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="از دکمه‌های Position استفاده کنید.", reply_markup=create_position_settings_keyboard()); return
             branding[field] = value[:256]
             data.setdefault("market", {})["card"] = branding
             save_data(data)
@@ -2450,11 +2556,12 @@ def get_market_runtime_settings() -> dict[str, Any]:
 
 async def post_init(app: Application) -> None:
     MARKET_SERVICE.bind_store(db)
-    app.create_task(MARKET_SERVICE.run_forever(get_market_runtime_settings))
+    restore_market_api_secrets()
+    asyncio.create_task(MARKET_SERVICE.run_forever(get_market_runtime_settings))
 
 
 def main() -> None:
-    setup_logging(); db.init(); MARKET_SERVICE.bind_store(db); save_data(load_data())
+    setup_logging(); db.init(); MARKET_SERVICE.bind_store(db); restore_market_api_secrets(); backup_market_api_secrets(); save_data(load_data())
     token=os.getenv("BOT_TOKEN")
     if not token: raise RuntimeError("BOT_TOKEN is missing")
     app=Application.builder().token(token).post_init(post_init).build()
