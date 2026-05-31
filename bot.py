@@ -694,6 +694,44 @@ def create_admin_keyboard(data: dict[str, Any]) -> InlineKeyboardMarkup:
     status_btn=create_success_button(f"وضعیت ربات: {status}","toggle:active") if data["active"] else create_danger_button(f"وضعیت ربات: {status}","toggle:active")
     return InlineKeyboardMarkup([[status_btn],[create_primary_button("ویرایش متن‌ها","admin:texts"),create_primary_button("فیچرها","admin:features")],[create_success_button("گزارش وضعیت","admin:report"),create_danger_button("راهنمای برودکست","admin:broadcast_help")],[create_primary_button(f"Self Bot: {selfb}","admin:selfbot"),create_primary_button("مدیریت سلف بات","admin:shortcut_menu")],[create_primary_button(f"Welcome: {wel}","admin:welcome_toggle"),create_primary_button("پیکربندی Welcome","admin:welcome_cfg")],[create_primary_button("Inline Menu Engine","im:root"), create_primary_button(f"Conversion Engine: {market_state}","admin:market_root")],[create_primary_button("بک‌آپ دیتابیس","admin:db_export"), create_primary_button("ایمپورت دیتابیس","admin:db_import")],[create_primary_button("لاگ‌ها","admin:logs_menu")],[create_primary_button("پیام‌های بازخورد","admin:feedback_list")],[create_danger_button("بازگشت","menu:admin")]])
 
+
+
+async def render_admin_panel(update, context, data, *, edit=False, query=None) -> bool:
+    """
+    Single source of truth for admin panel UI.
+
+    Returns True when the panel render request was handled by this UI layer.
+    The return value describes only the UI side effect and must not be used
+    as a global callback-pipeline stop signal.
+    """
+    user_data = getattr(context, "user_data", None)
+    if user_data is not None:
+        if user_data.get("panel_rendered_for_update") == update.update_id:
+            return True
+        user_data["panel_rendered_for_update"] = update.update_id
+
+    text = "پنل ادمین"
+    reply_markup = create_admin_keyboard(data)
+
+    if edit:
+        q = query or update.callback_query
+        if not q:
+            return False
+        try:
+            await q.edit_message_text(text, reply_markup=reply_markup)
+        except BadRequest as exc:
+            if "message is not modified" in str(exc).lower():
+                return True
+            raise
+        return True
+
+    message = update.message or update.effective_message
+    chat = update.effective_chat or getattr(message, "chat", None)
+    if not message or not chat:
+        return False
+    await context.bot.send_message(chat_id=chat.id, text=text, reply_markup=reply_markup)
+    return True
+
 def create_features_keyboard(data: dict[str, Any]) -> InlineKeyboardMarkup:
     rows=[[create_primary_button(f"{'✅' if data['features'].get(k) else '❌'} {k}",f"feature:{k}")] for k in ADMIN_FEATURES+USER_FEATURES]; rows.append([create_danger_button("بازگشت","menu:admin")]); return InlineKeyboardMarkup(rows)
 
@@ -1200,7 +1238,7 @@ async def panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_user: return
     data=load_data()
     if not is_admin(update.effective_user.id,data): return
-    await update.message.reply_text("پنل ادمین", reply_markup=create_admin_keyboard(data))
+    return await render_admin_panel(update, context, data, edit=False)
 
 async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query
@@ -1437,8 +1475,27 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if msg: await send_formatted_message(q.message, msg, data)
         return
     if not is_admin(uid,data): return
-    if q.data=="menu:admin": await q.edit_message_text("پنل ادمین", reply_markup=create_admin_keyboard(data))
-    elif q.data=="toggle:active": data["active"]=not data["active"]; save_data(data); await q.edit_message_text("وضعیت بروزرسانی شد.", reply_markup=create_admin_keyboard(data))
+    panel_callback_data = {"menu:admin", "toggle:active", "admin:selfbot", "admin:welcome_toggle", "admin:db_export"}
+    handled_panel_ui = False
+    if q.data in panel_callback_data or q.data.startswith("panel:"):
+        if q.data=="toggle:active":
+            data["active"]=not data["active"]
+            save_data(data)
+        elif q.data=="admin:selfbot":
+            if not data.get("active", False):
+                await safe_callback_answer(q, "اول ربات را از وضعیت سراسری روشن کنید.", show_alert=True)
+            else:
+                data["self_bot_enabled"]=not data.get("self_bot_enabled",False)
+                save_data(data)
+        elif q.data=="admin:welcome_toggle":
+            data["welcome_enabled"]=not data.get("welcome_enabled",False)
+            save_data(data)
+        elif q.data=="admin:db_export":
+            stamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+            await context.bot.send_document(chat_id=uid, document=DB_PATH.open("rb"), filename=f"bot-backup-{stamp}.db")
+        handled_panel_ui = await render_admin_panel(update, context, data, edit=True, query=q)
+    if handled_panel_ui:
+        pass
     elif q.data=="admin:features": await q.edit_message_text("فیچرها", reply_markup=create_features_keyboard(data))
     elif q.data.startswith("feature:"):
         key=q.data.split(":",1)[1]
@@ -1452,11 +1509,6 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if key in TEXT_KEYS:
             STATE.flow,STATE.step,STATE.admin_id,STATE.message_id,STATE.pending_key="text_edit","waiting_value",uid,q.message.message_id,key
             await q.edit_message_text(f"متن قبلی ({TEXT_KEYS[key]}):\n{data.get(key,'') or '(خالی)'}\n\nمتن جدید را ارسال کنید.")
-    elif q.data=="admin:selfbot":
-        if not data.get("active", False):
-            await safe_callback_answer(q, "اول ربات را از وضعیت سراسری روشن کنید.", show_alert=True)
-            return
-        data["self_bot_enabled"]=not data.get("self_bot_enabled",False); save_data(data); await q.edit_message_text("وضعیت Self Bot تغییر کرد.", reply_markup=create_admin_keyboard(data))
     elif q.data=="admin:shortcut_menu": await q.edit_message_text("مدیریت سلف بات", reply_markup=create_shortcut_menu_keyboard())
     elif q.data=="admin:shortcut_view":
         sc = db.load_shortcuts()
@@ -1537,10 +1589,6 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rows = {r["keyword"]: r["cnt"] for r in db.hit_stats()}
         out = "📚 مشاهده کلمات مانیتور:\n\n" + ("\n".join([f"• {k}: {rows.get(k, 0)}" for k in configured]) if configured else "کلمه‌ای ثبت نشده.")
         await q.edit_message_text(out, reply_markup=build_back_kb("admin:shortcut_menu"))
-    elif q.data=="admin:db_export":
-        stamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-        await context.bot.send_document(chat_id=uid, document=DB_PATH.open("rb"), filename=f"bot-backup-{stamp}.db")
-        await q.edit_message_text("بک‌آپ دیتابیس ارسال شد.", reply_markup=create_admin_keyboard(data))
     elif q.data=="admin:db_import":
         STATE.flow, STATE.step, STATE.admin_id, STATE.message_id = "db_import", "waiting_document", uid, q.message.message_id
         await q.edit_message_text("فایل دیتابیس (.db) را همینجا ارسال کنید.", reply_markup=build_back_kb("menu:admin"))
@@ -1794,8 +1842,6 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data["market"] = settings
             save_data(data)
         await q.edit_message_text("⭐ Stars Rate Settings", reply_markup=create_market_stars_keyboard(data))
-    elif q.data=="admin:welcome_toggle":
-        data["welcome_enabled"]=not data.get("welcome_enabled",False); save_data(data); await q.edit_message_text("وضعیت Welcome تغییر کرد.", reply_markup=create_admin_keyboard(data))
     elif q.data=="admin:welcome_cfg":
         STATE.flow,STATE.step,STATE.admin_id,STATE.message_id,STATE.pending_key="welcome_cfg","waiting_value",uid,q.message.message_id,"welcome_text"
         await q.edit_message_text(f"📝 حالت ویرایش Welcome فعال شد.\n\n✅ همین حالا متن جدید ولکام را در پیام بعدی ارسال کنید.\n\nمتن فعلی:\n{render_html_text(data.get('welcome_text','') or '(خالی)')}", parse_mode=ParseMode.HTML, reply_markup=build_back_kb("menu:admin"))
@@ -1898,7 +1944,6 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
     if prev and int(prev["soft_ban_until"] or 0) > int(time.time()):
         return
     db.upsert_user(uid,(bm.from_user.username if bm.from_user else "") or "",(bm.from_user.full_name if bm.from_user else bm.chat.full_name) or "",None,False,"business",src_txt)
-    await send_business_welcome_once(bm, context, data, uid, prev)
     if data.get("active", False) and data.get("inline_menu_enabled", False):
         menu = db.menu_by_command(txt)
         if menu:
@@ -1994,7 +2039,7 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if txt_cmd in {"panel", "/panel", "menu"}:
             STATE.flow = STATE.step = None
             if txt_cmd in {"panel", "/panel"} and update.effective_user and is_admin(update.effective_user.id, load_data()):
-                await update.message.reply_text("پنل ادمین", reply_markup=create_admin_keyboard(load_data()))
+                await render_admin_panel(update, context, load_data(), edit=False)
             elif txt_cmd == "menu":
                 await update.message.reply_text("منوی کاربر", reply_markup=create_menu_keyboard())
             return
@@ -2024,8 +2069,7 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         STATE.flow=STATE.step=STATE.pending_key=None
         STATE.temp_shortcuts=None
         db.clear_admin_state(uid)
-        await update.message.reply_text("پنل ادمین", reply_markup=create_admin_keyboard(data))
-        return
+        return await render_admin_panel(update, context, data, edit=False)
     if txt.casefold() in {"help convert", "help market", "market help", "راهنمای تبدیل", "راهنمای بازار"}:
         await update.message.reply_text(market_help_text(is_admin=is_admin(uid, data)))
         return
