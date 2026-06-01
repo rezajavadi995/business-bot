@@ -226,6 +226,60 @@ class PhaseDBusinessWelcomeRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(context.bot.sent), 1)
 
 
+
+
+class PhaseDBusinessAdminMenuTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old_db = bot.db
+        self.old_load_data = bot.load_data
+        bot.db = bot.DB(Path(self.tmp.name) / "bot.db")
+        bot.db.init()
+        bot.db.create_menu("buy", "preview")
+        bot.db.add_menu_button(1, "tariff", "just_text", "payload")
+        self.data = {**bot.get_default_data(), "admin_id": 42, "active": True, "inline_menu_enabled": True}
+        bot.load_data = lambda: self.data
+
+        async def no_watch(*args, **kwargs):
+            return None
+
+        self.old_watch = bot.maybe_report_watch_hit
+        bot.maybe_report_watch_hit = no_watch
+
+    def tearDown(self):
+        bot.db = self.old_db
+        bot.load_data = self.old_load_data
+        bot.maybe_report_watch_hit = self.old_watch
+        self.tmp.cleanup()
+
+    async def test_admin_business_menu_without_from_user_deletes_trigger(self):
+        message = DummyBusinessMessage(text="buy")
+        message.from_user = None
+        context = DummyContext()
+
+        async def delete_message(**kwargs):
+            context.bot.sent.append({"deleted": kwargs})
+
+        context.bot.delete_message = delete_message
+        await bot.business_message_handler(SimpleNamespace(business_message=message), context)
+
+        self.assertEqual(context.bot.sent[0]["deleted"]["message_id"], message.message_id)
+        self.assertEqual(context.bot.sent[1]["text"], "<b>preview</b>")
+
+    async def test_customer_business_menu_keeps_trigger(self):
+        message = DummyBusinessMessage(text="buy")
+        context = DummyContext()
+
+        async def delete_message(**kwargs):
+            context.bot.sent.append({"deleted": kwargs})
+
+        context.bot.delete_message = delete_message
+        await bot.business_message_handler(SimpleNamespace(business_message=message), context)
+
+        self.assertFalse(any("deleted" in item for item in context.bot.sent))
+        self.assertEqual(context.bot.sent[0]["text"], "<b>preview</b>")
+
+
 class PhaseDDatabaseMigrationTests(unittest.TestCase):
     def test_init_migrates_legacy_tables_without_dropping_existing_data(self):
         with tempfile.TemporaryDirectory() as tmp:

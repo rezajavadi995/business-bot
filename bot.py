@@ -468,6 +468,29 @@ def load_data() -> dict[str, Any]:
 
 def save_data(data: dict[str, Any]) -> None: db.set_json("settings", data)
 def is_admin(user_id: int, data: dict[str, Any]) -> bool: return user_id == int(data.get("admin_id") or os.getenv("ADMIN_ID") or 0)
+
+
+def is_admin_authored_business_message(message, data: dict[str, Any]) -> bool:
+    if not getattr(message, "business_connection_id", None):
+        return False
+    sender = getattr(message, "from_user", None)
+    if sender and is_admin(int(sender.id), data):
+        return True
+    if sender is None and not getattr(message, "sender_business_bot", None):
+        return True
+    return False
+
+
+def message_sender_id(message, data: dict[str, Any] | None = None) -> int | None:
+    sender = getattr(message, "from_user", None)
+    if sender:
+        return int(sender.id)
+    if getattr(message, "business_connection_id", None) and not getattr(message, "sender_business_bot", None):
+        admin_id = int((data or {}).get("admin_id") or os.getenv("ADMIN_ID") or 0)
+        return admin_id or None
+    chat = getattr(message, "chat", None)
+    return int(chat.id) if chat and getattr(chat, "id", None) is not None else None
+
 def create_primary_button(text: str, callback: str) -> InlineKeyboardButton: return InlineKeyboardButton(f"✨ {text}", callback_data=callback)
 def create_success_button(text: str, callback: str) -> InlineKeyboardButton: return InlineKeyboardButton(f"🚀 {text}", callback_data=callback)
 def create_danger_button(text: str, callback: str) -> InlineKeyboardButton: return InlineKeyboardButton(f"🧨 {text}", callback_data=callback)
@@ -959,6 +982,28 @@ def market_message_dedupe_key(message, source: str) -> str | None:
     return f"market_processed:{source}:{chat_id}:{message_id}"
 
 
+def schedule_market_refresh(market_settings: dict[str, Any]) -> None:
+    task = asyncio.create_task(MARKET_SERVICE.refresh_if_needed(dict(market_settings)))
+
+    def _log_refresh_error(done_task: asyncio.Task) -> None:
+        try:
+            done_task.result()
+        except Exception as exc:
+            logging.warning("market_background_refresh_failed reason=%s", exc)
+
+    task.add_done_callback(_log_refresh_error)
+
+
+def get_market_cache_for_response(market_settings: dict[str, Any]) -> dict[str, Any]:
+    cache = MARKET_SERVICE.read_cache()
+    status = cache_status(cache, market_settings)
+    if status.get("usable"):
+        if not status.get("fresh") and market_settings.get("market_api_enabled", True):
+            schedule_market_refresh(market_settings)
+        return cache
+    return {}
+
+
 async def maybe_send_market_response(message, data: dict[str, Any], *, source: str = "message", is_edit: bool = False) -> bool:
     market_settings = merge_market_settings(data)
     branding = merge_branding_settings(data)
@@ -979,7 +1024,7 @@ async def maybe_send_market_response(message, data: dict[str, Any], *, source: s
         return True
     if dedupe_key:
         db.set_json(dedupe_key, {"processed_at": int(time.time()), "intent": intent.kind})
-    cache = await MARKET_SERVICE.refresh_if_needed(market_settings)
+    cache = get_market_cache_for_response(market_settings) or await MARKET_SERVICE.refresh_if_needed(market_settings)
     try:
         response = render_market_response(text, market_settings, cache)
     except Exception as exc:
@@ -990,7 +1035,9 @@ async def maybe_send_market_response(message, data: dict[str, Any], *, source: s
     if branding.get("card_enabled", False):
         try:
             image_bytes = await asyncio.to_thread(render_market_card, response, branding)
-            await message.reply_photo(photo=BytesIO(image_bytes), caption=render_html_text(response[:1000], bold=False), parse_mode=ParseMode.HTML)
+            photo = BytesIO(image_bytes)
+            photo.name = "market-card.png"
+            await message.reply_photo(photo=photo, caption=render_html_text(response[:1000], bold=False), parse_mode=ParseMode.HTML)
             return True
         except Exception as exc:
             logging.warning("market_card_send_failed reason=%s", exc)
@@ -2066,7 +2113,10 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
     text_markup = text_with_custom_emoji_markup(bm) if getattr(bm, "text", None) else ""
     src_txt = text_markup or message_interaction_text(bm)
     txt=(getattr(bm, "text", None) or getattr(bm, "caption", None) or "").strip()
-    uid=(bm.from_user.id if bm.from_user else bm.chat.id)
+    uid = message_sender_id(bm, data)
+    if uid is None:
+        logging.warning("business_message_missing_sender msg_id=%s", getattr(bm, "message_id", None))
+        return
     await maybe_report_watch_hit(update, context, "business", txt)
     if not data.get("active", False) and not is_admin(uid, data):
         logging.info("business_ignored_bot_inactive uid=%s", uid)
@@ -2088,7 +2138,7 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
             kwargs = {"chat_id": bm.chat.id, "text": out, "parse_mode": ParseMode.HTML, "reply_markup": build_menu_markup(buttons)}
             bc = getattr(bm, "business_connection_id", None)
             if bc: kwargs["business_connection_id"] = bc
-            if is_admin(uid, data):
+            if is_admin(uid, data) or is_admin_authored_business_message(bm, data):
                 await delete_admin_trigger_message(bm, context)
             try:
                 await context.bot.send_message(**kwargs)
