@@ -323,6 +323,13 @@ def render_market_card(response_text: str, branding: dict[str, Any]) -> bytes:
     cached = _CARD_CACHE.get(cache_key)
     if cached and now - cached[0] <= _CARD_CACHE_TTL_SECONDS:
         return cached[1]
+    if branding.get("card_style") == "advanced":
+        data = render_advanced_market_card(response_text, branding)
+        if len(_CARD_CACHE) > 64:
+            _CARD_CACHE.clear()
+        _CARD_CACHE[cache_key] = (now, data)
+        return data
+
     image_mod = importlib.import_module("PIL.Image")
     draw_mod = importlib.import_module("PIL.ImageDraw")
     font_mod = importlib.import_module("PIL.ImageFont")
@@ -362,9 +369,6 @@ def render_market_card(response_text: str, branding: dict[str, Any]) -> bytes:
     fill = (255, 255, 255, int(branding.get("text_opacity", 220))) if dark else (28, 33, 55, int(branding.get("text_opacity", 220)))
     muted = (220, 225, 255, 190) if dark else (80, 87, 120, 190)
 
-    if branding.get("card_style") == "advanced":
-        return render_advanced_market_card(response_text, branding)
-
     branding_text = str(branding.get("branding_text") or "Market Bot")[:64]
     branding_font = title_font if not _is_rtl(branding_text) else _load_font(font_mod, persian_path, 56)
     branding_display = _display_text(branding_text)
@@ -403,7 +407,7 @@ def render_market_card(response_text: str, branding: dict[str, Any]) -> bytes:
         draw.text((x, y), display_watermark, font=watermark_font, fill=muted)
 
     out = BytesIO()
-    base.convert("RGB").save(out, format="PNG", optimize=True)
+    base.convert("RGB").save(out, format="PNG", compress_level=4)
     data = out.getvalue()
     if len(_CARD_CACHE) > 64:
         _CARD_CACHE.clear()
@@ -461,6 +465,33 @@ def _draw_badge(draw, xy: tuple[int, int], text: str, font, fill: tuple[int, int
     return (x, y, x + w, y + h)
 
 
+def _fit_font(font_mod, path: str, text: str, max_width: int, start_size: int, min_size: int = 22):
+    size = start_size
+    while size > min_size:
+        font = _load_font(font_mod, path, size)
+        try:
+            bbox = font.getbbox(text)
+            if bbox[2] - bbox[0] <= max_width:
+                return font
+        except Exception:
+            return font
+        size -= 2
+    return _load_font(font_mod, path, min_size)
+
+
+def _ellipsize_to_width(draw, text: str, font, max_width: int) -> str:
+    display = _display_text(_image_text(text))
+    if draw.textbbox((0, 0), display, font=font)[2] <= max_width:
+        return display
+    raw = _image_text(text)
+    while len(raw) > 4:
+        raw = raw[:-2].rstrip()
+        display = _display_text(raw + "…")
+        if draw.textbbox((0, 0), display, font=font)[2] <= max_width:
+            return display
+    return _display_text(raw)
+
+
 def _positioned_box(position: str, canvas: tuple[int, int], size: tuple[int, int], margin: tuple[int, int] = (72, 62)) -> tuple[int, int]:
     width, height = canvas
     box_w, box_h = size
@@ -474,18 +505,20 @@ def _positioned_box(position: str, canvas: tuple[int, int], size: tuple[int, int
 
 
 def _advanced_background(image_mod, width: int, height: int, primary: tuple[int, int, int], secondary: tuple[int, int, int]):
-    base = image_mod.new("RGB", (width, height), primary)
+    small_w, small_h = 180, 150
+    base = image_mod.new("RGB", (small_w, small_h), primary)
     px = base.load()
-    for x in range(width):
-        ratio = x / max(width - 1, 1)
+    for x in range(small_w):
+        ratio = x / max(small_w - 1, 1)
         r = int(primary[0] * (1 - ratio) + secondary[0] * ratio)
         g = int(primary[1] * (1 - ratio) + secondary[1] * ratio)
         b = int(primary[2] * (1 - ratio) + secondary[2] * ratio)
-        for y in range(height):
-            center = 1 - min(0.28, (((x - width / 2) ** 2 + (y - height / 2) ** 2) ** 0.5 / width) * 0.22)
-            soft = 0.92 + 0.08 * math.sin((x + y) / 210)
+        for y in range(small_h):
+            center = 1 - min(0.28, (((x - small_w / 2) ** 2 + (y - small_h / 2) ** 2) ** 0.5 / small_w) * 0.22)
+            soft = 0.92 + 0.08 * math.sin((x + y) / 36)
             px[x, y] = (int(r * center * soft), int(g * center * soft), int(b * center * soft))
-    return base.convert("RGBA")
+    resample = getattr(image_mod, "Resampling", image_mod).BICUBIC
+    return base.resize((width, height), resample).convert("RGBA")
 
 
 def render_advanced_market_card(response_text: str, branding: dict[str, Any]) -> bytes:
@@ -504,24 +537,29 @@ def render_advanced_market_card(response_text: str, branding: dict[str, Any]) ->
 
     english_choice = ENGLISH_FONT_CHOICES.get(str(branding.get("english_font") or "inter"), ENGLISH_FONT_CHOICES["inter"])
     persian_choice = PERSIAN_FONT_CHOICES.get(str(branding.get("persian_font") or "vazir"), PERSIAN_FONT_CHOICES["vazir"])
-    en_bold = _load_font(font_mod, _font_path(english_choice, True), 58)
-    en = _load_font(font_mod, _font_path(english_choice, False), 32)
-    en_small = _load_font(font_mod, _font_path(english_choice, False), 24)
-    fa_bold = _load_font(font_mod, _font_path(persian_choice, True), 42)
-    fa = _load_font(font_mod, _font_path(persian_choice, False), 31)
-    fa_small = _load_font(font_mod, _font_path(persian_choice, False), 24)
+    english_bold_path = _font_path(english_choice, True)
+    english_regular_path = _font_path(english_choice, False)
+    persian_bold_path = _font_path(persian_choice, True)
+    persian_regular_path = _font_path(persian_choice, False)
+    en_bold = _load_font(font_mod, english_bold_path, 58)
+    en = _load_font(font_mod, english_regular_path, 32)
+    en_small = _load_font(font_mod, english_regular_path, 24)
+    fa_bold = _load_font(font_mod, persian_bold_path, 42)
+    fa = _load_font(font_mod, persian_regular_path, 31)
+    fa_small = _load_font(font_mod, persian_regular_path, 24)
 
     logo_slot = (width - 192, 46, width - 74, 164)
     brand = str(branding.get("branding_text") or "Market Bot")[:36]
     brand_font = fa_bold if _is_rtl(brand) else en_bold
     brand_bbox = draw.textbbox((0, 0), _display_text(brand), font=brand_font)
-    brand_w = min(brand_bbox[2] - brand_bbox[0] + 38, 610)
-    brand_h = 58
+    brand_w = min(brand_bbox[2] - brand_bbox[0] + 46, 610)
+    brand_h = 72
     brand_x, brand_y = _positioned_box(str(branding.get("branding_position") or "top_left"), (width, height), (brand_w, brand_h), (76, 38))
     if brand_x + brand_w > logo_slot[0] - 16 and brand_y < logo_slot[3] + 8:
         brand_x = 76
-    draw.rounded_rectangle((brand_x, brand_y, brand_x + brand_w, brand_y + brand_h), radius=20, fill=(15, 21, 34, 105), outline=(255, 255, 255, 74), width=1)
-    _draw_text(draw, (brand_x + 18, brand_y + 9), brand, brand_font, (255, 255, 255, text_alpha))
+    draw.rounded_rectangle((brand_x, brand_y, brand_x + brand_w, brand_y + brand_h), radius=22, fill=(15, 21, 34, 105), outline=(255, 255, 255, 74), width=1)
+    brand_text_y = brand_y + max(6, (brand_h - (brand_bbox[3] - brand_bbox[1])) // 2 - 4)
+    _draw_text(draw, (brand_x + 22, brand_text_y), brand, brand_font, (255, 255, 255, text_alpha))
 
     logo_path = Path(str(branding.get("logo_path") or ""))
     if branding.get("logo_enabled", False) and logo_path.exists():
@@ -544,12 +582,14 @@ def render_advanced_market_card(response_text: str, branding: dict[str, Any]) ->
     draw.text((panel_x + 122, panel_y + 32), facts["symbol"], font=en_bold, fill=(16, 20, 32, text_alpha))
     draw.text((panel_x + panel_w - 240, panel_y + 48), f"{facts['symbol']} / USD", font=en, fill=(130, 136, 148, 230))
 
-    draw.text((panel_x + 62, panel_y + 130), f"${facts['usd']}", font=_load_font(font_mod, _font_path(english_choice, True), 82), fill=(8, 12, 24, text_alpha))
+    price_text = f"${facts['usd']}"
+    price_font = _fit_font(font_mod, english_bold_path, price_text, 390, 82, 54)
+    draw.text((panel_x + 62, panel_y + 126), price_text, font=price_font, fill=(8, 12, 24, text_alpha))
     change = facts["change"]
     change_color = (12, 180, 110, 255) if change >= 0 else (226, 64, 75, 255)
-    draw.text((panel_x + 66, panel_y + 230), f"{change:+.2f}%", font=en_bold, fill=change_color)
+    draw.text((panel_x + 66, panel_y + 224), f"{change:+.2f}%", font=en_bold, fill=change_color)
 
-    chart_left, chart_top = panel_x + 70, panel_y + 306
+    chart_left, chart_top = panel_x + 70, panel_y + 318
     chart_right, chart_bottom = panel_x + panel_w - 70, panel_y + panel_h - 136
     for i in range(5):
         y = chart_top + i * ((chart_bottom - chart_top) // 4)
@@ -576,15 +616,17 @@ def render_advanced_market_card(response_text: str, branding: dict[str, Any]) ->
     draw.text((info_x + 530, info_y + 21), f"${facts['usd']}", font=en, fill=(255, 255, 255, text_alpha))
 
     if facts.get("result"):
-        result = facts["result"][:34]
-        rb_w, rb_h = 520, 58
-        rb_x, rb_y = panel_x + panel_w - rb_w - 42, panel_y + 140
-        draw.rounded_rectangle((rb_x, rb_y, rb_x + rb_w, rb_y + rb_h), radius=20, fill=accent + (35,), outline=accent + (105,), width=2)
-        draw.text((rb_x + 20, rb_y + 12), _display_text(_image_text(result)), font=fa if _is_rtl(result) else en, fill=(18, 24, 38, text_alpha))
+        result = facts["result"]
+        rb_w, rb_h = 450, 62
+        rb_x, rb_y = panel_x + panel_w - rb_w - 42, panel_y + 132
+        result_font = fa if _is_rtl(result) else _fit_font(font_mod, english_regular_path, _image_text(result), rb_w - 42, 32, 23)
+        result_text = _ellipsize_to_width(draw, result, result_font, rb_w - 42)
+        draw.rounded_rectangle((rb_x, rb_y, rb_x + rb_w, rb_y + rb_h), radius=21, fill=accent + (45,), outline=accent + (130,), width=2)
+        draw.text((rb_x + 20, rb_y + 14), result_text, font=result_font, fill=(18, 24, 38, text_alpha))
     if facts.get("high_low"):
         high, low = facts["high_low"]
         text = f"High / Low  {high} / {low}"
-        draw.text((panel_x + 62, panel_y + 286), text, font=en_small, fill=(102, 110, 128, 230))
+        draw.text((panel_x + 62, panel_y + 284), text, font=en_small, fill=(102, 110, 128, 230))
 
     watermark = str(branding.get("watermark_text") or branding.get("branding_channel_id") or "")[:64]
     if watermark:
@@ -596,5 +638,5 @@ def render_advanced_market_card(response_text: str, branding: dict[str, Any]) ->
         _draw_text(draw, (wm_x + 13, wm_y + 7), watermark, wm_font, (255, 255, 255, min(text_alpha, 230)))
 
     out = BytesIO()
-    base.convert("RGB").save(out, format="PNG", optimize=True)
+    base.convert("RGB").save(out, format="PNG", compress_level=4)
     return out.getvalue()
