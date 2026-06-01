@@ -51,6 +51,52 @@ class DummyContext:
         self.bot = DummyBot()
 
 
+class DummyCallbackMessage:
+    def __init__(self, chat_id=555, business_connection_id=None):
+        self.chat = DummyChat(chat_id)
+        self.message_id = 33
+        self.business_connection_id = business_connection_id
+        self.replies = []
+
+    async def reply_text(self, text, **kwargs):
+        self.replies.append((text, kwargs))
+
+
+class DummyCallbackQuery:
+    def __init__(self, uid, data, message=None):
+        self.from_user = SimpleNamespace(id=uid, username=f"u{uid}", full_name=f"User {uid}", first_name="User")
+        self.data = data
+        self.message = message or DummyCallbackMessage()
+        self.answers = []
+        self.id = "query-id"
+
+    async def answer(self, text=None, show_alert=False):
+        self.answers.append((text, show_alert))
+
+    async def edit_message_text(self, *args, **kwargs):
+        self.edited_text = (args, kwargs)
+
+    async def edit_message_reply_markup(self, *args, **kwargs):
+        self.edited_markup = (args, kwargs)
+
+
+class CallbackBot(DummyBot):
+    async def send_message(self, **kwargs):
+        self.sent.append(kwargs)
+        return SimpleNamespace(message_id=len(self.sent) + 100)
+
+    async def edit_message_text(self, **kwargs):
+        self.sent.append({"edit": kwargs})
+
+    async def get_business_connection(self, business_connection_id):
+        return SimpleNamespace(user=SimpleNamespace(id=42), user_chat_id=42)
+
+
+class CallbackContext(DummyContext):
+    def __init__(self):
+        self.bot = CallbackBot()
+
+
 
 class MarketSecretBackupTests(unittest.TestCase):
     def setUp(self):
@@ -141,6 +187,56 @@ class PhaseDCallbackLimitTests(unittest.TestCase):
 
         bot.reset_callback_session(101)
         self.assertTrue(bot.inline_button_rate_limited(101, 77))
+
+
+class PhaseDCallbackRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old_db = bot.db
+        self.old_load_data = bot.load_data
+        bot.BUSINESS_OWNER_CACHE.clear()
+        bot.db = bot.DB(Path(self.tmp.name) / "bot.db")
+        bot.db.init()
+        menu_id = bot.db.create_menu("buy", "preview")
+        self.button_id = bot.db.add_menu_button(menu_id, "tariff", "just_text", "payload")
+        self.data = {**bot.get_default_data(), "admin_id": 42, "active": True, "inline_menu_enabled": True}
+        bot.load_data = lambda: self.data
+
+    def tearDown(self):
+        bot.db = self.old_db
+        bot.load_data = self.old_load_data
+        bot.BUSINESS_OWNER_CACHE.clear()
+        self.tmp.cleanup()
+
+    async def test_admin_inline_menu_button_bypasses_ban_and_disabled_engine(self):
+        self.data["active"] = False
+        self.data["inline_menu_enabled"] = False
+        bot.db.upsert_user(42, "", "Admin", None, False, "test", "")
+        bot.db.set_soft_ban(42, int(__import__("time").time()) + bot.CALLBACK_COOLDOWN_SECONDS)
+        q = DummyCallbackQuery(42, f"im:btn:{self.button_id}", DummyCallbackMessage(business_connection_id="bc"))
+        context = CallbackContext()
+
+        await bot.callbacks(SimpleNamespace(callback_query=q), context)
+
+        self.assertEqual(q.answers[-1], (None, False))
+        self.assertEqual(context.bot.sent[0]["text"], "<b>payload</b>")
+
+    async def test_customer_inline_menu_button_blocks_after_five_clicks_per_button(self):
+        bot.db.upsert_user(101, "", "Customer", None, False, "test", "")
+        context = CallbackContext()
+
+        for _ in range(bot.CALLBACK_ALLOWED_INTERACTIONS):
+            q = DummyCallbackQuery(101, f"im:btn:{self.button_id}")
+            await bot.callbacks(SimpleNamespace(callback_query=q), context)
+            self.assertEqual(q.answers[-1], (None, False))
+
+        blocked = DummyCallbackQuery(101, f"im:btn:{self.button_id}")
+        await bot.callbacks(SimpleNamespace(callback_query=blocked), context)
+
+        self.assertTrue(blocked.answers[-1][1])
+        self.assertIn("۲۰", blocked.answers[-1][0])
+        row = bot.db.get_user(101)
+        self.assertEqual(int(row["spam_score"] or 0), 1)
 
 
 class PhaseDWelcomeInteractionTests(unittest.TestCase):
