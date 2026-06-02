@@ -2287,13 +2287,6 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_user: return
     if STATE.admin_id == (update.effective_user.id if update.effective_user else None) and STATE.flow == "db_import" and STATE.step == "waiting_document":
         txt_cmd = (update.message.text or "").strip().lower() if update.message else ""
-        if txt_cmd in {"panel", "/panel", "menu"}:
-            STATE.flow = STATE.step = None
-            if txt_cmd in {"panel", "/panel"} and update.effective_user and is_admin(update.effective_user.id, load_data()):
-                await render_admin_panel(update, context, load_data(), edit=False)
-            elif txt_cmd == "menu":
-                await update.message.reply_text("منوی کاربر", reply_markup=create_menu_keyboard())
-            return
         doc = update.message.document
         if not doc:
             await update.message.reply_text("لطفاً فایل .db ارسال کنید.")
