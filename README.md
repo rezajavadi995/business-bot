@@ -471,9 +471,9 @@ Watch hits use source/chat/message/keyword dedupe to avoid repeated monitoring r
 
 ### Callback cooldown
 
-Non-admin callback users are allowed 5 total menu/button callback interactions per 20-minute cooldown window from a shared callback bucket. On the next interaction, a callback-only cooldown alert is shown for 20 minutes. Admin users are exempt from this callback limit.
+Non-admin inline-menu callback users are allowed 5 clicks per individual menu button in each one-hour cooldown window. On the next click of that same button, the user receives a one-hour soft-ban alert. Admin users are exempt from this callback limit.
 
-Callback hardening also keeps callback data within Telegram’s 64-byte limit, avoids disabling working keyboards just because one user hits a cooldown, and resets stale callback counters when a user opens a fresh menu session.
+Callback hardening also keeps callback data within Telegram’s 64-byte limit, avoids disabling working keyboards just because one user hits a cooldown, and keeps each menu button in its own click bucket.
 
 ### Cache consistency
 
@@ -600,7 +600,7 @@ Check:
 
 ### Callback users get cooldown alerts
 
-Non-admin users get 5 allowed callback interactions per 20-minute shared callback window. Admin users are exempt. If a regular user exceeds the limit, wait for the callback cooldown or have the user open a fresh menu session.
+Non-admin users get 5 allowed clicks per inline-menu button per one-hour window. Admin users are exempt. If a regular user exceeds the per-button limit, they receive a one-hour soft-ban alert and must wait for the cooldown to expire.
 
 ### Welcome does not send on media
 
