@@ -41,7 +41,7 @@ load_dotenv(ENV_PATH)
 
 START_TIME = int(time.time())
 SOFT_BAN_SECONDS = 20 * 60
-CALLBACK_COOLDOWN_SECONDS = 20 * 60
+CALLBACK_COOLDOWN_SECONDS = 60 * 60
 CALLBACK_ALLOWED_INTERACTIONS = 5
 CALLBACK_RATE_BUCKET = "callback_button"
 WELCOME_COOLDOWN_SECONDS = 24 * 60 * 60
@@ -1157,7 +1157,7 @@ def callback_cooldown_key(uid: int, action_key: str | None = None) -> str:
 
 def reset_callback_session(uid: int) -> None:
     # Keep this backward-compatible for old global buckets, but per-button limits
-    # intentionally survive menu reopens until their own 20-minute window expires.
+    # intentionally survive menu reopens until their own one-hour window expires.
     db.set_json(callback_rate_key(uid), [])
     db.set_json(callback_cooldown_key(uid), 0)
 
@@ -1343,7 +1343,7 @@ async def disable_callback_markup(q) -> None:
 
 
 async def block_banned_callback(q, data: dict[str, Any]) -> None:
-    await safe_callback_answer(q, "🚫 شما موقتاً محدود شدید. ۲۰ دقیقه دیگر دوباره تلاش کنید.", show_alert=True)
+    await safe_callback_answer(q, "🚫 شما یک ساعت بن شدید. لطفاً بعد از پایان محدودیت دوباره تلاش کنید.", show_alert=True)
 
 
 def persian_digits(value: int | str) -> str:
@@ -1352,7 +1352,10 @@ def persian_digits(value: int | str) -> str:
 
 async def block_rate_limited_callback(q, data: dict[str, Any], cooldown_seconds: int = CALLBACK_COOLDOWN_SECONDS) -> None:
     minutes = max(1, int(cooldown_seconds // 60))
-    await safe_callback_answer(q, f"🚫 شما بن شدید. {persian_digits(minutes)} دقیقه دیگر مجدد تلاش کنید.", show_alert=True)
+    if minutes >= 60:
+        await safe_callback_answer(q, "🚫 شما یک ساعت بن شدید.", show_alert=True)
+    else:
+        await safe_callback_answer(q, f"🚫 شما بن شدید. {persian_digits(minutes)} دقیقه دیگر مجدد تلاش کنید.", show_alert=True)
 
 async def send_or_replace_button_response(q, context: ContextTypes.DEFAULT_TYPE, button_id: int, payload: str, data: dict[str, Any]):
     if not q.message:
@@ -1373,9 +1376,9 @@ async def send_or_replace_button_response(q, context: ContextTypes.DEFAULT_TYPE,
             return
         except BadRequest as exc:
             if "message is not modified" in str(exc).lower():
-                db.set_json(storage_key, {"message_id": prev_msg_id, "updated_at": int(time.time())})
-                return
-            logging.warning("button_response_edit_failed uid=%s bid=%s reason=%s", q.from_user.id, button_id, exc)
+                logging.info("button_response_same_payload_resend uid=%s bid=%s prev_msg_id=%s", q.from_user.id, button_id, prev_msg_id)
+            else:
+                logging.warning("button_response_edit_failed uid=%s bid=%s reason=%s", q.from_user.id, button_id, exc)
         except Exception as exc:
             logging.warning("button_response_edit_failed uid=%s bid=%s reason=%s", q.from_user.id, button_id, exc)
     try:
