@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import bot
+from telegram.error import BadRequest
 
 
 class DummyChat:
@@ -82,10 +83,15 @@ class DummyCallbackQuery:
 
 class CallbackBot(DummyBot):
     async def send_message(self, **kwargs):
-        self.sent.append(kwargs)
-        return SimpleNamespace(message_id=len(self.sent) + 100)
+        message_id = len(self.sent) + 100
+        self.sent.append({**kwargs, "_message_id": message_id})
+        return SimpleNamespace(message_id=message_id)
 
     async def edit_message_text(self, **kwargs):
+        message_id = kwargs.get("message_id")
+        current = next((item for item in self.sent if item.get("_message_id") == message_id), None)
+        if current and current.get("text") == kwargs.get("text"):
+            raise BadRequest("Message is not modified")
         self.sent.append({"edit": kwargs})
 
     async def get_business_connection(self, business_connection_id):
@@ -156,7 +162,7 @@ class PhaseDCallbackLimitTests(unittest.TestCase):
         bot.db = self.old_db
         self.tmp.cleanup()
 
-    def test_callback_buttons_allow_five_per_button_then_twenty_minute_ban(self):
+    def test_callback_buttons_allow_five_per_button_then_one_hour_ban(self):
         for _ in range(bot.CALLBACK_ALLOWED_INTERACTIONS):
             self.assertFalse(bot.inline_button_rate_limited(101, 77))
 
@@ -234,7 +240,8 @@ class PhaseDCallbackRuntimeTests(unittest.IsolatedAsyncioTestCase):
         await bot.callbacks(SimpleNamespace(callback_query=blocked), context)
 
         self.assertTrue(blocked.answers[-1][1])
-        self.assertIn("۲۰", blocked.answers[-1][0])
+        self.assertIn("یک ساعت", blocked.answers[-1][0])
+        self.assertEqual(len([item for item in context.bot.sent if "edit" not in item]), bot.CALLBACK_ALLOWED_INTERACTIONS)
         row = bot.db.get_user(101)
         self.assertEqual(int(row["spam_score"] or 0), 1)
 
