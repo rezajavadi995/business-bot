@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import bot
-from telegram.error import BadRequest
+from telegram.error import BadRequest, RetryAfter
 
 
 class DummyChat:
@@ -241,9 +241,29 @@ class PhaseDCallbackRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(blocked.answers[-1][1])
         self.assertIn("یک ساعت", blocked.answers[-1][0])
-        self.assertEqual(len([item for item in context.bot.sent if "edit" not in item]), bot.CALLBACK_ALLOWED_INTERACTIONS)
+        sends = [item for item in context.bot.sent if "edit" not in item]
+        edits = [item for item in context.bot.sent if "edit" in item]
+        self.assertEqual(len(sends), 1)
+        self.assertEqual(len(edits), bot.CALLBACK_ALLOWED_INTERACTIONS - 1)
         row = bot.db.get_user(101)
         self.assertEqual(int(row["spam_score"] or 0), 1)
+
+    async def test_callback_retry_after_does_not_send_fallback_or_crash(self):
+        bot.db.upsert_user(101, "", "Customer", None, False, "test", "")
+        context = CallbackContext()
+        q = DummyCallbackQuery(101, f"im:btn:{self.button_id}")
+        await bot.callbacks(SimpleNamespace(callback_query=q), context)
+        sent_before = len(context.bot.sent)
+
+        async def retry_after_edit(**kwargs):
+            raise RetryAfter(198)
+
+        context.bot.edit_message_text = retry_after_edit
+        q2 = DummyCallbackQuery(101, f"im:btn:{self.button_id}")
+        await bot.callbacks(SimpleNamespace(callback_query=q2), context)
+
+        self.assertEqual(q2.answers[-1], (None, False))
+        self.assertEqual(len(context.bot.sent), sent_before)
 
 
 class PhaseDWelcomeInteractionTests(unittest.TestCase):
@@ -380,6 +400,16 @@ class PhaseDBusinessAdminMenuTests(unittest.IsolatedAsyncioTestCase):
         await bot.business_message_handler(SimpleNamespace(business_message=message), context)
 
         self.assertFalse(any("deleted" in item for item in context.bot.sent))
+        self.assertEqual(context.bot.sent[0]["text"], "<b>preview</b>")
+
+    async def test_customer_business_menu_opens_even_with_soft_ban(self):
+        bot.db.upsert_user(202, "", "Customer", None, False, "test", "")
+        bot.db.set_soft_ban(202, int(__import__("time").time()) + 300)
+        message = DummyBusinessMessage(text="buy")
+        context = DummyContext()
+
+        await bot.business_message_handler(SimpleNamespace(business_message=message), context)
+
         self.assertEqual(context.bot.sent[0]["text"], "<b>preview</b>")
 
 

@@ -23,7 +23,7 @@ from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram import MessageEntity
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, TimedOut
+from telegram.error import BadRequest, RetryAfter, TimedOut
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 from features.log_export import build_logs_keyboard, humanize_log_text
 from features.inline_menu import build_inline_menu_admin_kb, paged_rows, CB as IMCB
@@ -1198,7 +1198,8 @@ def user_button_rate_limited(uid: int, callback_data: str) -> bool:
 
 
 def menu_command_rate_limited(uid: int, command: str) -> bool:
-    return smart_rate_limit(uid, "menu_command", command, 60, 16, 30, 5)
+    # Opening inline menus must stay reliable; button callbacks own abuse limits.
+    return False
 
 
 def shortcut_rate_limited(uid: int, command: str) -> bool:
@@ -1357,6 +1358,14 @@ async def block_rate_limited_callback(q, data: dict[str, Any], cooldown_seconds:
     else:
         await safe_callback_answer(q, f"🚫 شما بن شدید. {persian_digits(minutes)} دقیقه دیگر مجدد تلاش کنید.", show_alert=True)
 
+def invisible_click_marker(marker: int) -> str:
+    return "\u2060" * (1 + (marker % 2))
+
+
+def button_response_text(base_text: str, marker: int, include_marker: bool) -> str:
+    return f"{base_text}{invisible_click_marker(marker)}" if include_marker else base_text
+
+
 async def send_or_replace_button_response(q, context: ContextTypes.DEFAULT_TYPE, button_id: int, payload: str, data: dict[str, Any]):
     if not q.message:
         return
@@ -1364,26 +1373,34 @@ async def send_or_replace_button_response(q, context: ContextTypes.DEFAULT_TYPE,
     storage_key = f"last_btn_response:{q.from_user.id}:{chat_id}:{button_id}"
     out_text = render_html_text(payload, bold=data.get("bold_mode", True))
     bc = getattr(q.message, "business_connection_id", None)
-    kwargs = {"chat_id": chat_id, "text": out_text, "parse_mode": ParseMode.HTML}
+    base_kwargs = {"chat_id": chat_id, "parse_mode": ParseMode.HTML}
     if bc:
-        kwargs["business_connection_id"] = bc
+        base_kwargs["business_connection_id"] = bc
     previous = db.get_json(storage_key, {})
     prev_msg_id = int(previous.get("message_id") or 0) if isinstance(previous, dict) else 0
+    prev_marker = int(previous.get("marker") or 0) if isinstance(previous, dict) else 0
+    next_marker = (prev_marker + 1) % 2
     if prev_msg_id:
         try:
-            await context.bot.edit_message_text(message_id=prev_msg_id, **kwargs)
-            db.set_json(storage_key, {"message_id": prev_msg_id, "updated_at": int(time.time())})
+            await context.bot.edit_message_text(message_id=prev_msg_id, text=button_response_text(out_text, next_marker, True), **base_kwargs)
+            db.set_json(storage_key, {"message_id": prev_msg_id, "updated_at": int(time.time()), "marker": next_marker})
             return
         except BadRequest as exc:
             if "message is not modified" in str(exc).lower():
-                logging.info("button_response_same_payload_resend uid=%s bid=%s prev_msg_id=%s", q.from_user.id, button_id, prev_msg_id)
-            else:
-                logging.warning("button_response_edit_failed uid=%s bid=%s reason=%s", q.from_user.id, button_id, exc)
+                logging.info("button_response_same_payload_ignored uid=%s bid=%s prev_msg_id=%s", q.from_user.id, button_id, prev_msg_id)
+                db.set_json(storage_key, {"message_id": prev_msg_id, "updated_at": int(time.time()), "marker": next_marker})
+                return
+            logging.warning("button_response_edit_failed uid=%s bid=%s reason=%s", q.from_user.id, button_id, exc)
+        except RetryAfter as exc:
+            logging.warning("button_response_edit_retry_after uid=%s bid=%s retry_after=%s", q.from_user.id, button_id, getattr(exc, "retry_after", None))
+            return
         except Exception as exc:
             logging.warning("button_response_edit_failed uid=%s bid=%s reason=%s", q.from_user.id, button_id, exc)
     try:
-        sent = await context.bot.send_message(**kwargs)
-        db.set_json(storage_key, {"message_id": sent.message_id, "updated_at": int(time.time())})
+        sent = await context.bot.send_message(text=out_text, **base_kwargs)
+        db.set_json(storage_key, {"message_id": sent.message_id, "updated_at": int(time.time()), "marker": 0})
+    except RetryAfter as exc:
+        logging.warning("button_response_send_retry_after uid=%s bid=%s retry_after=%s", q.from_user.id, button_id, getattr(exc, "retry_after", None))
     except TimedOut:
         logging.warning("button_response_send_timeout uid=%s bid=%s", q.from_user.id, button_id)
 
@@ -2178,15 +2195,10 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
         logging.info("business_ignored_bot_inactive uid=%s", uid)
         return
     prev=db.get_user(uid)
-    if prev and int(prev["soft_ban_until"] or 0) > int(time.time()) and not admin_allowed:
-        return
     db.upsert_user(uid,(bm.from_user.username if bm.from_user else "") or "",(bm.from_user.full_name if bm.from_user else bm.chat.full_name) or "",None,False,"business",src_txt)
     if (data.get("active", False) and data.get("inline_menu_enabled", False)) or admin_allowed:
         menu = db.menu_by_command(txt)
         if menu:
-            if not admin_allowed and menu_command_rate_limited(uid, txt):
-                logging.warning("business_menu_command_rate_limited uid=%s command=%r", uid, txt)
-                return
             buttons = db.menu_buttons(menu["id"])
             if not admin_allowed:
                 reset_callback_session(uid)
@@ -2198,9 +2210,13 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
                 await delete_admin_trigger_message(bm, context)
             try:
                 await context.bot.send_message(**kwargs)
+            except RetryAfter as exc:
+                logging.warning("business_inline_menu_send_retry_after uid=%s chat_id=%s command=%r retry_after=%s", uid, bm.chat.id, txt, getattr(exc, "retry_after", None))
             except TimedOut:
                 logging.warning("business_inline_menu_send_timeout uid=%s chat_id=%s command=%r", uid, bm.chat.id, txt)
             return
+    if prev and int(prev["soft_ban_until"] or 0) > int(time.time()) and not admin_allowed:
+        return
     if await maybe_send_market_response(bm, data, source="business"):
         return
     sc=db.load_shortcuts(); resp=match_shortcut(txt, sc)
@@ -2346,25 +2362,27 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if s=="im_edit_button_output":
             bid=int(p["button_id"]); db.update_button_output(bid, src_txt); db.log_admin(uid,"edit","menu_button_output",bid,None,src_txt); db.clear_admin_state(uid); await update.message.reply_text("خروجی دکمه بروزرسانی شد."); return
     admin_allowed = is_admin(uid, data)
-    row=db.get_user(uid)
-    if row and int(row["soft_ban_until"] or 0)>int(time.time()) and not admin_allowed: return
     db.upsert_user(uid, update.effective_user.username or "", update.effective_user.full_name or update.effective_user.first_name or "", update.message.contact.phone_number if update.message.contact else None, False, "message", txt)
 
     if (data.get("active", False) and data.get("inline_menu_enabled", False)) or admin_allowed:
         m = db.menu_by_command(txt)
         if m:
-            if not admin_allowed and menu_command_rate_limited(uid, txt):
-                logging.warning("menu_command_rate_limited uid=%s command=%r", uid, txt)
-                return
             btns=db.menu_buttons(m["id"])
             if not admin_allowed:
                 reset_callback_session(uid)
-            if admin_allowed:
-                await delete_admin_trigger_message(update.message, context)
-                await context.bot.send_message(chat_id=update.effective_chat.id, text=render_html_text(m["preview_text"], bold=data.get("bold_mode", True)), parse_mode=ParseMode.HTML, reply_markup=build_menu_markup(btns))
-            else:
-                await update.message.reply_text(render_html_text(m["preview_text"], bold=data.get("bold_mode", True)), parse_mode=ParseMode.HTML, reply_markup=build_menu_markup(btns))
+            try:
+                if admin_allowed:
+                    await delete_admin_trigger_message(update.message, context)
+                    await context.bot.send_message(chat_id=update.effective_chat.id, text=render_html_text(m["preview_text"], bold=data.get("bold_mode", True)), parse_mode=ParseMode.HTML, reply_markup=build_menu_markup(btns))
+                else:
+                    await update.message.reply_text(render_html_text(m["preview_text"], bold=data.get("bold_mode", True)), parse_mode=ParseMode.HTML, reply_markup=build_menu_markup(btns))
+            except RetryAfter as exc:
+                logging.warning("inline_menu_send_retry_after uid=%s chat_id=%s command=%r retry_after=%s", uid, update.effective_chat.id, txt, getattr(exc, "retry_after", None))
+            except TimedOut:
+                logging.warning("inline_menu_send_timeout uid=%s chat_id=%s command=%r", uid, update.effective_chat.id, txt)
             return
+    row=db.get_user(uid)
+    if row and int(row["soft_ban_until"] or 0)>int(time.time()) and not admin_allowed: return
     if txt.lower()=="menu":
         if not data.get("active", False) and not admin_allowed:
             return
