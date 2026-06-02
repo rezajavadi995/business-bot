@@ -101,6 +101,12 @@ class MarketEngineRenderTests(unittest.TestCase):
         text = render_market_response("100 usd trx", self.settings, self.cache)
         self.assertIn("833.333 TRX", text)
 
+    def test_conversion_includes_unit_price_and_daily_change(self):
+        text = render_market_response("۲۰۰ ترون تومان", self.settings, self.cache)
+        self.assertIn("قیمت واحد ۱ TRX", text)
+        self.assertIn("رشد روزانه", text)
+        self.assertIn("2.50%", text)
+
     def test_price_uses_cached_change(self):
         text = render_market_response("trx status", self.settings, self.cache)
         self.assertIn("24h: +2.50%", text)
@@ -113,9 +119,9 @@ class MarketEngineRenderTests(unittest.TestCase):
         self.assertIn("70/100", render_market_response("fear greed", self.settings, self.cache))
 
     def test_fiat_price_uses_cached_toman_rate(self):
-        self.assertIn("3,720 toman", render_market_response("لیر", self.settings, self.cache))
-        self.assertIn("2,370 toman", render_market_response("روبل", self.settings, self.cache))
-        self.assertIn("$0.02177731 dollar", render_market_response("۱ لیر", self.settings, self.cache))
+        self.assertIn("تومانی: <b>3,720</b>", render_market_response("لیر", self.settings, self.cache))
+        self.assertIn("تومانی: <b>2,370</b>", render_market_response("روبل", self.settings, self.cache))
+        self.assertIn("دلار: <b>$0.02177731</b>", render_market_response("۱ لیر", self.settings, self.cache))
 
     def test_stale_cache_fails_safely(self):
         stale = dict(self.cache, updated_at=1)

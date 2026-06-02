@@ -1,4 +1,8 @@
+import tempfile
 import unittest
+from pathlib import Path
+
+from PIL import Image
 
 from features.market_cards import (
     CARD_THEMES,
@@ -32,6 +36,16 @@ class MarketCardBrandingTests(unittest.TestCase):
         image = render_market_card("قیمت بیت‌کوین\n💵 70,000 USD\n✨ تبدیل 100 ترون", branding)
         self.assertGreater(len(image), 1000)
         self.assertTrue(image.startswith(b"\x89PNG"))
+
+    def test_advanced_card_respects_positions_theme_and_logo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            logo_path = Path(tmp) / "logo.png"
+            Image.new("RGBA", (96, 96), (255, 255, 255, 255)).save(logo_path)
+            data = {"market": {"card": {"card_style": "advanced", "card_theme": "emerald", "card_primary_color": CARD_THEMES["emerald"]["primary"], "card_secondary_color": CARD_THEMES["emerald"]["secondary"], "branding_position": "top_right", "watermark_position": "bottom_center", "price_position": "bottom_center", "logo_enabled": True, "logo_path": str(logo_path)}}}
+            branding = merge_branding_settings(data)
+            image = render_market_card("<b>🔺 قیمت TRX</b>\n💵 دلاری: <b>$0.3456</b>\n🇮🇷 تومانی: <b>59,042</b>\n🟢 رشد: <b>0.20%</b>", branding)
+            self.assertGreater(len(image), 1000)
+            self.assertTrue(image.startswith(b"\x89PNG"))
 
     def test_rtl_fallback_changes_persian_display_order(self):
         shaped = shape_rtl_text("قیمت بیت کوین")

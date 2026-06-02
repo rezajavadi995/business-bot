@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import os
 import re
@@ -22,7 +23,7 @@ ASSET_ALIASES: dict[str, str] = {
     "usdt": "usdt", "tether": "usdt", "تتر": "usdt",
     "usd": "usd", "dollar": "usd", "دلار": "usd", "دلار آمریکا": "usd", "$": "usd",
     "eur": "eur", "euro": "eur", "یورو": "eur",
-    "try": "try", "tl": "try", "lira": "try", "turkish lira": "try", "لیر": "try", "لیر ترکیه": "try",
+    "try": "try", "tl": "try", "lira": "try", "turkish lira": "try", "لیر": "try", "لیر ترکیه": "try", "لیر ترک": "try",
     "rub": "rub", "ruble": "rub", "rouble": "rub", "russian ruble": "rub", "روبل": "rub", "روبل روسیه": "rub",
     "irt": "irt", "toman": "irt", "tomans": "irt", "تومان": "irt", "تومن": "irt",
     "irr": "irr", "rial": "irr", "ریال": "irr",
@@ -312,7 +313,11 @@ class MarketRateService:
                 return self.read_cache()
             return await self.refresh(settings, _locked=True)
 
+    def stop(self) -> None:
+        self._stop.set()
+
     async def run_forever(self, settings_getter) -> None:
+        self._stop.clear()
         await asyncio.sleep(2)
         while not self._stop.is_set():
             settings = settings_getter()
@@ -611,7 +616,40 @@ def format_number(value: float, asset: str | None = None) -> str:
 
 
 def asset_label(asset: str) -> str:
-    return {"irt": "تومان", "irr": "ریال", "usd": "دلار آمریکا", "eur": "یورو", "try": "لیر ترکیه", "rub": "روبل روسیه", "stars": "Stars", "usdt": "USDT"}.get(asset, asset.upper())
+    return {"irt": "تومان", "irr": "ریال", "usd": "دلار", "eur": "یورو", "try": "لیر", "rub": "روبل", "stars": "استارز", "usdt": "USDT"}.get(asset, asset.upper())
+
+
+def asset_icon(asset: str) -> str:
+    return {"btc": "₿", "eth": "♦️", "trx": "🔺", "ton": "💎", "usdt": "💵", "usd": "💵", "eur": "💶", "try": "₺", "rub": "₽", "irt": "🇮🇷", "irr": "🇮🇷", "stars": "⭐"}.get(asset, "📊")
+
+
+def html_asset(asset: str) -> str:
+    return html.escape(asset_label(asset))
+
+
+def market_change(cache: dict[str, Any], asset: str | None) -> float | None:
+    if not asset:
+        return None
+    crypto_meta = ((cache.get("meta") or {}).get("crypto") or {}) if isinstance(cache, dict) else {}
+    value = (crypto_meta.get("24h_change") or {}).get(asset) if isinstance(crypto_meta, dict) else None
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def unit_price_line(cache: dict[str, Any], asset: str | None, quote: str, stale_ttl: int) -> str | None:
+    if not asset or asset == quote:
+        return None
+    unit = convert_amount(cache, 1.0, asset, quote, stale_ttl)
+    if not unit:
+        return None
+    return f"📌 قیمت واحد ۱ {html_asset(asset)}: <b>{format_number(unit.value, quote)} {html_asset(quote)}</b>"
+
+
+def change_line(cache: dict[str, Any], asset: str | None) -> str | None:
+    change = market_change(cache, asset)
+    if change is None:
+        return None
+    direction = "رشد" if change >= 0 else "افت"
+    return f"📊 {'🟢' if change >= 0 else '🔴'} {direction} روزانه: <b>{abs(change):.2f}%</b>"
 
 
 def _gregorian_to_jalali(year: int, month: int, day: int) -> tuple[int, int, int]:
@@ -661,31 +699,48 @@ def render_conversion(intent: MarketIntent, settings: dict[str, Any], cache: dic
         result = convert_amount(cache, intent.amount, intent.source, intent.target, stale_ttl)
         if not result:
             return unavailable_message(cache)
-        lines = [f"🔄 {format_number(intent.amount, intent.source)} {intent.source} = {format_number(result.value, intent.target)} {asset_label(intent.target)}"]
         toman = convert_amount(cache, intent.amount, intent.source, "irt", stale_ttl)
         usd_value = intent.amount * result.source_usd
-        if toman:
-            lines.append(f"💸 {format_number(toman.value, 'irt')} toman")
-        lines.append(f"💵 ${format_number(usd_value, 'usd')} dollar")
+        lines = [
+            f"<b>{asset_icon(intent.source)} تبدیل {format_number(intent.amount, intent.source)} {html_asset(intent.source)}</b>",
+            f"<blockquote>🔁 <b>{format_number(result.value, intent.target)} {html_asset(intent.target)}</b></blockquote>",
+        ]
+        unit_asset = intent.target if intent.source in {"irt", "irr"} and intent.target else intent.source
+        quote_asset = intent.target if intent.target in {"irt", "irr"} else "irt"
+        unit_line = unit_price_line(cache, unit_asset, quote_asset, stale_ttl)
+        if unit_line:
+            lines.append(unit_line)
+        line = change_line(cache, unit_asset)
+        if line:
+            lines.append(line)
+        if toman and intent.target not in {"irt", "irr"}:
+            lines.append(f"🇮🇷 تومان: <b>{format_number(toman.value, 'irt')}</b>")
+        lines.append(f"💵 دلار: <b>${format_number(usd_value, 'usd')}</b>")
         if result.stale:
-            lines.append("⚠️ نرخ‌ها از کش قبلی استفاده شده‌اند.")
-        lines.append(f"🪙 {format_timestamp(result.updated_at)}")
+            lines.append("⚠️ <i>نرخ از کش قبلی خوانده شده است.</i>")
+        lines.append(f"🕘 <code>{format_timestamp(result.updated_at)}</code>")
         return "\n".join(lines)
 
     toman = convert_amount(cache, intent.amount, intent.source, "irt", stale_ttl)
     usd = convert_amount(cache, intent.amount, intent.source, "usd", stale_ttl)
     if not toman and not usd:
         return unavailable_message(cache)
-    lines = [f"✨ {format_number(intent.amount, intent.source)} {asset_label(intent.source)} :"]
+    lines = [f"<b>{asset_icon(intent.source)} قیمت {format_number(intent.amount, intent.source)} {html_asset(intent.source)}</b>"]
+    unit_line = unit_price_line(cache, intent.source, "irt", stale_ttl)
+    if unit_line:
+        lines.append(unit_line)
+    line = change_line(cache, intent.source)
+    if line:
+        lines.append(line)
     if toman:
-        lines.append(f"💸 {format_number(toman.value, 'irt')} toman")
+        lines.append(f"🇮🇷 تومان: <b>{format_number(toman.value, 'irt')}</b>")
     if usd:
-        lines.append(f"💵 ${format_number(usd.value, 'usd')} dollar")
+        lines.append(f"💵 دلار: <b>${format_number(usd.value, 'usd')}</b>")
     first = toman or usd
     if first and first.stale:
-        lines.append("⚠️ نرخ‌ها از کش قبلی استفاده شده‌اند.")
+        lines.append("⚠️ <i>نرخ از کش قبلی خوانده شده است.</i>")
     if first:
-        lines.append(f"🪙 {format_timestamp(first.updated_at)}")
+        lines.append(f"🕘 <code>{format_timestamp(first.updated_at)}</code>")
     return "\n".join(lines)
 
 
@@ -706,22 +761,24 @@ def render_price(intent: MarketIntent, settings: dict[str, Any], cache: dict[str
     low = (crypto_meta.get("24h_low") or {}).get(asset)
     irt = rates.get("irt") if isinstance(rates, dict) else None
     toman = float(usd) / float(irt) if isinstance(irt, (int, float)) and irt > 0 else None
-    lines = [f"✨ 1 {asset_label(asset)} :"]
+    lines = [f"<b>{asset_icon(asset)} قیمت {html.escape(asset.upper())}</b>", "<blockquote>💰 <b>جزئیات قیمت</b>"]
+    lines.append(f"💵 دلاری: <b>${format_number(float(usd), 'usd')}</b>")
     if toman is not None:
-        lines.append(f"💸 {format_number(toman, 'irt')} toman")
-    lines.append(f"💵 ${format_number(float(usd), 'usd')} dollar")
+        lines.append(f"🇮🇷 تومانی: <b>{format_number(toman, 'irt')}</b>")
+    lines.append("</blockquote>")
     if isinstance(change, (int, float)):
-        arrow = "↗️" if change >= 0 else "↘️"
-        lines.append(f"{'🟢' if change >= 0 else '🔴'} {abs(change):.2f}%{arrow}")
-        lines.append(f"24h: {change:+.2f}%")
+        direction = "رشد" if change >= 0 else "افت"
+        lines.append(f"<blockquote>📊 <b>تغییرات روزانه</b>\n{'🟢' if change >= 0 else '🔴'} {direction}: <b>{abs(change):.2f}%</b>\n<code>24h: {change:+.2f}%</code></blockquote>")
     if isinstance(high, (int, float)) and isinstance(low, (int, float)):
-        lines.append("High & Low 📉")
+        hl = ["<blockquote>📈 <b>High & Low | بیشترین / کمترین</b>"]
         if isinstance(irt, (int, float)) and irt > 0:
-            lines.append(f"💸 {format_number(float(high) / float(irt), 'irt')} / {format_number(float(low) / float(irt), 'irt')} toman")
-        lines.append(f"💵 {format_number(float(high), 'usd')} / {format_number(float(low), 'usd')} dollar")
+            hl.append(f"🇮🇷 <b>{format_number(float(high) / float(irt), 'irt')} / {format_number(float(low) / float(irt), 'irt')}</b> تومان")
+        hl.append(f"💵 <b>{format_number(float(high), 'usd')} / {format_number(float(low), 'usd')}</b> دلار")
+        hl.append("</blockquote>")
+        lines.append("\n".join(hl))
     if age > 90:
-        lines.append("⚠️ نرخ از کش قبلی خوانده شد.")
-    lines.append(f"🪙 {format_timestamp(int(cache.get('updated_at') or 0))}")
+        lines.append("⚠️ <i>نرخ از کش قبلی خوانده شد.</i>")
+    lines.append(f"🕘 <code>{format_timestamp(int(cache.get('updated_at') or 0))}</code>")
     return "\n".join(lines)
 
 
@@ -845,35 +902,46 @@ def cache_status(cache: dict[str, Any], settings: dict[str, Any]) -> dict[str, A
 
 def market_help_text(is_admin: bool = False) -> str:
     base = [
-        "📈 راهنمای Market & Conversion Engine",
+        "📈 راهنمای ساده Market & Conversion Engine",
         "",
-        "نمونه تبدیل‌ها:",
-        "• ۲۰۰۰ استارز",
-        "• 100 usd trx",
-        "• ۲۰ ترون تومان",
-        "• 1200000 تومان تتر",
+        "این بخش با چند منبع قیمت کار می‌کند و جواب‌ها را از کش امن ربات می‌خواند؛ یعنی برای هر پیام مستقیم به API فشار نمی‌آورد.",
         "",
-        "نمونه قیمت/وضعیت:",
-        "• btc",
-        "• price trx",
-        "• trx status",
-        "• btc today",
-        "• trend",
-        "• top gainers",
-        "• btc dominance",
-        "• fear greed",
+        "🔄 تبدیل سریع",
+        "• ۲۰۰ تون تومان  → تبدیل TON به تومان + قیمت واحد ۱ TON",
+        "• ۲,۰۰۰,۰۰۰ تومن ترون  → تبدیل تومان به TRX",
+        "• 100 usd trx  → تبدیل دلار به ترون",
+        "• ۲۰۰۰ استارز  → قیمت استارز با نرخ تنظیم‌شده",
         "",
-        "Alias ها: ترون/trx، تون/ton، تتر/usdt، دلار/usd/$، تومان/irt، ریال/irr، استارز/stars",
+        "💰 قیمت لحظه‌ای",
+        "• ترون / trx / price trx",
+        "• تتر / usdt",
+        "• لیر / روبل / دلار / یورو",
+        "",
+        "📊 وضعیت و ابزارهای بازار",
+        "• trx status یا btc today  → قیمت، تغییرات روزانه، High/Low",
+        "• trend  → کوین‌های ترند CoinGecko",
+        "• top gainers  → بیشترین رشدهای موجود در کش",
+        "• btc dominance  → دامیننس بیت‌کوین",
+        "• fear greed  → شاخص ترس و طمع",
+        "",
+        "🔌 نقش API ها",
+        "• Nobitex local: نرخ تومانی/بازار ایران، مخصوصاً USDTIRT و قیمت‌های ریالی/تومانی",
+        "• CoinGecko: قیمت دلاری کریپتو، درصد تغییرات ۲۴ساعته، High/Low، ترندها و دامیننس",
+        "• ExchangeRate: نرخ ارزهای فیات مثل USD/EUR/TRY/RUB برای تبدیل‌های غیرکریپتو",
+        "",
+        "🏷 Alias های قابل استفاده: ترون/trx، تون/ton، تتر/usdt، دلار/usd/$، تومان/تومن/irt، ریال/irr، لیر/try، روبل/rub، استارز/stars",
     ]
     if is_admin:
         base.extend([
             "",
-            "ادمین:",
-            "• از پنل: Market API Configuration برای تنظیم و اعتبارسنجی API ها",
-            "• Stars Rate Settings برای نرخ دستی استارز",
-            "• Cache Settings برای TTL و وضعیت کش",
+            "🛠 نکات ادمین",
+            "• Market API Configuration: روشن/خاموش کردن Providerها و اعتبارسنجی کلیدها",
+            "• Cache Settings: TTL کش و رفرش دستی نرخ‌ها",
+            "• Stars Rate Settings: نرخ دستی/واحد استارز",
+            "• Market Branding: ساخت کارت، فونت، لوگو، تم و preview",
         ])
     return "\n".join(base)
+
 
 
 MARKET_SERVICE = MarketRateService()
