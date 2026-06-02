@@ -12,6 +12,9 @@ from features.market_engine import (
     validate_market_api_key,
     stars_unit_usd,
     MarketRateService,
+    CACHE_KEY,
+    EXCHANGERATE_COOLDOWN_KEY,
+    EXCHANGERATE_RUNTIME_STATE,
 )
 
 
@@ -165,6 +168,67 @@ class MarketEngineAdminSupportTests(unittest.TestCase):
         self.assertNotIn("btc", cache["rates_usd"])
         self.assertIn("eur", cache["rates_usd"])
 
+
+    def test_refresh_if_needed_uses_usable_stale_cache_without_provider_call(self):
+        class Store:
+            def __init__(self):
+                self.value = {"updated_at": int(time.time()) - 120, "rates_usd": {"usd": 1.0, "eur": 1.1}}
+            def get_json(self, key, default):
+                return self.value if key == CACHE_KEY else default
+            def set_json(self, key, value):
+                self.value = value
+
+        async def run_refresh():
+            service = MarketRateService(Store())
+            service.refresh = Mock()
+            return await service.refresh_if_needed({"market_api_enabled": True, "cache_ttl_seconds": 30, "stale_ttl_seconds": 86400})
+
+        cache = asyncio.run(run_refresh())
+        self.assertIn("eur", cache["rates_usd"])
+
+    def test_exchangerate_recent_cache_skips_provider_request(self):
+        class Store:
+            def __init__(self):
+                self.values = {CACHE_KEY: {"updated_at": int(time.time()) - 60, "rates_usd": {"usd": 1.0, "eur": 1.1}, "meta": {"fiat": {"updated_at": int(time.time()) - 60}}}}
+            def get_json(self, key, default):
+                return self.values.get(key, default)
+            def set_json(self, key, value):
+                self.values[key] = value
+
+        service = MarketRateService(Store())
+        service._fetch_coingecko = Mock(return_value={"rates_usd": {}, "meta": {}})
+        service._fetch_exchange_rates = Mock(return_value={"rates_usd": {"eur": 1.2}, "meta": {"source": "exchange"}})
+        service._fetch_nobitex = Mock(return_value={"rates_usd": {}, "meta": {}})
+        service._fetch_fear_greed = Mock(return_value={})
+
+        payload = service._fetch_rates({"coingecko_enabled": False, "exchangerate_enabled": True, "nobitex_enabled": False, "stars_unit_amount": 1000, "stars_unit_usd": 30})
+
+        service._fetch_exchange_rates.assert_not_called()
+        self.assertEqual(payload["rates_usd"]["eur"], 1.1)
+
+    def test_exchangerate_429_sets_progressive_cooldown(self):
+        EXCHANGERATE_RUNTIME_STATE.clear()
+        class Store:
+            def __init__(self):
+                self.values = {}
+            def get_json(self, key, default):
+                return self.values.get(key, default)
+            def set_json(self, key, value):
+                self.values[key] = value
+
+        store = Store()
+        service = MarketRateService(store)
+
+        service._record_exchangerate_429()
+        first = store.values[EXCHANGERATE_COOLDOWN_KEY]
+        service._record_exchangerate_429()
+        second = store.values[EXCHANGERATE_COOLDOWN_KEY]
+
+        self.assertEqual(first["penalty_level"], 1)
+        self.assertEqual(second["penalty_level"], 2)
+        self.assertGreaterEqual(second["cooldown_until"] - int(time.time()), 15 * 60 - 2)
+        self.assertTrue(service._exchangerate_cooldown_active())
+
     def test_help_text_includes_admin_section_when_requested(self):
         text = market_help_text(is_admin=True)
         self.assertIn("Market API Configuration", text)
@@ -177,6 +241,7 @@ class MarketEngineAdminSupportTests(unittest.TestCase):
         self.assertEqual(stars_unit_usd(settings), 0.03)
 
     def test_fetch_rates_keeps_partial_provider_success(self):
+        EXCHANGERATE_RUNTIME_STATE.clear()
         service = MarketRateService()
         service._fetch_coingecko = Mock(side_effect=RuntimeError("rate limited"))
         service._fetch_exchange_rates = Mock(return_value={"rates_usd": {"eur": 1.1, "irt": 0.00002}, "meta": {"source": "exchange"}})

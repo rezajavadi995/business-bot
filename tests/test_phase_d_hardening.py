@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import bot
+from telegram.error import BadRequest, RetryAfter
 
 
 class DummyChat:
@@ -49,6 +50,57 @@ class DummyBot:
 class DummyContext:
     def __init__(self):
         self.bot = DummyBot()
+
+
+class DummyCallbackMessage:
+    def __init__(self, chat_id=555, business_connection_id=None):
+        self.chat = DummyChat(chat_id)
+        self.message_id = 33
+        self.business_connection_id = business_connection_id
+        self.replies = []
+
+    async def reply_text(self, text, **kwargs):
+        self.replies.append((text, kwargs))
+
+
+class DummyCallbackQuery:
+    def __init__(self, uid, data, message=None):
+        self.from_user = SimpleNamespace(id=uid, username=f"u{uid}", full_name=f"User {uid}", first_name="User")
+        self.data = data
+        self.message = message or DummyCallbackMessage()
+        self.answers = []
+        self.id = "query-id"
+
+    async def answer(self, text=None, show_alert=False):
+        self.answers.append((text, show_alert))
+
+    async def edit_message_text(self, *args, **kwargs):
+        self.edited_text = (args, kwargs)
+
+    async def edit_message_reply_markup(self, *args, **kwargs):
+        self.edited_markup = (args, kwargs)
+
+
+class CallbackBot(DummyBot):
+    async def send_message(self, **kwargs):
+        message_id = len(self.sent) + 100
+        self.sent.append({**kwargs, "_message_id": message_id})
+        return SimpleNamespace(message_id=message_id)
+
+    async def edit_message_text(self, **kwargs):
+        message_id = kwargs.get("message_id")
+        current = next((item for item in self.sent if item.get("_message_id") == message_id), None)
+        if current and current.get("text") == kwargs.get("text"):
+            raise BadRequest("Message is not modified")
+        self.sent.append({"edit": kwargs})
+
+    async def get_business_connection(self, business_connection_id):
+        return SimpleNamespace(user=SimpleNamespace(id=42), user_chat_id=42)
+
+
+class CallbackContext(DummyContext):
+    def __init__(self):
+        self.bot = CallbackBot()
 
 
 
@@ -110,7 +162,7 @@ class PhaseDCallbackLimitTests(unittest.TestCase):
         bot.db = self.old_db
         self.tmp.cleanup()
 
-    def test_callback_buttons_allow_five_per_button_then_twenty_minute_ban(self):
+    def test_callback_buttons_allow_five_per_button_then_one_hour_ban(self):
         for _ in range(bot.CALLBACK_ALLOWED_INTERACTIONS):
             self.assertFalse(bot.inline_button_rate_limited(101, 77))
 
@@ -141,6 +193,77 @@ class PhaseDCallbackLimitTests(unittest.TestCase):
 
         bot.reset_callback_session(101)
         self.assertTrue(bot.inline_button_rate_limited(101, 77))
+
+
+class PhaseDCallbackRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old_db = bot.db
+        self.old_load_data = bot.load_data
+        bot.BUSINESS_OWNER_CACHE.clear()
+        bot.db = bot.DB(Path(self.tmp.name) / "bot.db")
+        bot.db.init()
+        menu_id = bot.db.create_menu("buy", "preview")
+        self.button_id = bot.db.add_menu_button(menu_id, "tariff", "just_text", "payload")
+        self.data = {**bot.get_default_data(), "admin_id": 42, "active": True, "inline_menu_enabled": True}
+        bot.load_data = lambda: self.data
+
+    def tearDown(self):
+        bot.db = self.old_db
+        bot.load_data = self.old_load_data
+        bot.BUSINESS_OWNER_CACHE.clear()
+        self.tmp.cleanup()
+
+    async def test_admin_inline_menu_button_bypasses_ban_and_disabled_engine(self):
+        self.data["active"] = False
+        self.data["inline_menu_enabled"] = False
+        bot.db.upsert_user(42, "", "Admin", None, False, "test", "")
+        bot.db.set_soft_ban(42, int(__import__("time").time()) + bot.CALLBACK_COOLDOWN_SECONDS)
+        q = DummyCallbackQuery(42, f"im:btn:{self.button_id}", DummyCallbackMessage(business_connection_id="bc"))
+        context = CallbackContext()
+
+        await bot.callbacks(SimpleNamespace(callback_query=q), context)
+
+        self.assertEqual(q.answers[-1], (None, False))
+        self.assertEqual(context.bot.sent[0]["text"], "<b>payload</b>")
+
+    async def test_customer_inline_menu_button_blocks_after_five_clicks_per_button(self):
+        bot.db.upsert_user(101, "", "Customer", None, False, "test", "")
+        context = CallbackContext()
+
+        for _ in range(bot.CALLBACK_ALLOWED_INTERACTIONS):
+            q = DummyCallbackQuery(101, f"im:btn:{self.button_id}")
+            await bot.callbacks(SimpleNamespace(callback_query=q), context)
+            self.assertEqual(q.answers[-1], (None, False))
+
+        blocked = DummyCallbackQuery(101, f"im:btn:{self.button_id}")
+        await bot.callbacks(SimpleNamespace(callback_query=blocked), context)
+
+        self.assertTrue(blocked.answers[-1][1])
+        self.assertIn("یک ساعت", blocked.answers[-1][0])
+        sends = [item for item in context.bot.sent if "edit" not in item]
+        edits = [item for item in context.bot.sent if "edit" in item]
+        self.assertEqual(len(sends), 1)
+        self.assertEqual(len(edits), bot.CALLBACK_ALLOWED_INTERACTIONS - 1)
+        row = bot.db.get_user(101)
+        self.assertEqual(int(row["spam_score"] or 0), 1)
+
+    async def test_callback_retry_after_does_not_send_fallback_or_crash(self):
+        bot.db.upsert_user(101, "", "Customer", None, False, "test", "")
+        context = CallbackContext()
+        q = DummyCallbackQuery(101, f"im:btn:{self.button_id}")
+        await bot.callbacks(SimpleNamespace(callback_query=q), context)
+        sent_before = len(context.bot.sent)
+
+        async def retry_after_edit(**kwargs):
+            raise RetryAfter(198)
+
+        context.bot.edit_message_text = retry_after_edit
+        q2 = DummyCallbackQuery(101, f"im:btn:{self.button_id}")
+        await bot.callbacks(SimpleNamespace(callback_query=q2), context)
+
+        self.assertEqual(q2.answers[-1], (None, False))
+        self.assertEqual(len(context.bot.sent), sent_before)
 
 
 class PhaseDWelcomeInteractionTests(unittest.TestCase):
@@ -224,6 +347,70 @@ class PhaseDBusinessWelcomeRoutingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(message.replies), 0)
         self.assertEqual(len(context.bot.sent), 1)
+
+
+
+
+class PhaseDBusinessAdminMenuTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old_db = bot.db
+        self.old_load_data = bot.load_data
+        bot.db = bot.DB(Path(self.tmp.name) / "bot.db")
+        bot.db.init()
+        bot.db.create_menu("buy", "preview")
+        bot.db.add_menu_button(1, "tariff", "just_text", "payload")
+        self.data = {**bot.get_default_data(), "admin_id": 42, "active": True, "inline_menu_enabled": True}
+        bot.load_data = lambda: self.data
+
+        async def no_watch(*args, **kwargs):
+            return None
+
+        self.old_watch = bot.maybe_report_watch_hit
+        bot.maybe_report_watch_hit = no_watch
+
+    def tearDown(self):
+        bot.db = self.old_db
+        bot.load_data = self.old_load_data
+        bot.maybe_report_watch_hit = self.old_watch
+        self.tmp.cleanup()
+
+    async def test_admin_business_menu_without_from_user_deletes_trigger(self):
+        message = DummyBusinessMessage(text="buy")
+        message.from_user = None
+        context = DummyContext()
+
+        async def delete_message(**kwargs):
+            context.bot.sent.append({"deleted": kwargs})
+
+        context.bot.delete_message = delete_message
+        await bot.business_message_handler(SimpleNamespace(business_message=message), context)
+
+        self.assertEqual(context.bot.sent[0]["deleted"]["message_id"], message.message_id)
+        self.assertEqual(context.bot.sent[1]["text"], "<b>preview</b>")
+
+    async def test_customer_business_menu_keeps_trigger(self):
+        message = DummyBusinessMessage(text="buy")
+        context = DummyContext()
+
+        async def delete_message(**kwargs):
+            context.bot.sent.append({"deleted": kwargs})
+
+        context.bot.delete_message = delete_message
+        await bot.business_message_handler(SimpleNamespace(business_message=message), context)
+
+        self.assertFalse(any("deleted" in item for item in context.bot.sent))
+        self.assertEqual(context.bot.sent[0]["text"], "<b>preview</b>")
+
+    async def test_customer_business_menu_opens_even_with_soft_ban(self):
+        bot.db.upsert_user(202, "", "Customer", None, False, "test", "")
+        bot.db.set_soft_ban(202, int(__import__("time").time()) + 300)
+        message = DummyBusinessMessage(text="buy")
+        context = DummyContext()
+
+        await bot.business_message_handler(SimpleNamespace(business_message=message), context)
+
+        self.assertEqual(context.bot.sent[0]["text"], "<b>preview</b>")
 
 
 class PhaseDDatabaseMigrationTests(unittest.TestCase):

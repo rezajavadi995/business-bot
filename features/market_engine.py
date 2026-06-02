@@ -43,6 +43,14 @@ SUPPORTED_ASSETS = set(CRYPTO_IDS) | FIAT_ASSETS | SPECIAL_ASSETS
 DEFAULT_QUICK_ASSETS = ["btc", "eth", "trx", "ton", "usdt"]
 DEFAULT_CONVERSION_TARGETS = ["irt", "usd", "ton"]
 CACHE_KEY = "market_cache"
+EXCHANGERATE_COOLDOWN_KEY = "market_provider_state:exchangerate"
+EXCHANGE_REFRESH_SECONDS = 15 * 60
+CRYPTO_REFRESH_SECONDS = 5 * 60
+EXCHANGE_STALE_SECONDS = 24 * 60 * 60
+CRYPTO_STALE_SECONDS = 6 * 60 * 60
+EXCHANGERATE_429_COOLDOWNS = [5 * 60, 15 * 60, 30 * 60]
+EXCHANGERATE_RUNTIME_STATE: dict[str, Any] = {}
+
 
 
 class JsonStore(Protocol):
@@ -301,16 +309,69 @@ class MarketRateService:
         status = cache_status(self.read_cache(), settings)
         return bool(status.get("fresh") and status.get("usable"))
 
+    def _cache_status_snapshot(self, settings: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        cache = self.read_cache()
+        return cache, cache_status(cache, settings)
+
+    def _read_exchangerate_state(self) -> dict[str, Any]:
+        state: dict[str, Any] = {}
+        if self.store:
+            raw = self.store.get_json(EXCHANGERATE_COOLDOWN_KEY, {})
+            state = dict(raw) if isinstance(raw, dict) else {}
+        runtime_until = int(EXCHANGERATE_RUNTIME_STATE.get("cooldown_until") or 0)
+        if runtime_until > int(state.get("cooldown_until") or 0):
+            state = dict(EXCHANGERATE_RUNTIME_STATE)
+        return state
+
+    def _write_exchangerate_state(self, state: dict[str, Any]) -> None:
+        EXCHANGERATE_RUNTIME_STATE.clear()
+        EXCHANGERATE_RUNTIME_STATE.update(dict(state))
+        if self.store:
+            self.store.set_json(EXCHANGERATE_COOLDOWN_KEY, dict(state))
+
+    def _exchangerate_cooldown_active(self) -> bool:
+        state = self._read_exchangerate_state()
+        until = int(state.get("cooldown_until") or 0)
+        now = int(time.time())
+        if until > now:
+            logging.warning("market_provider_cooldown_skip provider=exchangerate cooldown_until=%s remaining=%s penalty_level=%s", until, until - now, int(state.get("penalty_level") or 0))
+            return True
+        return False
+
+    def _record_exchangerate_429(self) -> None:
+        state = self._read_exchangerate_state()
+        level = min(int(state.get("penalty_level") or 0) + 1, len(EXCHANGERATE_429_COOLDOWNS))
+        cooldown_seconds = EXCHANGERATE_429_COOLDOWNS[level - 1]
+        until = int(time.time()) + cooldown_seconds
+        self._write_exchangerate_state({"penalty_level": level, "cooldown_until": until, "last_429_at": int(time.time())})
+        logging.warning("market_provider_429 provider=exchangerate penalty_level=%s cooldown_seconds=%s cooldown_until=%s", level, cooldown_seconds, until)
+
+    def _reset_exchangerate_penalty(self) -> None:
+        state = self._read_exchangerate_state()
+        if int(state.get("penalty_level") or 0) or int(state.get("cooldown_until") or 0):
+            self._write_exchangerate_state({"penalty_level": 0, "cooldown_until": 0, "last_success_at": int(time.time())})
+
     async def refresh_if_needed(self, settings: dict[str, Any], *, force: bool = False) -> dict[str, Any]:
         if not settings.get("market_api_enabled", True):
             return self.read_cache()
-        if not force and self.cache_is_fresh(settings):
-            return self.read_cache()
+        cache, status = self._cache_status_snapshot(settings)
+        if not force and status.get("usable"):
+            if status.get("fresh"):
+                logging.info("market_cache_hit fresh=true age=%s", status.get("age"))
+            else:
+                logging.warning("market_stale_cache_used age=%s stale_ttl=%s source=refresh_if_needed", status.get("age"), status.get("stale_ttl"))
+            return cache
+        logging.info("market_cache_miss reason=%s age=%s usable=%s", "force" if force else "unusable", status.get("age"), status.get("usable"))
         if self._refresh_lock.locked() and not force:
             return self.read_cache()
         async with self._refresh_lock:
-            if not force and self.cache_is_fresh(settings):
-                return self.read_cache()
+            cache, status = self._cache_status_snapshot(settings)
+            if not force and status.get("usable"):
+                if status.get("fresh"):
+                    logging.info("market_cache_hit fresh=true age=%s", status.get("age"))
+                else:
+                    logging.warning("market_stale_cache_used age=%s stale_ttl=%s source=refresh_if_needed_locked", status.get("age"), status.get("stale_ttl"))
+                return cache
             return await self.refresh(settings, _locked=True)
 
     def stop(self) -> None:
@@ -321,11 +382,11 @@ class MarketRateService:
         await asyncio.sleep(2)
         while not self._stop.is_set():
             settings = settings_getter()
-            interval = int(settings.get("cache_ttl_seconds", 60) or 60)
+            interval = CRYPTO_REFRESH_SECONDS
             if settings.get("_global_active", False) and settings.get("market_engine_enabled", False) and settings.get("market_api_enabled", True):
                 await self.refresh(settings)
             try:
-                await asyncio.wait_for(self._stop.wait(), timeout=max(30, interval))
+                await asyncio.wait_for(self._stop.wait(), timeout=interval)
             except asyncio.TimeoutError:
                 pass
 
@@ -351,32 +412,81 @@ class MarketRateService:
             self.write_cache(cache)
             return cache
 
+    def _provider_cache_age(self, cache: dict[str, Any], provider: str) -> int | None:
+        updated_at = provider_updated_at(cache, provider)
+        if updated_at <= 0:
+            updated_at = int(cache.get("updated_at") or 0) if isinstance(cache, dict) else 0
+        return max(0, int(time.time()) - updated_at) if updated_at else None
+
     def _fetch_rates(self, settings: dict[str, Any]) -> dict[str, Any]:
         timeout = float(settings.get("request_timeout_seconds", 8) or 8)
+        old_cache = self.read_cache()
+        old_rates = old_cache.get("rates_usd") if isinstance(old_cache.get("rates_usd"), dict) else {}
         crypto: dict[str, Any] = {}
         fiat: dict[str, Any] = {}
         local: dict[str, Any] = {}
         errors: dict[str, str] = {}
         if settings.get("coingecko_enabled", True):
-            try:
-                crypto = self._fetch_coingecko(settings, timeout)
-            except Exception as exc:
-                errors["coingecko"] = safe_error(exc)
-                logging.warning("market_provider_failed provider=coingecko reason=%s", errors["coingecko"])
+            crypto_age = self._provider_cache_age(old_cache, "crypto")
+            if cached_rates_for_assets(old_cache, set(CRYPTO_IDS)) and crypto_age is not None and crypto_age < CRYPTO_REFRESH_SECONDS:
+                logging.info("market_cache_hit provider=coingecko age=%s min_refresh=%s", crypto_age, CRYPTO_REFRESH_SECONDS)
+                crypto = provider_payload_from_cache(old_cache, set(CRYPTO_IDS), "crypto")
+            else:
+                logging.info("market_cache_miss provider=coingecko age=%s min_refresh=%s", crypto_age, CRYPTO_REFRESH_SECONDS)
+                try:
+                    crypto = self._fetch_coingecko(settings, timeout)
+                    crypto.setdefault("meta", {})["updated_at"] = int(time.time())
+                except Exception as exc:
+                    errors["coingecko"] = safe_error(exc)
+                    logging.warning("market_provider_failed provider=coingecko reason=%s", errors["coingecko"])
+                    if cached_rates_for_assets(old_cache, set(CRYPTO_IDS)) and cache_age_within(old_cache, CRYPTO_STALE_SECONDS):
+                        logging.warning("market_stale_cache_used provider=coingecko age=%s stale_ttl=%s", cache_age(old_cache), CRYPTO_STALE_SECONDS)
+                        crypto = provider_payload_from_cache(old_cache, set(CRYPTO_IDS), "crypto")
         if settings.get("exchangerate_enabled", True):
-            try:
-                fiat = self._fetch_exchange_rates(settings, timeout)
-            except Exception as exc:
-                errors["exchangerate"] = safe_error(exc)
-                logging.warning("market_provider_failed provider=exchangerate reason=%s", errors["exchangerate"])
+            fiat_age = self._provider_cache_age(old_cache, "fiat")
+            if cached_rates_for_assets(old_cache, FIAT_ASSETS - {"usd"}) and fiat_age is not None and fiat_age < EXCHANGE_REFRESH_SECONDS:
+                logging.info("market_cache_hit provider=exchangerate age=%s min_refresh=%s", fiat_age, EXCHANGE_REFRESH_SECONDS)
+                fiat = provider_payload_from_cache(old_cache, FIAT_ASSETS, "fiat")
+            elif self._exchangerate_cooldown_active():
+                errors["exchangerate"] = "cooldown"
+                if cached_rates_for_assets(old_cache, FIAT_ASSETS - {"usd"}) and cache_age_within(old_cache, EXCHANGE_STALE_SECONDS):
+                    logging.warning("market_stale_cache_used provider=exchangerate age=%s stale_ttl=%s", cache_age(old_cache), EXCHANGE_STALE_SECONDS)
+                    fiat = provider_payload_from_cache(old_cache, FIAT_ASSETS, "fiat")
+            else:
+                logging.info("market_cache_miss provider=exchangerate age=%s min_refresh=%s", fiat_age, EXCHANGE_REFRESH_SECONDS)
+                try:
+                    fiat = self._fetch_exchange_rates(settings, timeout)
+                    fiat.setdefault("meta", {})["updated_at"] = int(time.time())
+                    self._reset_exchangerate_penalty()
+                except Exception as exc:
+                    errors["exchangerate"] = safe_error(exc)
+                    logging.warning("market_provider_failed provider=exchangerate reason=%s", errors["exchangerate"])
+                    if cached_rates_for_assets(old_cache, FIAT_ASSETS - {"usd"}) and cache_age_within(old_cache, EXCHANGE_STALE_SECONDS):
+                        logging.warning("market_stale_cache_used provider=exchangerate age=%s stale_ttl=%s", cache_age(old_cache), EXCHANGE_STALE_SECONDS)
+                        fiat = provider_payload_from_cache(old_cache, FIAT_ASSETS, "fiat")
         if settings.get("nobitex_enabled", True):
-            try:
-                local = self._fetch_nobitex(settings, timeout)
-            except Exception as exc:
-                errors["nobitex"] = safe_error(exc)
-                logging.warning("market_provider_failed provider=nobitex reason=%s", errors["nobitex"])
+            local_age = self._provider_cache_age(old_cache, "local")
+            if cached_rates_for_assets(old_cache, {"irt", "irr", "usdt"}) and local_age is not None and local_age < CRYPTO_REFRESH_SECONDS:
+                logging.info("market_cache_hit provider=nobitex age=%s min_refresh=%s", local_age, CRYPTO_REFRESH_SECONDS)
+                local = provider_payload_from_cache(old_cache, {"irt", "irr", "usdt", *CRYPTO_IDS.keys()}, "local")
+            else:
+                logging.info("market_cache_miss provider=nobitex age=%s min_refresh=%s", local_age, CRYPTO_REFRESH_SECONDS)
+                try:
+                    local = self._fetch_nobitex(settings, timeout)
+                    local.setdefault("meta", {})["updated_at"] = int(time.time())
+                except Exception as exc:
+                    errors["nobitex"] = safe_error(exc)
+                    logging.warning("market_provider_failed provider=nobitex reason=%s", errors["nobitex"])
+                    if cached_rates_for_assets(old_cache, {"irt", "irr", "usdt"}) and cache_age_within(old_cache, CRYPTO_STALE_SECONDS):
+                        logging.warning("market_stale_cache_used provider=nobitex age=%s stale_ttl=%s", cache_age(old_cache), CRYPTO_STALE_SECONDS)
+                        local = provider_payload_from_cache(old_cache, {"irt", "irr", "usdt", *CRYPTO_IDS.keys()}, "local")
         rates_usd: dict[str, float] = {"usd": 1.0}
         sentiment = self._fetch_fear_greed(timeout)
+        if not sentiment and isinstance(old_cache.get("meta"), dict):
+            old_sentiment = old_cache.get("meta", {}).get("fear_greed", {})
+            if isinstance(old_sentiment, dict) and cache_age_within(old_cache, CRYPTO_STALE_SECONDS):
+                logging.warning("market_stale_cache_used provider=fear_greed age=%s stale_ttl=%s", cache_age(old_cache), CRYPTO_STALE_SECONDS)
+                sentiment = old_sentiment
         crypto_meta = dict(crypto.get("meta", {})) if isinstance(crypto.get("meta", {}), dict) else {}
         local_meta = local.get("meta", {}) if isinstance(local.get("meta", {}), dict) else {}
         for key in ("24h_change", "24h_high", "24h_low"):
@@ -387,6 +497,15 @@ class MarketRateService:
         if local_meta.get("source"):
             crypto_meta["local_source"] = local_meta.get("source")
         meta: dict[str, Any] = {"crypto": crypto_meta, "fiat": fiat.get("meta", {}), "local": local_meta, "fear_greed": sentiment, "provider_errors": errors}
+        if isinstance(old_rates, dict):
+            old_age = cache_age(old_cache)
+            for asset, value in old_rates.items():
+                if not isinstance(value, (int, float)) or asset not in SUPPORTED_ASSETS:
+                    continue
+                if asset in FIAT_ASSETS and old_age is not None and old_age <= EXCHANGE_STALE_SECONDS:
+                    rates_usd[asset] = float(value)
+                elif asset in set(CRYPTO_IDS) | {"usdt"} and old_age is not None and old_age <= CRYPTO_STALE_SECONDS:
+                    rates_usd[asset] = float(value)
         rates_usd.update(crypto.get("rates_usd", {}))
         rates_usd.update(fiat.get("rates_usd", {}))
         rates_usd.update(local.get("rates_usd", {}))
@@ -407,6 +526,7 @@ class MarketRateService:
         key = os.getenv("COINGECKO_API_KEY", "").strip()
         if key:
             headers["x-cg-demo-api-key"] = key
+        logging.info("market_provider_request provider=coingecko endpoint=coins_markets")
         response = requests.get(
             "https://api.coingecko.com/api/v3/coins/markets",
             params={"vs_currency": "usd", "ids": ids, "price_change_percentage": "24h"},
@@ -414,6 +534,7 @@ class MarketRateService:
             timeout=timeout,
         )
         response.raise_for_status()
+        logging.info("market_provider_success provider=coingecko status=%s", response.status_code)
         body = response.json()
         rates: dict[str, float] = {}
         changes: dict[str, float] = {}
@@ -443,8 +564,10 @@ class MarketRateService:
 
     def _fetch_coingecko_trending(self, headers: dict[str, str], timeout: float) -> dict[str, Any]:
         try:
+            logging.info("market_provider_request provider=coingecko_trending endpoint=search_trending")
             response = requests.get("https://api.coingecko.com/api/v3/search/trending", headers=headers, timeout=timeout)
             response.raise_for_status()
+            logging.info("market_provider_success provider=coingecko_trending status=%s", response.status_code)
             body = response.json()
             coins = []
             for row in (body.get("coins", []) if isinstance(body, dict) else [])[:7]:
@@ -460,8 +583,10 @@ class MarketRateService:
 
     def _fetch_coingecko_global(self, headers: dict[str, str], timeout: float) -> dict[str, Any]:
         try:
+            logging.info("market_provider_request provider=coingecko_global endpoint=global")
             response = requests.get("https://api.coingecko.com/api/v3/global", headers=headers, timeout=timeout)
             response.raise_for_status()
+            logging.info("market_provider_success provider=coingecko_global status=%s", response.status_code)
             body = response.json()
             data = body.get("data", {}) if isinstance(body, dict) else {}
             dominance = data.get("market_cap_percentage", {}) if isinstance(data, dict) else {}
@@ -473,8 +598,10 @@ class MarketRateService:
 
     def _fetch_fear_greed(self, timeout: float) -> dict[str, Any]:
         try:
+            logging.info("market_provider_request provider=fear_greed endpoint=fng")
             response = requests.get("https://api.alternative.me/fng/", params={"limit": 1}, timeout=timeout)
             response.raise_for_status()
+            logging.info("market_provider_success provider=fear_greed status=%s", response.status_code)
             body = response.json()
             item = (body.get("data") or [{}])[0] if isinstance(body, dict) else {}
             value = item.get("value")
@@ -489,8 +616,12 @@ class MarketRateService:
             url = f"https://v6.exchangerate-api.com/v6/{key}/latest/USD"
         else:
             url = "https://open.er-api.com/v6/latest/USD"
+        logging.info("market_provider_request provider=exchangerate endpoint=latest source=%s", "exchangerate" if key else "open-er-api")
         response = requests.get(url, timeout=timeout)
+        if response.status_code == 429:
+            self._record_exchangerate_429()
         response.raise_for_status()
+        logging.info("market_provider_success provider=exchangerate status=%s source=%s", response.status_code, "exchangerate" if key else "open-er-api")
         body = response.json()
         rates = body.get("conversion_rates") or body.get("rates") or {} if isinstance(body, dict) else {}
         out: dict[str, float] = {"usd": 1.0}
@@ -507,12 +638,14 @@ class MarketRateService:
 
     def _fetch_nobitex(self, settings: dict[str, Any], timeout: float) -> dict[str, Any]:
         src = ",".join(["usdt", *[symbol for symbol in CRYPTO_IDS if symbol != "usdt"]])
+        logging.info("market_provider_request provider=nobitex endpoint=market_stats")
         response = requests.get(
             "https://apiv2.nobitex.ir/market/stats",
             params={"srcCurrency": src, "dstCurrency": "rls"},
             timeout=timeout,
         )
         response.raise_for_status()
+        logging.info("market_provider_success provider=nobitex status=%s", response.status_code)
         body = response.json()
         stats = body.get("stats", {}) if isinstance(body, dict) else {}
         rates: dict[str, float] = {}
@@ -581,6 +714,51 @@ def safe_error(exc: Exception) -> str:
     text = str(exc) or exc.__class__.__name__
     text = re.sub(r"(?i)(api[_-]?key=|/v6/)[^/&\s]+", r"\1***", text)
     return text[:180]
+
+
+def cache_age(cache: dict[str, Any]) -> int | None:
+    updated_at = int(cache.get("updated_at") or 0) if isinstance(cache, dict) else 0
+    return max(0, int(time.time()) - updated_at) if updated_at else None
+
+
+def cache_age_within(cache: dict[str, Any], max_age: int) -> bool:
+    age = cache_age(cache)
+    return age is not None and age <= max_age
+
+
+def cached_rates_for_assets(cache: dict[str, Any], assets: set[str]) -> bool:
+    rates = cache.get("rates_usd") if isinstance(cache, dict) else None
+    if not isinstance(rates, dict):
+        return False
+    return any(asset in rates and isinstance(rates.get(asset), (int, float)) and float(rates.get(asset)) > 0 for asset in assets)
+
+
+def provider_updated_at(cache: dict[str, Any], provider: str) -> int:
+    meta = cache.get("meta") if isinstance(cache, dict) else None
+    if not isinstance(meta, dict):
+        return 0
+    section = meta.get(provider)
+    if isinstance(section, dict) and str(section.get("updated_at") or "").isdigit():
+        return int(section["updated_at"])
+    return 0
+
+
+def provider_payload_from_cache(cache: dict[str, Any], assets: set[str], meta_key: str) -> dict[str, Any]:
+    rates = cache.get("rates_usd") if isinstance(cache, dict) else {}
+    selected = {asset: float(value) for asset, value in rates.items() if asset in assets and isinstance(value, (int, float)) and float(value) > 0}
+    meta = cache.get("meta") if isinstance(cache, dict) else {}
+    provider_meta = dict(meta.get(meta_key, {})) if isinstance(meta, dict) and isinstance(meta.get(meta_key, {}), dict) else {}
+    provider_meta.setdefault("updated_at", int(cache.get("updated_at") or 0) if isinstance(cache, dict) else 0)
+    return {"rates_usd": selected, "meta": provider_meta}
+
+
+def record_exchangerate_runtime_429() -> None:
+    level = min(int(EXCHANGERATE_RUNTIME_STATE.get("penalty_level") or 0) + 1, len(EXCHANGERATE_429_COOLDOWNS))
+    cooldown_seconds = EXCHANGERATE_429_COOLDOWNS[level - 1]
+    until = int(time.time()) + cooldown_seconds
+    EXCHANGERATE_RUNTIME_STATE.clear()
+    EXCHANGERATE_RUNTIME_STATE.update({"penalty_level": level, "cooldown_until": until, "last_429_at": int(time.time())})
+    logging.warning("market_provider_429 provider=exchangerate penalty_level=%s cooldown_seconds=%s cooldown_until=%s", level, cooldown_seconds, until)
 
 
 def convert_amount(cache: dict[str, Any], amount: float, source: str, target: str, stale_ttl: int) -> ConversionResult | None:
@@ -851,24 +1029,34 @@ def validate_market_api_key(provider: str, api_key: str, timeout: float = 8.0) -
         return {"ok": False, "provider": provider, "message": "API key is empty or too long."}
     try:
         if provider == "coingecko":
+            logging.info("market_provider_request provider=coingecko endpoint=validate_simple_price")
             response = requests.get(
                 "https://api.coingecko.com/api/v3/simple/price",
                 params={"ids": "bitcoin", "vs_currencies": "usd"},
                 headers={"x-cg-demo-api-key": key},
                 timeout=timeout,
             )
+            if response.status_code == 429:
+                logging.warning("market_provider_429 provider=coingecko endpoint=validate_simple_price")
             if response.status_code in {401, 403, 429}:
+                logging.warning("market_provider_failed provider=coingecko reason=status_%s", response.status_code)
                 return {"ok": False, "provider": provider, "message": f"CoinGecko rejected the key/status: {response.status_code}"}
             response.raise_for_status()
+            logging.info("market_provider_success provider=coingecko status=%s endpoint=validate_simple_price", response.status_code)
             body = response.json()
             price = ((body.get("bitcoin") or {}).get("usd") if isinstance(body, dict) else None)
             if not isinstance(price, (int, float)) or price <= 0:
                 return {"ok": False, "provider": provider, "message": "CoinGecko response did not include BTC/USD price."}
             return {"ok": True, "provider": provider, "message": f"CoinGecko validation OK. BTC/USD={price}", "sample": price}
+        logging.info("market_provider_request provider=exchangerate endpoint=validate_pair")
         response = requests.get(f"https://v6.exchangerate-api.com/v6/{key}/pair/USD/EUR", timeout=timeout)
+        if response.status_code == 429:
+            record_exchangerate_runtime_429()
         if response.status_code in {401, 403, 404, 429}:
+            logging.warning("market_provider_failed provider=exchangerate reason=status_%s endpoint=validate_pair", response.status_code)
             return {"ok": False, "provider": provider, "message": f"ExchangeRate rejected the key/status: {response.status_code}"}
         response.raise_for_status()
+        logging.info("market_provider_success provider=exchangerate status=%s endpoint=validate_pair", response.status_code)
         body = response.json()
         if body.get("result") != "success":
             return {"ok": False, "provider": provider, "message": str(body.get("error-type") or body.get("result") or "ExchangeRate validation failed")}

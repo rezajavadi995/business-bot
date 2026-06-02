@@ -323,6 +323,13 @@ def render_market_card(response_text: str, branding: dict[str, Any]) -> bytes:
     cached = _CARD_CACHE.get(cache_key)
     if cached and now - cached[0] <= _CARD_CACHE_TTL_SECONDS:
         return cached[1]
+    if branding.get("card_style") == "advanced":
+        data = render_advanced_market_card(response_text, branding)
+        if len(_CARD_CACHE) > 64:
+            _CARD_CACHE.clear()
+        _CARD_CACHE[cache_key] = (now, data)
+        return data
+
     image_mod = importlib.import_module("PIL.Image")
     draw_mod = importlib.import_module("PIL.ImageDraw")
     font_mod = importlib.import_module("PIL.ImageFont")
@@ -403,7 +410,7 @@ def render_market_card(response_text: str, branding: dict[str, Any]) -> bytes:
         draw.text((x, y), display_watermark, font=watermark_font, fill=muted)
 
     out = BytesIO()
-    base.convert("RGB").save(out, format="PNG", optimize=True)
+    base.convert("RGB").save(out, format="PNG", compress_level=4)
     data = out.getvalue()
     if len(_CARD_CACHE) > 64:
         _CARD_CACHE.clear()
@@ -459,6 +466,34 @@ def _draw_badge(draw, xy: tuple[int, int], text: str, font, fill: tuple[int, int
     draw.rounded_rectangle((x, y, x + w, y + h), radius=14, fill=bg)
     draw.text((x + 16, y + 9), text, font=font, fill=fill)
     return (x, y, x + w, y + h)
+
+
+"""def _fit_font(font_mod, path: str, text: str, max_width: int, start_size: int, min_size: int = 22):
+    size = start_size
+    while size > min_size:
+        font = _load_font(font_mod, path, size)
+        try:
+            bbox = font.getbbox(text)
+            if bbox[2] - bbox[0] <= max_width:
+                return font
+        except Exception:
+            return font
+        size -= 2
+    return _load_font(font_mod, path, min_size)
+
+
+def _ellipsize_to_width(draw, text: str, font, max_width: int) -> str:
+    display = _display_text(_image_text(text))
+    if draw.textbbox((0, 0), display, font=font)[2] <= max_width:
+        return display
+    raw = _image_text(text)
+    while len(raw) > 4:
+        raw = raw[:-2].rstrip()
+        display = _display_text(raw + "…")
+        if draw.textbbox((0, 0), display, font=font)[2] <= max_width:
+            return display
+    return _display_text(raw)
+    """
 
 
 def _positioned_box(position: str, canvas: tuple[int, int], size: tuple[int, int], margin: tuple[int, int] = (72, 62)) -> tuple[int, int]:
@@ -597,4 +632,5 @@ def render_advanced_market_card(response_text: str, branding: dict[str, Any]) ->
 
     out = BytesIO()
     base.convert("RGB").save(out, format="PNG", optimize=True)
+    #base.convert("RGB").save(out, format="PNG", compress_level=4)
     return out.getvalue()

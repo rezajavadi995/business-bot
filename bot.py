@@ -23,7 +23,7 @@ from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram import MessageEntity
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, TimedOut
+from telegram.error import BadRequest, RetryAfter, TimedOut
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 from features.log_export import build_logs_keyboard, humanize_log_text
 from features.inline_menu import build_inline_menu_admin_kb, paged_rows, CB as IMCB
@@ -41,7 +41,7 @@ load_dotenv(ENV_PATH)
 
 START_TIME = int(time.time())
 SOFT_BAN_SECONDS = 20 * 60
-CALLBACK_COOLDOWN_SECONDS = 20 * 60
+CALLBACK_COOLDOWN_SECONDS = 60 * 60
 CALLBACK_ALLOWED_INTERACTIONS = 5
 CALLBACK_RATE_BUCKET = "callback_button"
 WELCOME_COOLDOWN_SECONDS = 24 * 60 * 60
@@ -392,6 +392,8 @@ class DB:
 
 db = DB(DB_PATH)
 FSM_TTL_SECONDS = 15 * 60
+BUSINESS_OWNER_CACHE_TTL_SECONDS = 60 * 60
+BUSINESS_OWNER_CACHE: dict[str, tuple[int, float]] = {}
 
 def setup_logging() -> None:
     LOG_DIR.mkdir(exist_ok=True)
@@ -468,6 +470,73 @@ def load_data() -> dict[str, Any]:
 
 def save_data(data: dict[str, Any]) -> None: db.set_json("settings", data)
 def is_admin(user_id: int, data: dict[str, Any]) -> bool: return user_id == int(data.get("admin_id") or os.getenv("ADMIN_ID") or 0)
+
+
+def configured_admin_id(data: dict[str, Any] | None = None) -> int:
+    return int((data or {}).get("admin_id") or os.getenv("ADMIN_ID") or 0)
+
+
+def business_owner_from_connection(connection) -> int | None:
+    owner = getattr(connection, "user", None)
+    if owner and getattr(owner, "id", None) is not None:
+        return int(owner.id)
+    user_chat_id = getattr(connection, "user_chat_id", None)
+    return int(user_chat_id) if user_chat_id is not None else None
+
+
+async def business_connection_owner_id(context: ContextTypes.DEFAULT_TYPE, business_connection_id: str | None) -> int | None:
+    bc_id = str(business_connection_id or "").strip()
+    if not bc_id:
+        return None
+    now = time.time()
+    cached = BUSINESS_OWNER_CACHE.get(bc_id)
+    if cached and now - cached[1] <= BUSINESS_OWNER_CACHE_TTL_SECONDS:
+        return cached[0]
+    try:
+        connection = await context.bot.get_business_connection(bc_id)
+        owner_id = business_owner_from_connection(connection)
+        if owner_id:
+            BUSINESS_OWNER_CACHE[bc_id] = (owner_id, now)
+        return owner_id
+    except Exception as exc:
+        logging.warning("business_connection_owner_lookup_failed bc=%s reason=%s", bc_id, exc)
+        return None
+
+
+async def is_admin_or_business_owner(user_id: int, data: dict[str, Any], context: ContextTypes.DEFAULT_TYPE, business_connection_id: str | None = None) -> bool:
+    if is_admin(user_id, data):
+        return True
+    owner_id = await business_connection_owner_id(context, business_connection_id)
+    return bool(owner_id and owner_id == int(user_id))
+
+
+async def is_admin_authored_business_message(message, data: dict[str, Any], context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if not getattr(message, "business_connection_id", None):
+        return False
+    sender = getattr(message, "from_user", None)
+    if sender and await is_admin_or_business_owner(int(sender.id), data, context, getattr(message, "business_connection_id", None)):
+        return True
+    owner_id = await business_connection_owner_id(context, getattr(message, "business_connection_id", None))
+    if owner_id and is_admin(owner_id, data) and sender is None and not getattr(message, "sender_business_bot", None):
+        return True
+    if sender is None and not getattr(message, "sender_business_bot", None):
+        return bool(configured_admin_id(data))
+    return False
+
+
+async def message_sender_id(message, data: dict[str, Any] | None = None, context: ContextTypes.DEFAULT_TYPE | None = None) -> int | None:
+    sender = getattr(message, "from_user", None)
+    if sender:
+        return int(sender.id)
+    if getattr(message, "business_connection_id", None) and not getattr(message, "sender_business_bot", None):
+        if context is not None:
+            owner_id = await business_connection_owner_id(context, getattr(message, "business_connection_id", None))
+            if owner_id:
+                return owner_id
+        return configured_admin_id(data) or None
+    chat = getattr(message, "chat", None)
+    return int(chat.id) if chat and getattr(chat, "id", None) is not None else None
+
 def create_primary_button(text: str, callback: str) -> InlineKeyboardButton: return InlineKeyboardButton(f"✨ {text}", callback_data=callback)
 def create_success_button(text: str, callback: str) -> InlineKeyboardButton: return InlineKeyboardButton(f"🚀 {text}", callback_data=callback)
 def create_danger_button(text: str, callback: str) -> InlineKeyboardButton: return InlineKeyboardButton(f"🧨 {text}", callback_data=callback)
@@ -959,6 +1028,28 @@ def market_message_dedupe_key(message, source: str) -> str | None:
     return f"market_processed:{source}:{chat_id}:{message_id}"
 
 
+def schedule_market_refresh(market_settings: dict[str, Any]) -> None:
+    task = asyncio.create_task(MARKET_SERVICE.refresh_if_needed(dict(market_settings)))
+
+    def _log_refresh_error(done_task: asyncio.Task) -> None:
+        try:
+            done_task.result()
+        except Exception as exc:
+            logging.warning("market_background_refresh_failed reason=%s", exc)
+
+    task.add_done_callback(_log_refresh_error)
+
+
+def get_market_cache_for_response(market_settings: dict[str, Any]) -> dict[str, Any]:
+    cache = MARKET_SERVICE.read_cache()
+    status = cache_status(cache, market_settings)
+    if status.get("usable"):
+        if not status.get("fresh") and market_settings.get("market_api_enabled", True):
+            schedule_market_refresh(market_settings)
+        return cache
+    return {}
+
+
 async def maybe_send_market_response(message, data: dict[str, Any], *, source: str = "message", is_edit: bool = False) -> bool:
     market_settings = merge_market_settings(data)
     branding = merge_branding_settings(data)
@@ -979,7 +1070,7 @@ async def maybe_send_market_response(message, data: dict[str, Any], *, source: s
         return True
     if dedupe_key:
         db.set_json(dedupe_key, {"processed_at": int(time.time()), "intent": intent.kind})
-    cache = await MARKET_SERVICE.refresh_if_needed(market_settings)
+    cache = get_market_cache_for_response(market_settings) or await MARKET_SERVICE.refresh_if_needed(market_settings)
     try:
         response = render_market_response(text, market_settings, cache)
     except Exception as exc:
@@ -1064,7 +1155,7 @@ def callback_cooldown_key(uid: int, action_key: str | None = None) -> str:
 
 def reset_callback_session(uid: int) -> None:
     # Keep this backward-compatible for old global buckets, but per-button limits
-    # intentionally survive menu reopens until their own 20-minute window expires.
+    # intentionally survive menu reopens until their own one-hour window expires.
     db.set_json(callback_rate_key(uid), [])
     db.set_json(callback_cooldown_key(uid), 0)
 
@@ -1105,7 +1196,8 @@ def user_button_rate_limited(uid: int, callback_data: str) -> bool:
 
 
 def menu_command_rate_limited(uid: int, command: str) -> bool:
-    return smart_rate_limit(uid, "menu_command", command, 60, 16, 30, 5)
+    # Opening inline menus must stay reliable; button callbacks own abuse limits.
+    return False
 
 
 def shortcut_rate_limited(uid: int, command: str) -> bool:
@@ -1250,12 +1342,27 @@ async def disable_callback_markup(q) -> None:
 
 
 async def block_banned_callback(q, data: dict[str, Any]) -> None:
-    await safe_callback_answer(q, "🚫 شما موقتاً محدود شدید. ۲۰ دقیقه دیگر دوباره تلاش کنید.", show_alert=True)
+    await safe_callback_answer(q, "🚫 شما یک ساعت بن شدید. لطفاً بعد از پایان محدودیت دوباره تلاش کنید.", show_alert=True)
+
+
+def persian_digits(value: int | str) -> str:
+    return str(value).translate(str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹"))
 
 
 async def block_rate_limited_callback(q, data: dict[str, Any], cooldown_seconds: int = CALLBACK_COOLDOWN_SECONDS) -> None:
     minutes = max(1, int(cooldown_seconds // 60))
-    await safe_callback_answer(q, f"🚫 محدودیت ضداسپم فعال شد. {minutes} دقیقه بعد دوباره تلاش کنید.", show_alert=True)
+    if minutes >= 60:
+        await safe_callback_answer(q, "🚫 شما یک ساعت بن شدید.", show_alert=True)
+    else:
+        await safe_callback_answer(q, f"🚫 شما بن شدید. {persian_digits(minutes)} دقیقه دیگر مجدد تلاش کنید.", show_alert=True)
+
+def invisible_click_marker(marker: int) -> str:
+    return "\u2060" * (1 + (marker % 2))
+
+
+def button_response_text(base_text: str, marker: int, include_marker: bool) -> str:
+    return f"{base_text}{invisible_click_marker(marker)}" if include_marker else base_text
+
 
 async def send_or_replace_button_response(q, context: ContextTypes.DEFAULT_TYPE, button_id: int, payload: str, data: dict[str, Any]):
     if not q.message:
@@ -1264,26 +1371,34 @@ async def send_or_replace_button_response(q, context: ContextTypes.DEFAULT_TYPE,
     storage_key = f"last_btn_response:{q.from_user.id}:{chat_id}:{button_id}"
     out_text = render_html_text(payload, bold=data.get("bold_mode", True))
     bc = getattr(q.message, "business_connection_id", None)
-    kwargs = {"chat_id": chat_id, "text": out_text, "parse_mode": ParseMode.HTML}
+    base_kwargs = {"chat_id": chat_id, "parse_mode": ParseMode.HTML}
     if bc:
-        kwargs["business_connection_id"] = bc
+        base_kwargs["business_connection_id"] = bc
     previous = db.get_json(storage_key, {})
     prev_msg_id = int(previous.get("message_id") or 0) if isinstance(previous, dict) else 0
+    prev_marker = int(previous.get("marker") or 0) if isinstance(previous, dict) else 0
+    next_marker = (prev_marker + 1) % 2
     if prev_msg_id:
         try:
-            await context.bot.edit_message_text(message_id=prev_msg_id, **kwargs)
-            db.set_json(storage_key, {"message_id": prev_msg_id, "updated_at": int(time.time())})
+            await context.bot.edit_message_text(message_id=prev_msg_id, text=button_response_text(out_text, next_marker, True), **base_kwargs)
+            db.set_json(storage_key, {"message_id": prev_msg_id, "updated_at": int(time.time()), "marker": next_marker})
             return
         except BadRequest as exc:
             if "message is not modified" in str(exc).lower():
-                db.set_json(storage_key, {"message_id": prev_msg_id, "updated_at": int(time.time())})
+                logging.info("button_response_same_payload_ignored uid=%s bid=%s prev_msg_id=%s", q.from_user.id, button_id, prev_msg_id)
+                db.set_json(storage_key, {"message_id": prev_msg_id, "updated_at": int(time.time()), "marker": next_marker})
                 return
             logging.warning("button_response_edit_failed uid=%s bid=%s reason=%s", q.from_user.id, button_id, exc)
+        except RetryAfter as exc:
+            logging.warning("button_response_edit_retry_after uid=%s bid=%s retry_after=%s", q.from_user.id, button_id, getattr(exc, "retry_after", None))
+            return
         except Exception as exc:
             logging.warning("button_response_edit_failed uid=%s bid=%s reason=%s", q.from_user.id, button_id, exc)
     try:
-        sent = await context.bot.send_message(**kwargs)
-        db.set_json(storage_key, {"message_id": sent.message_id, "updated_at": int(time.time())})
+        sent = await context.bot.send_message(text=out_text, **base_kwargs)
+        db.set_json(storage_key, {"message_id": sent.message_id, "updated_at": int(time.time()), "marker": 0})
+    except RetryAfter as exc:
+        logging.warning("button_response_send_retry_after uid=%s bid=%s retry_after=%s", q.from_user.id, button_id, getattr(exc, "retry_after", None))
     except TimedOut:
         logging.warning("button_response_send_timeout uid=%s bid=%s", q.from_user.id, button_id)
 
@@ -1356,13 +1471,15 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_callback_answer(q, "Callback نامعتبر است.", show_alert=True)
         return
     data=load_data(); uid=q.from_user.id
+    bc = getattr(getattr(q, "message", None), "business_connection_id", None)
+    admin_allowed = await is_admin_or_business_owner(uid, data, context, bc)
     db.upsert_user(uid, q.from_user.username or "", q.from_user.full_name or q.from_user.first_name or "", None, False, "callback", q.data or "")
     if not (q.data and q.data.startswith(("im:btn:", "user:"))):
         await safe_callback_answer(q)
     if q.data and q.data.startswith("im:btn:"):
         bid=int(q.data.split(":")[2])
         db.touch_user_activity(uid, "inline_button", f"button:{bid}")
-        if not is_admin(uid, data):
+        if not admin_allowed:
             row_user = db.get_user(uid)
             if row_user and int(row_user["soft_ban_until"] or 0) > int(time.time()):
                 await block_banned_callback(q, data)
@@ -1371,7 +1488,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await block_rate_limited_callback(q, data)
                 return
         await safe_callback_answer(q)
-        if not data.get("active", False) or not data.get("inline_menu_enabled", False):
+        if not admin_allowed and (not data.get("active", False) or not data.get("inline_menu_enabled", False)):
             return
         with db.conn() as c:
             row=c.execute("SELECT action_type, action_payload FROM menu_buttons WHERE id=? AND is_active=1",(bid,)).fetchone()
@@ -1390,14 +1507,14 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             db.clear_admin_state(uid)
             await q.edit_message_text("State منقضی شد. دوباره از منو شروع کنید.", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False)))
             return
-        if not is_admin(uid, data): return
-        if (not data.get("active", False)) and q.data not in {IMCB["ROOT"], IMCB["TOGGLE"], IMCB["CANCEL"], IMCB["CONFIRM_NO"]}:
+        if not admin_allowed: return
+        if (not data.get("active", False)) and not admin_allowed and q.data not in {IMCB["ROOT"], IMCB["TOGGLE"], IMCB["CANCEL"], IMCB["CONFIRM_NO"]}:
             await safe_callback_answer(q, "اول باید ربات را از وضعیت سراسری روشن کنید.", show_alert=True); return
         if q.data == IMCB["ROOT"]:
             await q.edit_message_text("Inline Menu Engine", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False)))
             return
         if q.data == IMCB["TOGGLE"]:
-            if not data.get("active", False):
+            if not data.get("active", False) and not admin_allowed:
                 await safe_callback_answer(q, "اول ربات را روشن کنید.", show_alert=True); return
             data["inline_menu_enabled"] = not data.get("inline_menu_enabled", False); save_data(data)
             db.log_admin(uid, "toggle", "inline_menu", None, None, str(data["inline_menu_enabled"]))
@@ -1565,7 +1682,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await q.edit_message_text("Output را دوباره بفرستید.", reply_markup=build_back_kb("im:root")); return
     if q.data and q.data.startswith("user:"):
         db.touch_user_activity(uid, "user_button", q.data)
-        if not is_admin(uid, data):
+        if not admin_allowed:
             row_user = db.get_user(uid)
             if row_user and int(row_user["soft_ban_until"] or 0) > int(time.time()):
                 await block_banned_callback(q, data)
@@ -1574,7 +1691,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await block_rate_limited_callback(q, data)
                 return
         await safe_callback_answer(q)
-        if not data.get("active", False):
+        if not data.get("active", False) and not admin_allowed:
             await q.message.reply_text("ربات خاموش است.")
             return
         if q.data=="user:feedback": db.set_json(f"feedback_wait:{uid}", True)
@@ -1582,7 +1699,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg=mapping.get(q.data)
         if msg: await send_formatted_message(q.message, msg, data)
         return
-    if not is_admin(uid,data): return
+    if not admin_allowed: return
     panel_callback_data = {"menu:admin", "toggle:active", "admin:selfbot", "admin:welcome_toggle", "admin:db_export"}
     handled_panel_ui = False
     if q.data in panel_callback_data or q.data.startswith("panel:"):
@@ -2066,44 +2183,47 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
     text_markup = text_with_custom_emoji_markup(bm) if getattr(bm, "text", None) else ""
     src_txt = text_markup or message_interaction_text(bm)
     txt=(getattr(bm, "text", None) or getattr(bm, "caption", None) or "").strip()
-    uid=(bm.from_user.id if bm.from_user else bm.chat.id)
+    uid = await message_sender_id(bm, data, context)
+    if uid is None:
+        logging.warning("business_message_missing_sender msg_id=%s", getattr(bm, "message_id", None))
+        return
+    admin_allowed = await is_admin_or_business_owner(uid, data, context, getattr(bm, "business_connection_id", None))
     await maybe_report_watch_hit(update, context, "business", txt)
-    if not data.get("active", False) and not is_admin(uid, data):
+    if not data.get("active", False) and not admin_allowed:
         logging.info("business_ignored_bot_inactive uid=%s", uid)
         return
     prev=db.get_user(uid)
-    if prev and int(prev["soft_ban_until"] or 0) > int(time.time()):
-        return
     db.upsert_user(uid,(bm.from_user.username if bm.from_user else "") or "",(bm.from_user.full_name if bm.from_user else bm.chat.full_name) or "",None,False,"business",src_txt)
-    if data.get("active", False) and data.get("inline_menu_enabled", False):
+    if (data.get("active", False) and data.get("inline_menu_enabled", False)) or admin_allowed:
         menu = db.menu_by_command(txt)
         if menu:
-            if not is_admin(uid, data) and menu_command_rate_limited(uid, txt):
-                logging.warning("business_menu_command_rate_limited uid=%s command=%r", uid, txt)
-                return
             buttons = db.menu_buttons(menu["id"])
-            if not is_admin(uid, data):
+            if not admin_allowed:
                 reset_callback_session(uid)
             out = render_html_text(menu["preview_text"], bold=data.get("bold_mode", True))
             kwargs = {"chat_id": bm.chat.id, "text": out, "parse_mode": ParseMode.HTML, "reply_markup": build_menu_markup(buttons)}
             bc = getattr(bm, "business_connection_id", None)
             if bc: kwargs["business_connection_id"] = bc
-            if is_admin(uid, data):
+            if admin_allowed or await is_admin_authored_business_message(bm, data, context):
                 await delete_admin_trigger_message(bm, context)
             try:
                 await context.bot.send_message(**kwargs)
+            except RetryAfter as exc:
+                logging.warning("business_inline_menu_send_retry_after uid=%s chat_id=%s command=%r retry_after=%s", uid, bm.chat.id, txt, getattr(exc, "retry_after", None))
             except TimedOut:
                 logging.warning("business_inline_menu_send_timeout uid=%s chat_id=%s command=%r", uid, bm.chat.id, txt)
             return
+    if prev and int(prev["soft_ban_until"] or 0) > int(time.time()) and not admin_allowed:
+        return
     if await maybe_send_market_response(bm, data, source="business"):
         return
     sc=db.load_shortcuts(); resp=match_shortcut(txt, sc)
     if resp and data.get("self_bot_enabled", False):
-        if not is_admin(uid, data) and shortcut_rate_limited(uid, txt):
+        if not admin_allowed and shortcut_rate_limited(uid, txt):
             await send_formatted_message(bm, "<b>🚫 محدودیت ضداسپم فعال شد.</b>\n\nبه دلیل ارسال سریع/پرتکرار، به مدت <b>۵ دقیقه</b> محدود شدید.", data)
             return
         bc=getattr(bm,"business_connection_id",None)
-        if data.get("self_bot_enabled") and is_admin(uid, data):
+        if data.get("self_bot_enabled") and admin_allowed:
             out_self = render_html_text(resp, bold=data.get("bold_mode", True))
             try:
                 edit_kwargs = {"chat_id": bm.chat.id, "message_id": bm.message_id, "text": out_self, "parse_mode": ParseMode.HTML}
@@ -2239,30 +2359,33 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bid=int(p["button_id"]); db.update_button_name(bid, src_txt); db.log_admin(uid,"edit","menu_button_name",bid,None,src_txt); db.clear_admin_state(uid); await update.message.reply_text("نام دکمه بروزرسانی شد."); return
         if s=="im_edit_button_output":
             bid=int(p["button_id"]); db.update_button_output(bid, src_txt); db.log_admin(uid,"edit","menu_button_output",bid,None,src_txt); db.clear_admin_state(uid); await update.message.reply_text("خروجی دکمه بروزرسانی شد."); return
-    row=db.get_user(uid)
-    if row and int(row["soft_ban_until"] or 0)>int(time.time()): return
+    admin_allowed = is_admin(uid, data)
     db.upsert_user(uid, update.effective_user.username or "", update.effective_user.full_name or update.effective_user.first_name or "", update.message.contact.phone_number if update.message.contact else None, False, "message", txt)
 
-    if data.get("active", False) and data.get("inline_menu_enabled", False):
+    if (data.get("active", False) and data.get("inline_menu_enabled", False)) or admin_allowed:
         m = db.menu_by_command(txt)
         if m:
-            if not is_admin(uid, data) and menu_command_rate_limited(uid, txt):
-                logging.warning("menu_command_rate_limited uid=%s command=%r", uid, txt)
-                return
             btns=db.menu_buttons(m["id"])
-            if not is_admin(uid, data):
+            if not admin_allowed:
                 reset_callback_session(uid)
-            if is_admin(uid, data):
-                await delete_admin_trigger_message(update.message, context)
-                await context.bot.send_message(chat_id=update.effective_chat.id, text=render_html_text(m["preview_text"], bold=data.get("bold_mode", True)), parse_mode=ParseMode.HTML, reply_markup=build_menu_markup(btns))
-            else:
-                await update.message.reply_text(render_html_text(m["preview_text"], bold=data.get("bold_mode", True)), parse_mode=ParseMode.HTML, reply_markup=build_menu_markup(btns))
+            try:
+                if admin_allowed:
+                    await delete_admin_trigger_message(update.message, context)
+                    await context.bot.send_message(chat_id=update.effective_chat.id, text=render_html_text(m["preview_text"], bold=data.get("bold_mode", True)), parse_mode=ParseMode.HTML, reply_markup=build_menu_markup(btns))
+                else:
+                    await update.message.reply_text(render_html_text(m["preview_text"], bold=data.get("bold_mode", True)), parse_mode=ParseMode.HTML, reply_markup=build_menu_markup(btns))
+            except RetryAfter as exc:
+                logging.warning("inline_menu_send_retry_after uid=%s chat_id=%s command=%r retry_after=%s", uid, update.effective_chat.id, txt, getattr(exc, "retry_after", None))
+            except TimedOut:
+                logging.warning("inline_menu_send_timeout uid=%s chat_id=%s command=%r", uid, update.effective_chat.id, txt)
             return
+    row=db.get_user(uid)
+    if row and int(row["soft_ban_until"] or 0)>int(time.time()) and not admin_allowed: return
     if txt.lower()=="menu":
-        if not data.get("active", False):
+        if not data.get("active", False) and not admin_allowed:
             return
         logging.info("user_menu_open uid=%s", uid)
-        if not is_admin(uid, data):
+        if not admin_allowed:
             reset_callback_session(uid)
         await update.message.reply_text("منوی کاربر", reply_markup=create_menu_keyboard())
         return
@@ -2504,7 +2627,7 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.get("self_bot_enabled", False):
         resp=match_shortcut(txt,shortcuts)
         if resp:
-            if not is_admin(uid, data) and shortcut_rate_limited(uid, txt):
+            if not admin_allowed and shortcut_rate_limited(uid, txt):
                 await send_formatted_message(update.message, "<b>🚫 محدودیت ضداسپم فعال شد.</b>\n\nبه دلیل ارسال سریع/پرتکرار، به مدت <b>۵ دقیقه</b> محدود شدید.", data)
                 return
             if is_admin(uid,data):
