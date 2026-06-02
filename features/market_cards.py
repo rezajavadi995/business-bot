@@ -272,22 +272,45 @@ def _display_text(text: str) -> str:
     return shape_rtl_text(text) if _is_rtl(text) else str(text or "")
 
 
+def _text_width(draw, text: str, font) -> int:
+    bbox = draw.textbbox((0, 0), _display_text(_image_text(text)), font=font)
+    return bbox[2] - bbox[0]
+
+
+def _split_token_to_width(draw, token: str, font, max_width: int) -> list[str]:
+    parts: list[str] = []
+    current = ""
+    for char in str(token or ""):
+        candidate = current + char
+        if current and _text_width(draw, candidate, font) > max_width:
+            parts.append(current)
+            current = char
+        else:
+            current = candidate
+    if current:
+        parts.append(current)
+    return parts or [str(token or "")]
+
+
 def _line_wrap(draw, text: str, font, max_width: int) -> list[str]:
     lines: list[str] = []
+    safe_width = max(24, int(max_width))
     for raw_line in str(text or "").splitlines():
         if not raw_line:
             lines.append("")
             continue
         current = ""
-        for word in raw_line.split():
-            candidate = f"{current} {word}".strip()
-            bbox = draw.textbbox((0, 0), _display_text(candidate), font=font)
-            if bbox[2] - bbox[0] <= max_width or not current:
-                current = candidate
-            else:
-                lines.append(current)
-                current = word
-        lines.append(current)
+        for raw_word in raw_line.split():
+            words = _split_token_to_width(draw, raw_word, font, safe_width) if _text_width(draw, raw_word, font) > safe_width else [raw_word]
+            for word in words:
+                candidate = f"{current} {word}".strip()
+                if _text_width(draw, candidate, font) <= safe_width or not current:
+                    current = candidate
+                else:
+                    lines.append(current)
+                    current = word
+        if current:
+            lines.append(current)
     return lines
 
 
@@ -307,6 +330,16 @@ def _draw_text(draw, xy: tuple[int, int], text: str, font, fill, *, anchor: str 
     draw.text(xy, _display_text(_image_text(text)), font=font, fill=fill, anchor=anchor)
 
 
+def _ellipsize_to_width(draw, text: str, font, max_width: int) -> str:
+    raw = _image_text(text)
+    if _text_width(draw, raw, font) <= max_width:
+        return raw
+    suffix = "…"
+    while raw and _text_width(draw, raw + suffix, font) > max_width:
+        raw = raw[:-1].rstrip()
+    return (raw + suffix) if raw else suffix
+
+
 def _watermark_xy(position: str, width: int, height: int, tw: int, th: int, margin_x: int = 105, margin_y: int = 105) -> tuple[int, int]:
     y_map = {"top": margin_y, "center": (height - th) // 2, "bottom": height - th - 145}
     x_map = {"left": margin_x, "center": (width - tw) // 2, "right": width - tw - margin_x}
@@ -314,6 +347,10 @@ def _watermark_xy(position: str, width: int, height: int, tw: int, th: int, marg
         return x_map["center"], y_map["center"]
     vertical, _, horizontal = position.partition("_")
     return x_map.get(horizontal, x_map["right"]), y_map.get(vertical, y_map["bottom"])
+
+
+def clear_market_card_cache() -> None:
+    _CARD_CACHE.clear()
 
 
 def render_market_card(response_text: str, branding: dict[str, Any]) -> bytes:
@@ -383,7 +420,8 @@ def render_market_card(response_text: str, branding: dict[str, Any]) -> bytes:
         logo = image_mod.open(logo_path).convert("RGBA").resize((112, 112))
         base.alpha_composite(logo, (width - 220, 140))
 
-    wrapped_lines = _line_wrap(draw, response_text, body_font_fa if _is_rtl(response_text) else body_font_en, width - 210)[:13]
+    content_max_width = width - 210
+    wrapped_lines = _line_wrap(draw, response_text, body_font_fa if _is_rtl(response_text) else body_font_en, content_max_width)[:13]
     line_metrics = []
     max_line_width = 0
     total_height = 0
@@ -395,7 +433,8 @@ def render_market_card(response_text: str, branding: dict[str, Any]) -> bytes:
         line_metrics.append((line, font, line_width, line_height))
         max_line_width = max(max_line_width, line_width)
         total_height += line_height
-    x, y = _watermark_xy(str(branding.get("price_position") or "center_left"), width, height, max_line_width, total_height, margin_y=310)
+    x, y = _watermark_xy(str(branding.get("price_position") or "center_left"), width, height, min(max_line_width, content_max_width), total_height, margin_y=310)
+    x = max(105, min(x, width - 105 - min(max_line_width, content_max_width)))
     for line, font, _, line_height in line_metrics:
         _draw_text(draw, (x, y), line, font, fill)
         y += line_height
@@ -549,6 +588,7 @@ def render_advanced_market_card(response_text: str, branding: dict[str, Any]) ->
     logo_slot = (width - 192, 46, width - 74, 164)
     brand = str(branding.get("branding_text") or "Market Bot")[:36]
     brand_font = fa_bold if _is_rtl(brand) else en_bold
+    brand = _ellipsize_to_width(draw, brand, brand_font, 572)
     brand_bbox = draw.textbbox((0, 0), _display_text(brand), font=brand_font)
     brand_w = min(brand_bbox[2] - brand_bbox[0] + 38, 610)
     brand_h = 58
@@ -577,9 +617,12 @@ def render_advanced_market_card(response_text: str, branding: dict[str, Any]) ->
     dot = (panel_x + 48, panel_y + 48, panel_x + 100, panel_y + 100)
     draw.ellipse(dot, fill=accent + (255,))
     draw.text((panel_x + 122, panel_y + 32), facts["symbol"], font=en_bold, fill=(16, 20, 32, text_alpha))
-    draw.text((panel_x + panel_w - 240, panel_y + 48), f"{facts['symbol']} / USD", font=en, fill=(130, 136, 148, 230))
+    pair_text = _ellipsize_to_width(draw, f"{facts['symbol']} / USD", en, 220)
+    draw.text((panel_x + panel_w - 240, panel_y + 48), pair_text, font=en, fill=(130, 136, 148, 230))
 
-    draw.text((panel_x + 62, panel_y + 130), f"${facts['usd']}", font=_load_font(font_mod, _font_path(english_choice, True), 82), fill=(8, 12, 24, text_alpha))
+    price_font = _load_font(font_mod, _font_path(english_choice, True), 82)
+    price_text = _ellipsize_to_width(draw, f"${facts['usd']}", price_font, panel_w - 124)
+    draw.text((panel_x + 62, panel_y + 130), price_text, font=price_font, fill=(8, 12, 24, text_alpha))
     change = facts["change"]
     change_color = (12, 180, 110, 255) if change >= 0 else (226, 64, 75, 255)
     draw.text((panel_x + 66, panel_y + 230), f"{change:+.2f}%", font=en_bold, fill=change_color)
@@ -606,16 +649,16 @@ def render_advanced_market_card(response_text: str, branding: dict[str, Any]) ->
     info_x, info_y = panel_x + 60, panel_y + panel_h - 100
     draw.rounded_rectangle((info_x, info_y, info_x + info_w, info_y + info_h), radius=26, fill=(15, 21, 34, 235))
     _draw_badge(draw, (info_x + 28, info_y + 17), "IRT", en, (255, 255, 255, 255), (39, 150, 92, 255))
-    draw.text((info_x + 118, info_y + 21), f"{facts['toman']}", font=en, fill=(255, 255, 255, text_alpha))
+    draw.text((info_x + 118, info_y + 21), _ellipsize_to_width(draw, f"{facts['toman']}", en, 275), font=en, fill=(255, 255, 255, text_alpha))
     _draw_badge(draw, (info_x + 430, info_y + 17), "USD", en, (255, 255, 255, 255), (74, 105, 164, 255))
-    draw.text((info_x + 530, info_y + 21), f"${facts['usd']}", font=en, fill=(255, 255, 255, text_alpha))
+    draw.text((info_x + 530, info_y + 21), _ellipsize_to_width(draw, f"${facts['usd']}", en, info_x + info_w - (info_x + 530) - 24), font=en, fill=(255, 255, 255, text_alpha))
 
     if facts.get("result") and not re.search(r"(?:تومان|toman|IRT)", str(facts.get("result")), re.IGNORECASE):
-        result = facts["result"][:34]
         rb_w, rb_h = 520, 58
+        result = _ellipsize_to_width(draw, str(facts["result"]), fa if _is_rtl(str(facts["result"])) else en, rb_w - 40)
         rb_x, rb_y = panel_x + panel_w - rb_w - 42, panel_y + 140
         draw.rounded_rectangle((rb_x, rb_y, rb_x + rb_w, rb_y + rb_h), radius=20, fill=accent + (35,), outline=accent + (105,), width=2)
-        draw.text((rb_x + 20, rb_y + 12), _display_text(_image_text(result)), font=fa if _is_rtl(result) else en, fill=(18, 24, 38, text_alpha))
+        draw.text((rb_x + 20, rb_y + 12), _display_text(result), font=fa if _is_rtl(result) else en, fill=(18, 24, 38, text_alpha))
     if facts.get("high_low"):
         high, low = facts["high_low"]
         text = f"High / Low  {high} / {low}"
@@ -625,12 +668,15 @@ def render_advanced_market_card(response_text: str, branding: dict[str, Any]) ->
     if watermark:
         wm_font = fa_small if _is_rtl(watermark) else en_small
         bbox = draw.textbbox((0, 0), _display_text(watermark), font=wm_font)
+        max_wm_width = width - 160
+        if bbox[2] - bbox[0] > max_wm_width:
+            watermark = _ellipsize_to_width(draw, watermark, wm_font, max_wm_width)
+            bbox = draw.textbbox((0, 0), _display_text(watermark), font=wm_font)
         wm_w, wm_h = bbox[2] - bbox[0] + 26, bbox[3] - bbox[1] + 18
         wm_x, wm_y = _positioned_box(str(branding.get("watermark_position") or "bottom_center"), (width, height), (wm_w, wm_h), (80, 34))
         draw.rounded_rectangle((wm_x, wm_y, wm_x + wm_w, wm_y + wm_h), radius=15, fill=(0, 0, 0, 38))
         _draw_text(draw, (wm_x + 13, wm_y + 7), watermark, wm_font, (255, 255, 255, min(text_alpha, 230)))
 
     out = BytesIO()
-    base.convert("RGB").save(out, format="PNG", optimize=True)
-    #base.convert("RGB").save(out, format="PNG", compress_level=4)
+    base.convert("RGB").save(out, format="PNG", compress_level=4)
     return out.getvalue()
