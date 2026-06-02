@@ -295,11 +295,13 @@ class MarketRateService:
     def bind_store(self, store: JsonStore) -> None:
         self.store = store
 
-    def reset_runtime_state(self, store: JsonStore | None = None) -> None:
+    def reset_runtime_state(self, store: JsonStore | None = None, *, clear_persisted: bool = False) -> None:
         if store is not None:
             self.store = store
         EXCHANGERATE_RUNTIME_STATE.clear()
         self._last_refresh_started_at = 0
+        if clear_persisted and self.store:
+            self.store.set_json(EXCHANGERATE_COOLDOWN_KEY, {"penalty_level": 0, "cooldown_until": 0, "reset_at": int(time.time())})
 
     def read_cache(self) -> dict[str, Any]:
         if not self.store:

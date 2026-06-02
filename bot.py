@@ -14,6 +14,7 @@ from io import BytesIO
 from contextlib import contextmanager
 from dataclasses import dataclass
 import tempfile
+import contextlib
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any
@@ -395,6 +396,10 @@ FSM_TTL_SECONDS = 15 * 60
 BUSINESS_OWNER_CACHE_TTL_SECONDS = 60 * 60
 BUSINESS_OWNER_CACHE: dict[str, tuple[int, float]] = {}
 DB_IMPORT_IN_PROGRESS = False
+ACTIVE_UPDATE_TASKS: set[asyncio.Task] = set()
+DB_IMPORT_CONDITION: asyncio.Condition | None = None
+DB_IMPORT_DRAIN_TIMEOUT_SECONDS = 15
+BACKGROUND_TASK_SHUTDOWN_TIMEOUT_SECONDS = 20
 MARKET_REFRESH_TASK: asyncio.Task | None = None
 
 def setup_logging() -> None:
@@ -623,6 +628,16 @@ def set_env_value(key: str, value: str, *, update_backup: bool = True) -> None:
         backup_market_api_secrets()
 
 
+def unset_env_value(key: str) -> None:
+    key = str(key or "").strip()
+    if not re.fullmatch(r"[A-Z0-9_]+", key):
+        raise ValueError("invalid env key")
+    if ENV_PATH.exists():
+        lines = [line for line in ENV_PATH.read_text(encoding="utf-8").splitlines() if not line.startswith(f"{key}=")]
+        ENV_PATH.write_text(("\n".join(lines).rstrip() + "\n") if lines else "", encoding="utf-8")
+    os.environ.pop(key, None)
+
+
 
 
 def _market_secret_key() -> bytes:
@@ -680,12 +695,15 @@ def restore_market_api_secrets(*, force: bool = False) -> None:
     payload = db.get_json("market_api_secrets", {})
     secrets = payload.get("keys", {}) if isinstance(payload, dict) else {}
     if not isinstance(secrets, dict):
-        return
+        secrets = {}
     for key in MARKET_SECRET_ENV_KEYS:
         value = decrypt_market_secret(str(secrets.get(key) or ""))
-        if not value:
-            continue
-        if force or not os.getenv(key, "").strip():
+        if force:
+            if value:
+                set_env_value(key, value, update_backup=False)
+            else:
+                unset_env_value(key)
+        elif value and not os.getenv(key, "").strip():
             set_env_value(key, value, update_backup=False)
 
 def format_market_status(data: dict[str, Any]) -> str:
@@ -2263,10 +2281,121 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
         return
     logging.info("business_shortcut_no_match uid=%s text=%s", uid, txt)
 
-async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def _db_import_condition() -> asyncio.Condition:
+    global DB_IMPORT_CONDITION
+    if DB_IMPORT_CONDITION is None:
+        DB_IMPORT_CONDITION = asyncio.Condition()
+    return DB_IMPORT_CONDITION
+
+
+async def enter_update_handler() -> bool:
+    global ACTIVE_UPDATE_TASKS
+    task = asyncio.current_task()
+    cond = _db_import_condition()
+    async with cond:
+        if DB_IMPORT_IN_PROGRESS:
+            return False
+        if task:
+            ACTIVE_UPDATE_TASKS.add(task)
+        return True
+
+
+async def leave_update_handler() -> None:
+    task = asyncio.current_task()
+    cond = _db_import_condition()
+    async with cond:
+        if task:
+            ACTIVE_UPDATE_TASKS.discard(task)
+        cond.notify_all()
+
+
+async def begin_db_import() -> list[asyncio.Task]:
     global DB_IMPORT_IN_PROGRESS
-    if DB_IMPORT_IN_PROGRESS:
+    current = asyncio.current_task()
+    cond = _db_import_condition()
+    DB_IMPORT_IN_PROGRESS = True
+    deadline = time.monotonic() + DB_IMPORT_DRAIN_TIMEOUT_SECONDS
+    async with cond:
+        while True:
+            pending = [task for task in ACTIVE_UPDATE_TASKS if task is not current and not task.done()]
+            if not pending:
+                return []
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                await asyncio.wait_for(cond.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                break
+        stale = [task for task in ACTIVE_UPDATE_TASKS if task is not current and not task.done()]
+    for task in stale:
+        task.cancel()
+    if stale:
+        await asyncio.gather(*stale, return_exceptions=True)
+    return stale
+
+
+async def finish_db_import() -> None:
+    global DB_IMPORT_IN_PROGRESS
+    cond = _db_import_condition()
+    async with cond:
+        DB_IMPORT_IN_PROGRESS = False
+        cond.notify_all()
+
+
+async def stop_market_background_tasks(context: ContextTypes.DEFAULT_TYPE) -> None:
+    global MARKET_REFRESH_TASK
+    MARKET_SERVICE.stop()
+    tasks = []
+    task = context.application.bot_data.get("market_task")
+    if task and not task.done():
+        tasks.append(task)
+    if MARKET_REFRESH_TASK and not MARKET_REFRESH_TASK.done():
+        tasks.append(MARKET_REFRESH_TASK)
+    if tasks:
+        done, pending = await asyncio.wait(tasks, timeout=BACKGROUND_TASK_SHUTDOWN_TIMEOUT_SECONDS)
+        for task in done:
+            with contextlib.suppress(asyncio.CancelledError):
+                exc = task.exception()
+                if exc:
+                    logging.warning("market_background_shutdown_error reason=%s", exc)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+    MARKET_REFRESH_TASK = None
+
+
+def reset_runtime_state_after_db_import() -> None:
+    BUSINESS_OWNER_CACHE.clear()
+    clear_market_card_cache()
+    STATE.flow = STATE.step = STATE.pending_key = None
+    STATE.admin_id = STATE.message_id = None
+    STATE.temp_shortcuts = None
+
+
+def gate_update_handler(handler):
+    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await enter_update_handler():
+            return
+        try:
+            return await handler(update, context)
+        finally:
+            await leave_update_handler()
+    return wrapped
+
+
+async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await enter_update_handler():
         return
+    try:
+        await _all_messages_impl(update, context)
+    finally:
+        await leave_update_handler()
+
+
+async def _all_messages_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global DB_IMPORT_IN_PROGRESS
     if getattr(update,"business_message",None): await business_message_handler(update, context); return
     if getattr(update, "edited_business_message", None):
         data = load_data()
@@ -2299,31 +2428,27 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not doc:
             await update.message.reply_text("لطفاً فایل .db ارسال کنید.")
             return
-        DB_IMPORT_IN_PROGRESS = True
         try:
-            MARKET_SERVICE.stop()
-            task = context.application.bot_data.get("market_task")
-            if task:
-                task.cancel()
-            if MARKET_REFRESH_TASK and not MARKET_REFRESH_TASK.done():
-                MARKET_REFRESH_TASK.cancel()
+            await begin_db_import()
             file = await doc.get_file()
             tmp = BASE_DIR / "bot.new.db"
             await file.download_to_drive(custom_path=str(tmp))
+            await stop_market_background_tasks(context)
             backup_old = BASE_DIR / f"bot.backup.{int(time.time())}.db"
             if DB_PATH.exists():
                 DB_PATH.replace(backup_old)
             tmp.replace(DB_PATH)
-            BUSINESS_OWNER_CACHE.clear()
-            clear_market_card_cache()
-            MARKET_SERVICE.reset_runtime_state(db)
+            db.init()
+            reset_runtime_state_after_db_import()
+            MARKET_SERVICE.reset_runtime_state(db, clear_persisted=True)
             restore_market_api_secrets(force=True)
-            STATE.flow = STATE.step = STATE.pending_key = None
-            STATE.temp_shortcuts = None
             await update.message.reply_text("✅ دیتابیس جدید جایگزین شد. ربات در حال ریلود...")
             os.execlp("python", "python", str(BASE_DIR / "bot.py"))
         finally:
-            DB_IMPORT_IN_PROGRESS = False
+            task = context.application.bot_data.get("market_task", None)
+            if task and task.done():
+                context.application.bot_data["market_task"] = asyncio.create_task(MARKET_SERVICE.run_forever(get_market_runtime_settings))
+            await finish_db_import()
         return
     if update.effective_chat and update.effective_chat.type in {"group", "supergroup"}:
         await maybe_report_watch_hit(update, context, "group", update.message.text or update.message.caption or "")
@@ -2737,8 +2862,8 @@ def main() -> None:
     token=os.getenv("BOT_TOKEN")
     if not token: raise RuntimeError("BOT_TOKEN is missing")
     app=Application.builder().token(token).post_init(post_init).post_shutdown(post_shutdown).build()
-    app.add_handler(CommandHandler("start", start)); app.add_handler(CommandHandler("panel", panel)); app.add_handler(CommandHandler("help_market", help_market)); app.add_handler(CommandHandler("help", help_command)); app.add_handler(CommandHandler("broadcast", broadcast))
-    app.add_handler(CallbackQueryHandler(callbacks)); app.add_handler(MessageHandler(filters.ALL, all_messages)); app.add_error_handler(on_error)
+    app.add_handler(CommandHandler("start", gate_update_handler(start))); app.add_handler(CommandHandler("panel", gate_update_handler(panel))); app.add_handler(CommandHandler("help_market", gate_update_handler(help_market))); app.add_handler(CommandHandler("help", gate_update_handler(help_command))); app.add_handler(CommandHandler("broadcast", gate_update_handler(broadcast)))
+    app.add_handler(CallbackQueryHandler(gate_update_handler(callbacks))); app.add_handler(MessageHandler(filters.ALL, all_messages)); app.add_error_handler(on_error)
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__": main()
