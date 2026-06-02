@@ -30,7 +30,7 @@ from features.inline_menu import build_inline_menu_admin_kb, paged_rows, CB as I
 from features.inline_actions import ACTION_REGISTRY
 from features.inline_callback import parse as parse_cb, is_valid_im_callback
 from features.market_engine import MARKET_SERVICE, cache_status, market_help_text, merge_market_settings, normalize_asset_list, parse_market_intent, render_market_response, validate_market_api_key
-from features.market_cards import COLOR_PALETTES, CARD_THEMES, ENGLISH_FONT_CHOICES, PERSIAN_FONT_CHOICES, WATERMARK_POSITIONS, merge_branding_settings, render_market_card
+from features.market_cards import COLOR_PALETTES, CARD_THEMES, ENGLISH_FONT_CHOICES, PERSIAN_FONT_CHOICES, WATERMARK_POSITIONS, clear_market_card_cache, merge_branding_settings, render_market_card
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
@@ -394,6 +394,8 @@ db = DB(DB_PATH)
 FSM_TTL_SECONDS = 15 * 60
 BUSINESS_OWNER_CACHE_TTL_SECONDS = 60 * 60
 BUSINESS_OWNER_CACHE: dict[str, tuple[int, float]] = {}
+DB_IMPORT_IN_PROGRESS = False
+MARKET_REFRESH_TASK: asyncio.Task | None = None
 
 def setup_logging() -> None:
     LOG_DIR.mkdir(exist_ok=True)
@@ -674,16 +676,16 @@ def backup_market_api_secrets() -> None:
         db.set_json("market_api_secrets", {"v": 1, "keys": secrets, "updated_at": int(time.time())})
 
 
-def restore_market_api_secrets() -> None:
+def restore_market_api_secrets(*, force: bool = False) -> None:
     payload = db.get_json("market_api_secrets", {})
     secrets = payload.get("keys", {}) if isinstance(payload, dict) else {}
     if not isinstance(secrets, dict):
         return
     for key in MARKET_SECRET_ENV_KEYS:
-        if os.getenv(key, "").strip():
-            continue
         value = decrypt_market_secret(str(secrets.get(key) or ""))
-        if value:
+        if not value:
+            continue
+        if force or not os.getenv(key, "").strip():
             set_env_value(key, value, update_backup=False)
 
 def format_market_status(data: dict[str, Any]) -> str:
@@ -1029,15 +1031,20 @@ def market_message_dedupe_key(message, source: str) -> str | None:
 
 
 def schedule_market_refresh(market_settings: dict[str, Any]) -> None:
-    task = asyncio.create_task(MARKET_SERVICE.refresh_if_needed(dict(market_settings)))
+    global MARKET_REFRESH_TASK
+    if MARKET_REFRESH_TASK and not MARKET_REFRESH_TASK.done():
+        return
+    MARKET_REFRESH_TASK = asyncio.create_task(MARKET_SERVICE.refresh_if_needed(dict(market_settings)))
 
     def _log_refresh_error(done_task: asyncio.Task) -> None:
         try:
             done_task.result()
+        except asyncio.CancelledError:
+            pass
         except Exception as exc:
             logging.warning("market_background_refresh_failed reason=%s", exc)
 
-    task.add_done_callback(_log_refresh_error)
+    MARKET_REFRESH_TASK.add_done_callback(_log_refresh_error)
 
 
 def get_market_cache_for_response(market_settings: dict[str, Any]) -> dict[str, Any]:
@@ -2252,13 +2259,14 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
             return
         logging.info("business_shortcut_sent uid=%s text=%s",uid, txt)
         return
-    if await maybe_send_market_response(bm, data, source="business"):
-        return
     if await send_business_welcome_once(bm, context, data, uid, prev):
         return
     logging.info("business_shortcut_no_match uid=%s text=%s", uid, txt)
 
 async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global DB_IMPORT_IN_PROGRESS
+    if DB_IMPORT_IN_PROGRESS:
+        return
     if getattr(update,"business_message",None): await business_message_handler(update, context); return
     if getattr(update, "edited_business_message", None):
         data = load_data()
@@ -2291,17 +2299,31 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not doc:
             await update.message.reply_text("لطفاً فایل .db ارسال کنید.")
             return
-        file = await doc.get_file()
-        tmp = BASE_DIR / "bot.new.db"
-        await file.download_to_drive(custom_path=str(tmp))
-        backup_old = BASE_DIR / f"bot.backup.{int(time.time())}.db"
-        if DB_PATH.exists():
-            DB_PATH.replace(backup_old)
-        tmp.replace(DB_PATH)
-        restore_market_api_secrets()
-        STATE.flow = STATE.step = None
-        await update.message.reply_text("✅ دیتابیس جدید جایگزین شد. ربات در حال ریلود...")
-        os.execlp("python", "python", str(BASE_DIR / "bot.py"))
+        DB_IMPORT_IN_PROGRESS = True
+        try:
+            MARKET_SERVICE.stop()
+            task = context.application.bot_data.get("market_task")
+            if task:
+                task.cancel()
+            if MARKET_REFRESH_TASK and not MARKET_REFRESH_TASK.done():
+                MARKET_REFRESH_TASK.cancel()
+            file = await doc.get_file()
+            tmp = BASE_DIR / "bot.new.db"
+            await file.download_to_drive(custom_path=str(tmp))
+            backup_old = BASE_DIR / f"bot.backup.{int(time.time())}.db"
+            if DB_PATH.exists():
+                DB_PATH.replace(backup_old)
+            tmp.replace(DB_PATH)
+            BUSINESS_OWNER_CACHE.clear()
+            clear_market_card_cache()
+            MARKET_SERVICE.reset_runtime_state(db)
+            restore_market_api_secrets(force=True)
+            STATE.flow = STATE.step = STATE.pending_key = None
+            STATE.temp_shortcuts = None
+            await update.message.reply_text("✅ دیتابیس جدید جایگزین شد. ربات در حال ریلود...")
+            os.execlp("python", "python", str(BASE_DIR / "bot.py"))
+        finally:
+            DB_IMPORT_IN_PROGRESS = False
         return
     if update.effective_chat and update.effective_chat.type in {"group", "supergroup"}:
         await maybe_report_watch_hit(update, context, "group", update.message.text or update.message.caption or "")
@@ -2638,9 +2660,6 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await send_formatted_message(update.message, resp, data)
                 return
             if not is_admin(uid,data): await send_formatted_message(update.message, resp, data); return
-
-    if not is_edited_message and await maybe_send_market_response(update.message, data, source="message"):
-        return
 
     if data["active"] and not is_admin(uid,data): await send_formatted_message(update.message, data.get("offline_message",""), data)
 
