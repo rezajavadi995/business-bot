@@ -805,6 +805,31 @@ def html_asset(asset: str) -> str:
     return html.escape(asset_label(asset))
 
 
+def market_change(cache: dict[str, Any], asset: str | None) -> float | None:
+    if not asset:
+        return None
+    crypto_meta = ((cache.get("meta") or {}).get("crypto") or {}) if isinstance(cache, dict) else {}
+    value = (crypto_meta.get("24h_change") or {}).get(asset) if isinstance(crypto_meta, dict) else None
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def unit_price_line(cache: dict[str, Any], asset: str | None, quote: str, stale_ttl: int) -> str | None:
+    if not asset or asset == quote:
+        return None
+    unit = convert_amount(cache, 1.0, asset, quote, stale_ttl)
+    if not unit:
+        return None
+    return f"📌 قیمت واحد ۱ {html_asset(asset)}: <b>{format_number(unit.value, quote)} {html_asset(quote)}</b>"
+
+
+def change_line(cache: dict[str, Any], asset: str | None) -> str | None:
+    change = market_change(cache, asset)
+    if change is None:
+        return None
+    direction = "رشد" if change >= 0 else "افت"
+    return f"📊 {'🟢' if change >= 0 else '🔴'} {direction} روزانه: <b>{abs(change):.2f}%</b>"
+
+
 def _gregorian_to_jalali(year: int, month: int, day: int) -> tuple[int, int, int]:
     g_days_in_month = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
     j_days_in_month = [31, 31, 31, 31, 31, 31, 30, 30, 30, 30, 30, 29]
@@ -858,7 +883,15 @@ def render_conversion(intent: MarketIntent, settings: dict[str, Any], cache: dic
             f"<b>{asset_icon(intent.source)} تبدیل {format_number(intent.amount, intent.source)} {html_asset(intent.source)}</b>",
             f"<blockquote>🔁 <b>{format_number(result.value, intent.target)} {html_asset(intent.target)}</b></blockquote>",
         ]
-        if toman:
+        unit_asset = intent.target if intent.source in {"irt", "irr"} and intent.target else intent.source
+        quote_asset = intent.target if intent.target in {"irt", "irr"} else "irt"
+        unit_line = unit_price_line(cache, unit_asset, quote_asset, stale_ttl)
+        if unit_line:
+            lines.append(unit_line)
+        line = change_line(cache, unit_asset)
+        if line:
+            lines.append(line)
+        if toman and intent.target not in {"irt", "irr"}:
             lines.append(f"🇮🇷 تومان: <b>{format_number(toman.value, 'irt')}</b>")
         lines.append(f"💵 دلار: <b>${format_number(usd_value, 'usd')}</b>")
         if result.stale:
@@ -871,6 +904,12 @@ def render_conversion(intent: MarketIntent, settings: dict[str, Any], cache: dic
     if not toman and not usd:
         return unavailable_message(cache)
     lines = [f"<b>{asset_icon(intent.source)} قیمت {format_number(intent.amount, intent.source)} {html_asset(intent.source)}</b>"]
+    unit_line = unit_price_line(cache, intent.source, "irt", stale_ttl)
+    if unit_line:
+        lines.append(unit_line)
+    line = change_line(cache, intent.source)
+    if line:
+        lines.append(line)
     if toman:
         lines.append(f"🇮🇷 تومان: <b>{format_number(toman.value, 'irt')}</b>")
     if usd:
@@ -1051,35 +1090,46 @@ def cache_status(cache: dict[str, Any], settings: dict[str, Any]) -> dict[str, A
 
 def market_help_text(is_admin: bool = False) -> str:
     base = [
-        "📈 راهنمای Market & Conversion Engine",
+        "📈 راهنمای ساده Market & Conversion Engine",
         "",
-        "نمونه تبدیل‌ها:",
-        "• ۲۰۰۰ استارز",
-        "• 100 usd trx",
-        "• ۲۰ ترون تومان",
-        "• 1200000 تومان تتر",
+        "این بخش با چند منبع قیمت کار می‌کند و جواب‌ها را از کش امن ربات می‌خواند؛ یعنی برای هر پیام مستقیم به API فشار نمی‌آورد.",
         "",
-        "نمونه قیمت/وضعیت:",
-        "• btc",
-        "• price trx",
-        "• trx status",
-        "• btc today",
-        "• trend",
-        "• top gainers",
-        "• btc dominance",
-        "• fear greed",
+        "🔄 تبدیل سریع",
+        "• ۲۰۰ تون تومان  → تبدیل TON به تومان + قیمت واحد ۱ TON",
+        "• ۲,۰۰۰,۰۰۰ تومن ترون  → تبدیل تومان به TRX",
+        "• 100 usd trx  → تبدیل دلار به ترون",
+        "• ۲۰۰۰ استارز  → قیمت استارز با نرخ تنظیم‌شده",
         "",
-        "Alias ها: ترون/trx، تون/ton، تتر/usdt، دلار/usd/$، تومان/irt، ریال/irr، استارز/stars",
+        "💰 قیمت لحظه‌ای",
+        "• ترون / trx / price trx",
+        "• تتر / usdt",
+        "• لیر / روبل / دلار / یورو",
+        "",
+        "📊 وضعیت و ابزارهای بازار",
+        "• trx status یا btc today  → قیمت، تغییرات روزانه، High/Low",
+        "• trend  → کوین‌های ترند CoinGecko",
+        "• top gainers  → بیشترین رشدهای موجود در کش",
+        "• btc dominance  → دامیننس بیت‌کوین",
+        "• fear greed  → شاخص ترس و طمع",
+        "",
+        "🔌 نقش API ها",
+        "• Nobitex local: نرخ تومانی/بازار ایران، مخصوصاً USDTIRT و قیمت‌های ریالی/تومانی",
+        "• CoinGecko: قیمت دلاری کریپتو، درصد تغییرات ۲۴ساعته، High/Low، ترندها و دامیننس",
+        "• ExchangeRate: نرخ ارزهای فیات مثل USD/EUR/TRY/RUB برای تبدیل‌های غیرکریپتو",
+        "",
+        "🏷 Alias های قابل استفاده: ترون/trx، تون/ton، تتر/usdt، دلار/usd/$، تومان/تومن/irt، ریال/irr، لیر/try، روبل/rub، استارز/stars",
     ]
     if is_admin:
         base.extend([
             "",
-            "ادمین:",
-            "• از پنل: Market API Configuration برای تنظیم و اعتبارسنجی API ها",
-            "• Stars Rate Settings برای نرخ دستی استارز",
-            "• Cache Settings برای TTL و وضعیت کش",
+            "🛠 نکات ادمین",
+            "• Market API Configuration: روشن/خاموش کردن Providerها و اعتبارسنجی کلیدها",
+            "• Cache Settings: TTL کش و رفرش دستی نرخ‌ها",
+            "• Stars Rate Settings: نرخ دستی/واحد استارز",
+            "• Market Branding: ساخت کارت، فونت، لوگو، تم و preview",
         ])
     return "\n".join(base)
+
 
 
 MARKET_SERVICE = MarketRateService()

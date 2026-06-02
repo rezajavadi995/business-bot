@@ -104,6 +104,12 @@ class MarketEngineRenderTests(unittest.TestCase):
         text = render_market_response("100 usd trx", self.settings, self.cache)
         self.assertIn("833.333 TRX", text)
 
+    def test_conversion_includes_unit_price_and_daily_change(self):
+        text = render_market_response("۲۰۰ ترون تومان", self.settings, self.cache)
+        self.assertIn("قیمت واحد ۱ TRX", text)
+        self.assertIn("رشد روزانه", text)
+        self.assertIn("2.50%", text)
+
     def test_price_uses_cached_change(self):
         text = render_market_response("trx status", self.settings, self.cache)
         self.assertIn("24h: +2.50%", text)

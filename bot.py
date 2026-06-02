@@ -1081,9 +1081,7 @@ async def maybe_send_market_response(message, data: dict[str, Any], *, source: s
     if branding.get("card_enabled", False):
         try:
             image_bytes = await asyncio.to_thread(render_market_card, response, branding)
-            photo = BytesIO(image_bytes)
-            photo.name = "market-card.png"
-            await message.reply_photo(photo=photo, caption=render_html_text(response[:1000], bold=False), parse_mode=ParseMode.HTML)
+            await message.reply_photo(photo=BytesIO(image_bytes), caption=render_html_text(response[:1000], bold=False), parse_mode=ParseMode.HTML)
             return True
         except Exception as exc:
             logging.warning("market_card_send_failed reason=%s", exc)
