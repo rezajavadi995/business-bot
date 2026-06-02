@@ -295,6 +295,12 @@ class MarketRateService:
     def bind_store(self, store: JsonStore) -> None:
         self.store = store
 
+    def reset_runtime_state(self, store: JsonStore | None = None) -> None:
+        if store is not None:
+            self.store = store
+        EXCHANGERATE_RUNTIME_STATE.clear()
+        self._last_refresh_started_at = 0
+
     def read_cache(self) -> dict[str, Any]:
         if not self.store:
             return {}
