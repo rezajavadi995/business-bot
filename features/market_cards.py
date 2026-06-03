@@ -340,6 +340,16 @@ def _ellipsize_to_width(draw, text: str, font, max_width: int) -> str:
     return (raw + suffix) if raw else suffix
 
 
+def _fit_font_to_width(draw, font_mod, path: str, text: str, max_width: int, start_size: int, min_size: int):
+    size = start_size
+    while size > min_size:
+        font = _load_font(font_mod, path, size)
+        if _text_width(draw, text, font) <= max_width:
+            return font
+        size -= 2
+    return _load_font(font_mod, path, min_size)
+
+
 def _watermark_xy(position: str, width: int, height: int, tw: int, th: int, margin_x: int = 105, margin_y: int = 105) -> tuple[int, int]:
     y_map = {"top": margin_y, "center": (height - th) // 2, "bottom": height - th - 145}
     x_map = {"left": margin_x, "center": (width - tw) // 2, "right": width - tw - margin_x}
@@ -376,16 +386,18 @@ def render_market_card(response_text: str, branding: dict[str, Any]) -> bytes:
     primary = _hex_to_rgb(branding.get("card_primary_color"), _hex_to_rgb(theme["primary"], (35, 54, 255)))
     secondary = _hex_to_rgb(branding.get("card_secondary_color"), _hex_to_rgb(theme["secondary"], (138, 43, 226)))
     dark = bool(branding.get("card_dark_mode", theme.get("dark", True)))
-    base = image_mod.new("RGB", (width, height), (8, 11, 25) if dark else (245, 247, 255))
+    small_w, small_h = max(180, width // 6), max(180, height // 6)
+    base = image_mod.new("RGB", (small_w, small_h), (8, 11, 25) if dark else (245, 247, 255))
     px = base.load()
-    for y in range(height):
-        ratio = y / max(height - 1, 1)
+    for y in range(small_h):
+        ratio = y / max(small_h - 1, 1)
         r = int(primary[0] * (1 - ratio) + secondary[0] * ratio)
         g = int(primary[1] * (1 - ratio) + secondary[1] * ratio)
         b = int(primary[2] * (1 - ratio) + secondary[2] * ratio)
-        for x in range(width):
-            vignette = 1 - (abs(x - width / 2) / width) * 0.35
+        for x in range(small_w):
+            vignette = 1 - (abs(x - small_w / 2) / small_w) * 0.35
             px[x, y] = (int(r * vignette), int(g * vignette), int(b * vignette))
+    base = base.resize((width, height), _resample_filter(image_mod))
 
     overlay = image_mod.new("RGBA", (width, height), (0, 0, 0, 0))
     draw = draw_mod.Draw(overlay)
@@ -449,7 +461,7 @@ def render_market_card(response_text: str, branding: dict[str, Any]) -> bytes:
         draw.text((x, y), display_watermark, font=watermark_font, fill=muted)
 
     out = BytesIO()
-    base.convert("RGB").save(out, format="PNG", compress_level=4)
+    base.convert("RGB").save(out, format="PNG", compress_level=3)
     data = out.getvalue()
     if len(_CARD_CACHE) > 64:
         _CARD_CACHE.clear()
@@ -474,6 +486,21 @@ _SYMBOL_ALIASES = {
 }
 
 
+def _extract_change_pct(plain: str) -> float:
+    code_match = re.search(r"24h\s*:\s*([+-]\s*\d+(?:\.\d+)?)\s*%", plain, re.IGNORECASE)
+    if code_match:
+        return float(code_match.group(1).replace(" ", ""))
+    signed_match = re.search(r"([+-]\s*\d+(?:\.\d+)?)\s*%", plain)
+    if signed_match:
+        return float(signed_match.group(1).replace(" ", ""))
+    direction_match = re.search(r"(افت|ریزش|کاهش|رشد|افزایش|صعود)[^\d%\n]{0,32}(\d+(?:\.\d+)?)\s*%", plain)
+    if direction_match:
+        value = float(direction_match.group(2))
+        return -value if direction_match.group(1) in {"افت", "ریزش", "کاهش"} else value
+    pct_match = re.search(r"(\d+(?:\.\d+)?)\s*%", plain)
+    return float(pct_match.group(1)) if pct_match else 0.0
+
+
 def _extract_card_facts(response_text: str) -> dict[str, Any]:
     plain = re.sub(r"\n{3,}", "\n\n", _strip_html(response_text)).strip()
     upper = plain.upper()
@@ -482,7 +509,6 @@ def _extract_card_facts(response_text: str) -> dict[str, Any]:
         symbol = next((asset for word, asset in _SYMBOL_ALIASES.items() if word in plain), "USDT")
     usd_match = re.search(r"\$\s*([0-9][0-9,]*(?:\.\d+)?)", plain)
     toman_match = re.search(r"(?:تومان|IRT|تومانی)\s*:?\s*([0-9][0-9,]*(?:\.\d+)?)|([0-9][0-9,]*(?:\.\d+)?)\s*(?:تومان|toman)", plain, re.IGNORECASE)
-    pct_match = re.search(r"([+-]?\d+(?:\.\d+)?)\s*%", plain)
     high_low_match = re.search(r"([0-9][0-9,]*(?:\.\d+)?)\s*/\s*([0-9][0-9,]*(?:\.\d+)?)\s*تومان", plain)
     result_match = re.search(r"🔁\s*([^\n]+)", plain)
     title = next((line.strip() for line in plain.splitlines() if line.strip()), f"قیمت {symbol}")
@@ -491,7 +517,7 @@ def _extract_card_facts(response_text: str) -> dict[str, Any]:
         "title": title.replace("🔺", "").replace("💵", "").strip(),
         "usd": usd_match.group(1) if usd_match else "1",
         "toman": ((toman_match.group(1) or toman_match.group(2)) if toman_match else "-"),
-        "change": float(pct_match.group(1)) if pct_match else 0.0,
+        "change": _extract_change_pct(plain),
         "high_low": high_low_match.groups() if high_low_match else None,
         "result": result_match.group(1).strip() if result_match else "",
     }
@@ -547,19 +573,24 @@ def _positioned_box(position: str, canvas: tuple[int, int], size: tuple[int, int
     return x_map.get(horizontal, x_map["center"]), y_map.get(vertical, y_map["center"])
 
 
+def _resample_filter(image_mod):
+    return getattr(getattr(image_mod, "Resampling", image_mod), "LANCZOS", getattr(image_mod, "LANCZOS", 1))
+
+
 def _advanced_background(image_mod, width: int, height: int, primary: tuple[int, int, int], secondary: tuple[int, int, int]):
-    base = image_mod.new("RGB", (width, height), primary)
+    small_w, small_h = max(180, width // 5), max(150, height // 5)
+    base = image_mod.new("RGB", (small_w, small_h), primary)
     px = base.load()
-    for x in range(width):
-        ratio = x / max(width - 1, 1)
+    for x in range(small_w):
+        ratio = x / max(small_w - 1, 1)
         r = int(primary[0] * (1 - ratio) + secondary[0] * ratio)
         g = int(primary[1] * (1 - ratio) + secondary[1] * ratio)
         b = int(primary[2] * (1 - ratio) + secondary[2] * ratio)
-        for y in range(height):
-            center = 1 - min(0.28, (((x - width / 2) ** 2 + (y - height / 2) ** 2) ** 0.5 / width) * 0.22)
-            soft = 0.92 + 0.08 * math.sin((x + y) / 210)
+        for y in range(small_h):
+            center = 1 - min(0.28, (((x - small_w / 2) ** 2 + (y - small_h / 2) ** 2) ** 0.5 / small_w) * 0.22)
+            soft = 0.92 + 0.08 * math.sin((x + y) / 42)
             px[x, y] = (int(r * center * soft), int(g * center * soft), int(b * center * soft))
-    return base.convert("RGBA")
+    return base.resize((width, height), _resample_filter(image_mod)).convert("RGBA")
 
 
 def render_advanced_market_card(response_text: str, branding: dict[str, Any]) -> bytes:
@@ -608,9 +639,9 @@ def render_advanced_market_card(response_text: str, branding: dict[str, Any]) ->
         except Exception:
             pass
 
-    panel_w, panel_h = 910, 540
-    panel_x, panel_y = _positioned_box(str(branding.get("price_position") or "center"), (width, height), (panel_w, panel_h), (84, 132))
-    panel_y = max(132, min(panel_y, height - panel_h - 130))
+    panel_w, panel_h = 910, 560
+    panel_x, panel_y = _positioned_box(str(branding.get("price_position") or "center"), (width, height), (panel_w, panel_h), (84, 92))
+    panel_y = max(92, min(panel_y, height - panel_h - 96))
     draw.rounded_rectangle((panel_x + 10, panel_y + 14, panel_x + panel_w + 10, panel_y + panel_h + 14), radius=46, fill=(12, 16, 26, 65))
     draw.rounded_rectangle((panel_x, panel_y, panel_x + panel_w, panel_y + panel_h), radius=46, fill=(255, 255, 255, 244), outline=(255, 255, 255, 180), width=2)
 
@@ -618,16 +649,17 @@ def render_advanced_market_card(response_text: str, branding: dict[str, Any]) ->
     draw.ellipse(dot, fill=accent + (255,))
     draw.text((panel_x + 122, panel_y + 32), facts["symbol"], font=en_bold, fill=(16, 20, 32, text_alpha))
     pair_text = _ellipsize_to_width(draw, f"{facts['symbol']} / USD", en, 220)
-    draw.text((panel_x + panel_w - 240, panel_y + 48), pair_text, font=en, fill=(130, 136, 148, 230))
+    draw.text((panel_x + panel_w - 62, panel_y + 48), pair_text, font=en, fill=(130, 136, 148, 230), anchor="ra")
 
     price_font = _load_font(font_mod, _font_path(english_choice, True), 82)
     price_text = _ellipsize_to_width(draw, f"${facts['usd']}", price_font, panel_w - 124)
     draw.text((panel_x + 62, panel_y + 130), price_text, font=price_font, fill=(8, 12, 24, text_alpha))
     change = facts["change"]
     change_color = (12, 180, 110, 255) if change >= 0 else (226, 64, 75, 255)
-    draw.text((panel_x + 66, panel_y + 230), f"{change:+.2f}%", font=en_bold, fill=change_color)
+    change_text = _ellipsize_to_width(draw, f"{change:+.2f}%", en_bold, panel_w - 124)
+    draw.text((panel_x + 66, panel_y + 220), change_text, font=en_bold, fill=change_color)
 
-    chart_left, chart_top = panel_x + 70, panel_y + 306
+    chart_left, chart_top = panel_x + 70, panel_y + 330
     chart_right, chart_bottom = panel_x + panel_w - 70, panel_y + panel_h - 136
     for i in range(5):
         y = chart_top + i * ((chart_bottom - chart_top) // 4)
@@ -645,13 +677,22 @@ def render_advanced_market_card(response_text: str, branding: dict[str, Any]) ->
     for point in points[::8]:
         draw.ellipse((point[0] - 5, point[1] - 5, point[0] + 5, point[1] + 5), fill=change_color)
 
-    info_w, info_h = panel_w - 120, 74
-    info_x, info_y = panel_x + 60, panel_y + panel_h - 100
+    info_w, info_h = panel_w - 120, 78
+    info_x, info_y = panel_x + 60, panel_y + panel_h - 106
     draw.rounded_rectangle((info_x, info_y, info_x + info_w, info_y + info_h), radius=26, fill=(15, 21, 34, 235))
-    _draw_badge(draw, (info_x + 28, info_y + 17), "IRT", en, (255, 255, 255, 255), (39, 150, 92, 255))
-    draw.text((info_x + 118, info_y + 21), _ellipsize_to_width(draw, f"{facts['toman']}", en, 275), font=en, fill=(255, 255, 255, text_alpha))
-    _draw_badge(draw, (info_x + 430, info_y + 17), "USD", en, (255, 255, 255, 255), (74, 105, 164, 255))
-    draw.text((info_x + 530, info_y + 21), _ellipsize_to_width(draw, f"${facts['usd']}", en, info_x + info_w - (info_x + 530) - 24), font=en, fill=(255, 255, 255, text_alpha))
+    irt_badge = _draw_badge(draw, (info_x + 28, info_y + 18), "IRT", en, (255, 255, 255, 255), (39, 150, 92, 255))
+    usd_badge = _draw_badge(draw, (info_x + 460, info_y + 18), "USD", en, (255, 255, 255, 255), (74, 105, 164, 255))
+    irt_x = irt_badge[2] + 28
+    usd_x = usd_badge[2] + 28
+    irt_max_w = max(120, usd_badge[0] - irt_x - 28)
+    usd_max_w = max(120, info_x + info_w - usd_x - 24)
+    number_path = _font_path(english_choice, False)
+    irt_text = str(facts["toman"])
+    usd_text = f"${facts['usd']}"
+    irt_font = _fit_font_to_width(draw, font_mod, number_path, irt_text, irt_max_w, 32, 22)
+    usd_font = _fit_font_to_width(draw, font_mod, number_path, usd_text, usd_max_w, 32, 22)
+    draw.text((irt_x, info_y + 22), _ellipsize_to_width(draw, irt_text, irt_font, irt_max_w), font=irt_font, fill=(255, 255, 255, text_alpha))
+    draw.text((usd_x, info_y + 22), _ellipsize_to_width(draw, usd_text, usd_font, usd_max_w), font=usd_font, fill=(255, 255, 255, text_alpha))
 
     if facts.get("result") and not re.search(r"(?:تومان|toman|IRT)", str(facts.get("result")), re.IGNORECASE):
         rb_w, rb_h = 520, 58
@@ -662,7 +703,7 @@ def render_advanced_market_card(response_text: str, branding: dict[str, Any]) ->
     if facts.get("high_low"):
         high, low = facts["high_low"]
         text = f"High / Low  {high} / {low}"
-        draw.text((panel_x + 62, panel_y + 286), text, font=en_small, fill=(102, 110, 128, 230))
+        draw.text((panel_x + 62, panel_y + 292), _ellipsize_to_width(draw, text, en_small, panel_w - 124), font=en_small, fill=(102, 110, 128, 230))
 
     watermark = str(branding.get("watermark_text") or branding.get("branding_channel_id") or "")[:64]
     if watermark:
@@ -678,5 +719,5 @@ def render_advanced_market_card(response_text: str, branding: dict[str, Any]) ->
         _draw_text(draw, (wm_x + 13, wm_y + 7), watermark, wm_font, (255, 255, 255, min(text_alpha, 230)))
 
     out = BytesIO()
-    base.convert("RGB").save(out, format="PNG", compress_level=4)
+    base.convert("RGB").save(out, format="PNG", compress_level=3)
     return out.getvalue()

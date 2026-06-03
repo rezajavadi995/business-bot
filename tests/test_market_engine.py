@@ -11,6 +11,7 @@ from features.market_engine import (
     render_market_response,
     validate_market_api_key,
     stars_unit_usd,
+    provider_refresh_interval,
     MarketRateService,
     CACHE_KEY,
     EXCHANGERATE_COOLDOWN_KEY,
@@ -100,6 +101,19 @@ class MarketEngineRenderTests(unittest.TestCase):
             },
             "meta": {"crypto": {"24h_change": {"trx": 2.5}, "24h_high": {"trx": 0.13}, "24h_low": {"trx": 0.11}, "trending": [{"symbol": "BTC", "name": "Bitcoin"}], "top_gainers": [{"symbol": "TRX", "change": 2.5}], "dominance": {"btc": 52.3}}, "fear_greed": {"value": 70, "classification": "Greed", "timestamp": int(time.time())}},
         }
+
+
+    def test_default_market_cache_ttl_is_two_minutes(self):
+        settings = merge_market_settings({})
+        self.assertEqual(settings["cache_ttl_seconds"], 120)
+        self.assertEqual(settings["stale_ttl_seconds"], 120)
+        self.assertEqual(provider_refresh_interval(settings), 120)
+
+    def test_existing_short_market_cache_ttl_is_clamped_to_two_minutes(self):
+        settings = merge_market_settings({"market": {"cache_ttl_seconds": 60, "stale_ttl_seconds": 60}})
+        self.assertEqual(settings["cache_ttl_seconds"], 120)
+        self.assertEqual(settings["stale_ttl_seconds"], 120)
+        self.assertEqual(provider_refresh_interval(settings), 120)
 
     def test_conversion_uses_cache_only(self):
         text = render_market_response("100 usd trx", self.settings, self.cache)
