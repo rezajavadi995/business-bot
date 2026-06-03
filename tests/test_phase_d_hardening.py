@@ -276,7 +276,7 @@ class PhaseDCallbackRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("یک ساعت", blocked.answers[-1][0])
         sends = [item for item in context.bot.sent if "edit" not in item]
         edits = [item for item in context.bot.sent if "edit" in item]
-        self.assertEqual(len(sends), 1)
+        self.assertEqual(len(sends), bot.CALLBACK_ALLOWED_INTERACTIONS)
         self.assertEqual(len(edits), 0)
         row = bot.db.get_user(101)
         self.assertEqual(int(row["spam_score"] or 0), 1)
@@ -319,7 +319,7 @@ class PhaseDCallbackRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(q2.answers[-1], (None, False))
         self.assertEqual(len([item for item in context.bot.sent if "edit" not in item]), 1)
 
-    async def test_callback_retry_after_does_not_send_fallback_or_crash(self):
+    async def test_repeated_callback_sends_new_message_without_editing_previous(self):
         bot.db.upsert_user(101, "", "Customer", None, False, "test", "")
         context = CallbackContext()
         q = DummyCallbackQuery(101, f"im:btn:{self.button_id}")
@@ -334,7 +334,8 @@ class PhaseDCallbackRuntimeTests(unittest.IsolatedAsyncioTestCase):
         await bot.callbacks(SimpleNamespace(callback_query=q2), context)
 
         self.assertEqual(q2.answers[-1], (None, False))
-        self.assertEqual(len(context.bot.sent), sent_before)
+        self.assertEqual(len(context.bot.sent), sent_before + 1)
+        self.assertFalse(any("edit" in item for item in context.bot.sent))
 
 
 

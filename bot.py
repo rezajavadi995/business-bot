@@ -1282,6 +1282,38 @@ async def tg_answer_callback_query(bot_obj, **kwargs) -> Any:
     return await telegram_api_call(bot_obj, "answer_callback_query", **kwargs)
 
 
+def safe_debug_text(value: Any, limit: int = 1200) -> str:
+    text = str(value or "")
+    token = os.getenv("BOT_TOKEN", "").strip()
+    if token:
+        text = text.replace(token, "***BOT_TOKEN***")
+    text = re.sub(r"bot\d+:[A-Za-z0-9_\-]+", "bot***:***", text)
+    return text[:limit]
+
+
+async def notify_admin_debug(context: ContextTypes.DEFAULT_TYPE | None, title: str, details: Any, data: dict[str, Any] | None = None) -> None:
+    if context is None or getattr(context, "bot", None) is None:
+        return
+    try:
+        admin_id = configured_admin_id(data or load_data())
+    except Exception:
+        admin_id = int(os.getenv("ADMIN_ID") or 0)
+    if not admin_id:
+        return
+    text = f"🛠 <b>{html.escape(str(title))}</b>\n<pre>{html.escape(safe_debug_text(details))}</pre>"
+    try:
+        await tg_send_message(context.bot, chat_id=admin_id, text=text, parse_mode=ParseMode.HTML)
+    except Exception as exc:
+        logging.warning("admin_debug_notify_failed title=%r reason=%s", title, exc)
+
+
+def validate_sqlite_db_file(path: Path) -> None:
+    with sqlite3.connect(path) as c:
+        row = c.execute("PRAGMA integrity_check").fetchone()
+        if not row or str(row[0]).lower() != "ok":
+            raise RuntimeError(f"sqlite integrity_check failed: {row[0] if row else 'empty'}")
+
+
 def shortcut_rate_limited(uid: int, command: str) -> bool:
     return smart_rate_limit(uid, "shortcut", command, 60, 20, 30, 7)
 
@@ -1563,35 +1595,21 @@ async def send_or_replace_button_response(q, context: ContextTypes.DEFAULT_TYPE,
     if not q.message:
         return
     chat_id = q.message.chat.id
-    storage_key = f"last_btn_response:{q.from_user.id}:{chat_id}:{button_id}"
     out_text = render_html_text(payload, bold=data.get("bold_mode", True))
     bc = getattr(q.message, "business_connection_id", None)
     base_kwargs = {"chat_id": chat_id, "parse_mode": ParseMode.HTML}
     if bc:
         base_kwargs["business_connection_id"] = bc
-    previous = db.get_json(storage_key, {})
-    prev_msg_id = int(previous.get("message_id") or 0) if isinstance(previous, dict) else 0
-    if prev_msg_id:
-        try:
-            edited = await safe_bot_edit_message_text(context.bot, message_id=prev_msg_id, text=out_text, **base_kwargs)
-            if edited:
-                db.set_json(storage_key, {"message_id": prev_msg_id, "updated_at": int(time.time()), "hash": stable_payload_hash(out_text)})
-            return
-        except BadRequest as exc:
-            logging.warning("button_response_edit_failed uid=%s bid=%s reason=%s", q.from_user.id, button_id, exc)
-        except RetryAfter as exc:
-            logging.warning("button_response_edit_retry_after uid=%s bid=%s retry_after=%s", q.from_user.id, button_id, getattr(exc, "retry_after", None))
-            return
-        except Exception as exc:
-            logging.warning("button_response_edit_failed uid=%s bid=%s reason=%s", q.from_user.id, button_id, exc)
     try:
-        sent = await tg_send_message(context.bot, text=out_text, **base_kwargs)
-        db.set_json(storage_key, {"message_id": sent.message_id, "updated_at": int(time.time()), "hash": stable_payload_hash(out_text)})
+        await tg_send_message(context.bot, text=out_text, **base_kwargs)
+        logging.info("button_response_sent uid=%s bid=%s chat_id=%s", q.from_user.id, button_id, chat_id)
     except RetryAfter as exc:
         logging.warning("button_response_send_retry_after uid=%s bid=%s retry_after=%s", q.from_user.id, button_id, getattr(exc, "retry_after", None))
     except TimedOut:
         logging.warning("button_response_send_timeout uid=%s bid=%s", q.from_user.id, button_id)
-
+    except Exception as exc:
+        logging.warning("button_response_send_failed uid=%s bid=%s reason=%s", q.from_user.id, button_id, exc)
+        await notify_admin_debug(context, "Inline button response send failed", {"uid": q.from_user.id, "button_id": button_id, "reason": safe_debug_text(exc)}, data)
 
 async def delete_admin_trigger_message(message, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
@@ -1663,6 +1681,24 @@ async def panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id,data): return
     return await render_admin_panel(update, context, data, edit=False)
 
+
+
+class CallbackQueryDataProxy:
+    """Local proxy so normalized callback data reaches handlers without mutating PTB objects."""
+    def __init__(self, query: Any, data: str):
+        self._query = query
+        self.data = data
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._query, name)
+
+
+def best_effort_set_callback_data(query: Any, data: str) -> None:
+    try:
+        object.__setattr__(query, "data", data)
+    except Exception as exc:
+        logging.info("callback_data_proxy_used reason=%s", exc)
+
 async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query
     if not q: return
@@ -1670,6 +1706,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     normalized = normalize_for_dispatch(raw_callback_data)
     if not normalized or not is_safe_callback_data(normalized.runtime):
         logging.warning("callback_rejected_invalid data=%r normalized=%r", raw_callback_data, normalized.runtime if normalized else None)
+        await notify_admin_debug(context, "Invalid callback rejected", {"raw": raw_callback_data, "normalized": normalized.runtime if normalized else None})
         await safe_callback_answer(q, "Callback نامعتبر است.", show_alert=True)
         return
     message_id = getattr(getattr(q, "message", None), "message_id", None)
@@ -1677,10 +1714,10 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.info("callback_duplicate_ignored id=%s canonical=%r", getattr(q, "id", None), normalized.canonical)
         await safe_callback_answer(q)
         return
-    setattr(q, "normalized_callback_data", normalized.canonical)
     if normalized.legacy:
         logging.info("callback_legacy_normalized raw=%r runtime=%r canonical=%r", raw_callback_data, normalized.runtime, normalized.canonical)
-    q.data = normalized.runtime
+    best_effort_set_callback_data(q, normalized.runtime)
+    q = CallbackQueryDataProxy(q, normalized.runtime)
     data=load_data(); uid=q.from_user.id
     bc = getattr(getattr(q, "message", None), "business_connection_id", None)
     admin_allowed = await is_admin_or_business_owner(uid, data, context, bc)
@@ -1704,6 +1741,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         row, resolved_bid, resolution = resolve_inline_button_row(bid)
         if not row:
             logging.warning("im_button_missing uid=%s button_id=%s resolution=%s data=%r", uid, bid, resolution, q.data)
+            await notify_admin_debug(context, "Inline button missing", {"uid": uid, "button_id": bid, "resolution": resolution, "data": q.data}, data)
             await safe_callback_answer(q, "این دکمه منقضی شده است. لطفاً منو را دوباره باز کنید.", show_alert=True)
             return
         handler = get_action_handler(row["action_type"])
@@ -2634,11 +2672,15 @@ async def _all_messages_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if not doc:
             await update.message.reply_text("لطفاً فایل .db ارسال کنید.")
             return
+        backup_old = None
+        tmp = BASE_DIR / "bot.new.db"
         try:
             await begin_db_import()
             file = await doc.get_file()
-            tmp = BASE_DIR / "bot.new.db"
             await file.download_to_drive(custom_path=str(tmp))
+            validate_sqlite_db_file(tmp)
+            DB(tmp).init()
+            await notify_admin_debug(context, "DB import validated", {"tmp": str(tmp), "state": DB_IMPORT_STATE})
             DB_IMPORT_STATE = "FREEZE"
             await stop_market_background_tasks(context)
             DB_IMPORT_STATE = "SWAP"
@@ -2652,7 +2694,21 @@ async def _all_messages_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
             MARKET_SERVICE.reset_runtime_state(db, clear_persisted=True)
             restore_market_api_secrets(force=True)
             await update.message.reply_text("✅ دیتابیس جدید جایگزین شد. ربات در حال ریلود...")
+            await notify_admin_debug(context, "DB import swapped successfully", {"backup": str(backup_old), "state": DB_IMPORT_STATE})
             os.execlp("python", "python", str(BASE_DIR / "bot.py"))
+        except Exception as exc:
+            logging.exception("db_import_failed state=%s reason=%s", DB_IMPORT_STATE, exc)
+            if DB_IMPORT_STATE in {"SWAP", "REBUILD"} and backup_old and backup_old.exists():
+                with contextlib.suppress(Exception):
+                    if DB_PATH.exists():
+                        DB_PATH.unlink()
+                    backup_old.replace(DB_PATH)
+                    db.init()
+                    MARKET_SERVICE.reset_runtime_state(db, clear_persisted=False)
+                    logging.warning("db_import_rollback_restored backup=%s", backup_old)
+            await notify_admin_debug(context, "DB import failed", {"state": DB_IMPORT_STATE, "reason": safe_debug_text(exc)})
+            with contextlib.suppress(Exception):
+                await update.message.reply_text(f"❌ ایمپورت دیتابیس ناموفق بود. مرحله: {DB_IMPORT_STATE}\n{safe_debug_text(exc, 500)}")
         finally:
             task = context.application.bot_data.get("market_task", None)
             if task and task.done():
@@ -3023,7 +3079,9 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as exc: logging.warning("broadcast failed %s %s", u["user_id"], exc)
     await update.message.reply_text(f"ارسال شد برای {sent} کاربر")
 
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE): logging.exception("Unhandled error: %s", context.error)
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logging.exception("Unhandled error: %s", context.error)
+    await notify_admin_debug(context, "Unhandled bot error", {"error": safe_debug_text(context.error), "update": safe_debug_text(update, 700)})
 
 
 def build_back_kb(target: str="menu:admin") -> InlineKeyboardMarkup:

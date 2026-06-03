@@ -133,9 +133,9 @@ def normalize_for_dispatch(raw: str | None) -> NormalizedCallback | None:
 
 
 def callback_execution_key(callback_id: str | None, message_id: object | None, normalized_payload: str | None) -> str | None:
-    if not callback_id and not normalized_payload:
+    if not callback_id:
         return None
-    seed = f"{callback_id or '-'}:{message_id or '-'}:{normalized_payload or '-'}"
+    seed = f"{callback_id}:{message_id or '-'}:{normalized_payload or '-'}"
     return hashlib.sha256(seed.encode("utf-8")).hexdigest()
 
 
