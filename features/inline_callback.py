@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 
 MAX_CALLBACK_LEN = 64
 
@@ -62,6 +63,22 @@ class ParsedCallback:
     parts: list[str]
 
 
+@dataclass(frozen=True)
+class NormalizedCallback:
+    """Callback data after the single pre-dispatch normalization layer.
+
+    canonical is the architecture-level vX:namespace:action:payload shape.
+    runtime is the backward-compatible shape consumed by existing handlers.
+    """
+    raw: str
+    runtime: str
+    canonical: str
+    namespace: str
+    action: str
+    payload: str
+    legacy: bool = False
+
+
 def cb(*parts: str) -> str:
     value = ":".join(parts)
     if len(value.encode("utf-8")) > MAX_CALLBACK_LEN:
@@ -86,6 +103,40 @@ def normalize_callback_data(raw: str | None) -> str | None:
         if value.startswith(old):
             return f"{new}{value[len(old):]}"
     return value
+
+
+def canonicalize_callback_data(runtime: str | None) -> str | None:
+    if not runtime:
+        return None
+    parts = str(runtime).split(":")
+    namespace = parts[0] if parts else "unknown"
+    action = parts[1] if len(parts) > 1 else "noop"
+    payload = ":".join(parts[2:]) if len(parts) > 2 else ""
+    return ":".join(["v1", namespace, action, payload]) if payload else ":".join(["v1", namespace, action])
+
+
+def normalize_for_dispatch(raw: str | None) -> NormalizedCallback | None:
+    if not raw:
+        return None
+    original = str(raw).strip()
+    runtime = normalize_callback_data(original)
+    if not runtime:
+        return None
+    canonical = canonicalize_callback_data(runtime)
+    if not canonical:
+        return None
+    parts = runtime.split(":")
+    namespace = parts[0] if parts else "unknown"
+    action = parts[1] if len(parts) > 1 else "noop"
+    payload = ":".join(parts[2:]) if len(parts) > 2 else ""
+    return NormalizedCallback(original, runtime, canonical, namespace, action, payload, legacy=(runtime != original))
+
+
+def callback_execution_key(callback_id: str | None, message_id: object | None, normalized_payload: str | None) -> str | None:
+    if not callback_id and not normalized_payload:
+        return None
+    seed = f"{callback_id or '-'}:{message_id or '-'}:{normalized_payload or '-'}"
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()
 
 
 def parse(raw: str | None) -> ParsedCallback | None:

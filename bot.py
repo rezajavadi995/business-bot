@@ -29,8 +29,8 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 from features.log_export import build_logs_keyboard, humanize_log_text
 from features.inline_menu import build_inline_menu_admin_kb, paged_rows, CB as IMCB
 from features.inline_actions import get_action_handler
-from features.inline_callback import parse as parse_cb, is_valid_im_callback, normalize_callback_data
-from features.market_engine import MARKET_SERVICE, cache_status, market_help_text, merge_market_settings, normalize_asset_list, parse_market_intent, render_market_response, validate_market_api_key
+from features.inline_callback import callback_execution_key, normalize_for_dispatch, parse as parse_cb, is_valid_im_callback, normalize_callback_data
+from features.market_engine import MARKET_SERVICE, cache_status, market_help_text, merge_market_settings, normalize_asset_list, parse_market_intent, render_market_response, validate_market_api_key, get_market_snapshot
 from features.market_cards import COLOR_PALETTES, CARD_THEMES, ENGLISH_FONT_CHOICES, PERSIAN_FONT_CHOICES, WATERMARK_POSITIONS, clear_market_card_cache, merge_branding_settings, render_market_card
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -396,6 +396,8 @@ FSM_TTL_SECONDS = 15 * 60
 BUSINESS_OWNER_CACHE_TTL_SECONDS = 60 * 60
 BUSINESS_OWNER_CACHE: dict[str, tuple[int, float]] = {}
 DB_IMPORT_IN_PROGRESS = False
+DB_IMPORT_STATE = "IDLE"
+DB_IMPORT_LOCK = asyncio.Lock()
 ACTIVE_UPDATE_TASKS: set[asyncio.Task] = set()
 DB_IMPORT_CONDITION: asyncio.Condition | None = None
 DB_IMPORT_DRAIN_TIMEOUT_SECONDS = 15
@@ -404,6 +406,7 @@ MARKET_REFRESH_TASK: asyncio.Task | None = None
 CALLBACK_EXECUTION_TTL_SECONDS = 10 * 60
 CALLBACK_EXECUTION_LOCK = asyncio.Lock()
 CALLBACK_EXECUTION_IDS: dict[str, int] = {}
+CALLBACK_EXECUTION_RESULTS: dict[str, str] = {}
 EDIT_MESSAGE_LOCKS: dict[str, asyncio.Lock] = {}
 
 
@@ -913,7 +916,7 @@ async def render_admin_panel(update, context, data, *, edit=False, query=None) -
     chat = update.effective_chat or getattr(message, "chat", None)
     if not message or not chat:
         return False
-    await context.bot.send_message(chat_id=chat.id, text=text, reply_markup=reply_markup)
+    await tg_send_message(context.bot, chat_id=chat.id, text=text, reply_markup=reply_markup)
     return True
 
 def create_features_keyboard(data: dict[str, Any]) -> InlineKeyboardMarkup:
@@ -1035,8 +1038,8 @@ async def maybe_report_watch_hit(update: Update, context: ContextTypes.DEFAULT_T
     try:
         if msg and ec:
             await context.bot.forward_message(chat_id=report_chat, from_chat_id=ec.id, message_id=msg.message_id)
-        await context.bot.send_message(chat_id=report_chat, text="💠 اطلاعات بیشتر از پیام مانیتور شده:", parse_mode=ParseMode.HTML)
-        await context.bot.send_message(chat_id=report_chat, text=meta, parse_mode=ParseMode.HTML)
+        await tg_send_message(context.bot, chat_id=report_chat, text="💠 اطلاعات بیشتر از پیام مانیتور شده:", parse_mode=ParseMode.HTML)
+        await tg_send_message(context.bot, chat_id=report_chat, text=meta, parse_mode=ParseMode.HTML)
     except Exception as exc:
         logging.warning("watch_report_send_failed reason=%s", exc)
 
@@ -1100,7 +1103,7 @@ async def maybe_send_market_response(message, data: dict[str, Any], *, source: s
         return True
     if dedupe_key:
         db.set_json(dedupe_key, {"processed_at": int(time.time()), "intent": intent.kind})
-    cache = get_market_cache_for_response(market_settings) or await MARKET_SERVICE.refresh_if_needed(market_settings)
+    cache = get_market_cache_for_response(market_settings) or await get_market_snapshot(market_settings)
     try:
         response = render_market_response(text, market_settings, cache)
     except Exception as exc:
@@ -1230,12 +1233,65 @@ def menu_command_rate_limited(uid: int, command: str) -> bool:
     return False
 
 
+TG_METHOD_ALLOWED_KWARGS: dict[str, set[str]] = {
+    "send_message": {"chat_id", "text", "parse_mode", "reply_markup", "disable_notification", "protect_content", "reply_to_message_id", "business_connection_id"},
+    "edit_message_text": {"chat_id", "message_id", "text", "parse_mode", "reply_markup", "disable_web_page_preview", "business_connection_id"},
+    "delete_message": {"chat_id", "message_id"},
+    "answer_callback_query": {"callback_query_id", "text", "show_alert", "url", "cache_time"},
+    "send_document": {"chat_id", "document", "filename", "caption", "parse_mode", "reply_markup", "business_connection_id"},
+}
+
+
+def telegram_safe_kwargs(method_name: str, kwargs: dict[str, Any]) -> dict[str, Any]:
+    allowed = TG_METHOD_ALLOWED_KWARGS.get(method_name)
+    cleaned = dict(kwargs)
+    if allowed is not None:
+        cleaned = {k: v for k, v in cleaned.items() if k in allowed and v is not None}
+    if method_name == "delete_message":
+        cleaned.pop("business_connection_id", None)
+    return cleaned
+
+
+async def telegram_api_call(target: Any, method_name: str, **kwargs) -> Any:
+    cleaned = telegram_safe_kwargs(method_name, kwargs)
+    method = getattr(target, method_name)
+    try:
+        return await method(**cleaned)
+    except TypeError as exc:
+        if "business_connection_id" in cleaned:
+            fallback = dict(cleaned)
+            fallback.pop("business_connection_id", None)
+            logging.warning("telegram_api_kwarg_stripped method=%s kwarg=business_connection_id reason=%s", method_name, exc)
+            return await method(**fallback)
+        raise
+
+
+async def tg_send_message(bot_obj, **kwargs) -> Any:
+    return await telegram_api_call(bot_obj, "send_message", **kwargs)
+
+
+async def tg_edit_message_text(bot_obj, **kwargs) -> Any:
+    return await telegram_api_call(bot_obj, "edit_message_text", **kwargs)
+
+
+async def tg_delete_message(bot_obj, **kwargs) -> Any:
+    return await telegram_api_call(bot_obj, "delete_message", **kwargs)
+
+
+async def tg_answer_callback_query(bot_obj, **kwargs) -> Any:
+    return await telegram_api_call(bot_obj, "answer_callback_query", **kwargs)
+
+
 def shortcut_rate_limited(uid: int, command: str) -> bool:
     return smart_rate_limit(uid, "shortcut", command, 60, 20, 30, 7)
 
 async def safe_callback_answer(q, text: str | None = None, show_alert: bool = False) -> bool:
     try:
-        if text is None:
+        bot_obj = getattr(q, "bot", None)
+        callback_id = getattr(q, "id", None)
+        if bot_obj and callback_id:
+            await tg_answer_callback_query(bot_obj, callback_query_id=callback_id, text=text, show_alert=show_alert)
+        elif text is None:
             await q.answer()
         else:
             await q.answer(text, show_alert=show_alert)
@@ -1254,15 +1310,16 @@ def _prune_callback_execution_ids(now: int) -> None:
         CALLBACK_EXECUTION_IDS.pop(key, None)
 
 
-async def claim_callback_execution(callback_id: str | None) -> bool:
-    if not callback_id:
+async def claim_callback_execution(callback_id: str | None, message_id: object | None = None, normalized_payload: str | None = None) -> bool:
+    execution_key = callback_execution_key(callback_id, message_id, normalized_payload)
+    if not execution_key:
         return True
     now = int(time.time())
     async with CALLBACK_EXECUTION_LOCK:
         _prune_callback_execution_ids(now)
-        if callback_id in CALLBACK_EXECUTION_IDS:
+        if execution_key in CALLBACK_EXECUTION_IDS:
             return False
-        CALLBACK_EXECUTION_IDS[callback_id] = now
+        CALLBACK_EXECUTION_IDS[execution_key] = now
         return True
 
 
@@ -1348,7 +1405,7 @@ async def safe_bot_edit_message_text(bot_obj, *, chat_id, message_id, business_c
             logging.info("bot_edit_message_idempotent_skip chat_id=%s message_id=%s", chat_id, message_id)
             return True
         try:
-            await bot_obj.edit_message_text(chat_id=chat_id, message_id=message_id, **edit_kwargs)
+            await tg_edit_message_text(bot_obj, chat_id=chat_id, message_id=message_id, **edit_kwargs)
         except BadRequest as exc:
             if "message is not modified" not in str(exc).lower():
                 raise
@@ -1528,7 +1585,7 @@ async def send_or_replace_button_response(q, context: ContextTypes.DEFAULT_TYPE,
         except Exception as exc:
             logging.warning("button_response_edit_failed uid=%s bid=%s reason=%s", q.from_user.id, button_id, exc)
     try:
-        sent = await context.bot.send_message(text=out_text, **base_kwargs)
+        sent = await tg_send_message(context.bot, text=out_text, **base_kwargs)
         db.set_json(storage_key, {"message_id": sent.message_id, "updated_at": int(time.time()), "hash": stable_payload_hash(out_text)})
     except RetryAfter as exc:
         logging.warning("button_response_send_retry_after uid=%s bid=%s retry_after=%s", q.from_user.id, button_id, getattr(exc, "retry_after", None))
@@ -1542,7 +1599,7 @@ async def delete_admin_trigger_message(message, context: ContextTypes.DEFAULT_TY
         bc = getattr(message, "business_connection_id", None)
         if bc:
             kwargs["business_connection_id"] = bc
-        await context.bot.delete_message(**kwargs)
+        await tg_delete_message(context.bot, **kwargs)
     except Exception as exc:
         logging.warning("admin_menu_trigger_delete_failed uid=%s msg_id=%s reason=%s", getattr(getattr(message, "from_user", None), "id", None), getattr(message, "message_id", None), exc)
 
@@ -1609,19 +1666,21 @@ async def panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query
     if not q: return
-    if not await claim_callback_execution(getattr(q, "id", None)):
-        logging.info("callback_duplicate_ignored id=%s data=%r", getattr(q, "id", None), getattr(q, "data", None))
-        await safe_callback_answer(q)
-        return
     raw_callback_data = q.data
-    normalized_callback_data = normalize_callback_data(raw_callback_data)
-    if not is_safe_callback_data(normalized_callback_data):
-        logging.warning("callback_rejected_invalid data=%r normalized=%r", raw_callback_data, normalized_callback_data)
+    normalized = normalize_for_dispatch(raw_callback_data)
+    if not normalized or not is_safe_callback_data(normalized.runtime):
+        logging.warning("callback_rejected_invalid data=%r normalized=%r", raw_callback_data, normalized.runtime if normalized else None)
         await safe_callback_answer(q, "Callback نامعتبر است.", show_alert=True)
         return
-    if normalized_callback_data != raw_callback_data:
-        logging.info("callback_legacy_normalized raw=%r normalized=%r", raw_callback_data, normalized_callback_data)
-        q.data = normalized_callback_data
+    message_id = getattr(getattr(q, "message", None), "message_id", None)
+    if not await claim_callback_execution(getattr(q, "id", None), message_id, normalized.canonical):
+        logging.info("callback_duplicate_ignored id=%s canonical=%r", getattr(q, "id", None), normalized.canonical)
+        await safe_callback_answer(q)
+        return
+    setattr(q, "normalized_callback_data", normalized.canonical)
+    if normalized.legacy:
+        logging.info("callback_legacy_normalized raw=%r runtime=%r canonical=%r", raw_callback_data, normalized.runtime, normalized.canonical)
+    q.data = normalized.runtime
     data=load_data(); uid=q.from_user.id
     bc = getattr(getattr(q, "message", None), "business_connection_id", None)
     admin_allowed = await is_admin_or_business_owner(uid, data, context, bc)
@@ -1876,7 +1935,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif q.data=="admin:db_export":
             backup_market_api_secrets()
             stamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-            await context.bot.send_document(chat_id=uid, document=DB_PATH.open("rb"), filename=f"bot-backup-{stamp}.db")
+            await telegram_api_call(context.bot, "send_document", chat_id=uid, document=DB_PATH.open("rb"), filename=f"bot-backup-{stamp}.db")
         handled_panel_ui = await render_admin_panel(update, context, data, edit=True, query=q)
     if handled_panel_ui:
         pass
@@ -1994,7 +2053,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 tempf.write(pretty)
                 temp_path = Path(tempf.name)
             with temp_path.open("rb") as doc:
-                await context.bot.send_document(chat_id=uid, document=doc, filename=f"{fp.stem}-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}.txt")
+                await telegram_api_call(context.bot, "send_document", chat_id=uid, document=doc, filename=f"{fp.stem}-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}.txt")
             temp_path.unlink(missing_ok=True)
             await safe_edit_callback_message_text(q, "فایل لاگ ارسال شد.", reply_markup=build_back_kb("admin:logs_menu"))
     elif q.data=="shortcut:continue_yes": STATE.step="waiting_name"; await safe_edit_callback_message_text(q, "نام شورت‌کات بعدی را وارد کنید:", reply_markup=build_back_kb("admin:shortcut_menu"))
@@ -2038,7 +2097,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = await asyncio.to_thread(validate_market_api_key, provider, key, merge_market_settings(data).get("request_timeout_seconds", 8))
         await safe_edit_callback_message_text(q, ("✅ " if result.get("ok") else "❌ ") + result.get("message", "unknown"), reply_markup=create_market_api_keyboard(data))
     elif q.data=="admin:market_test":
-        await MARKET_SERVICE.refresh(merge_market_settings(data))
+        await get_market_snapshot(merge_market_settings(data), force=True)
         await safe_edit_callback_message_text(q, "درخواست زنده انجام شد.\n\n" + format_market_status(data), reply_markup=create_market_api_keyboard(data))
     elif q.data=="admin:market_stars":
         STATE.flow = STATE.step = STATE.pending_key = None
@@ -2049,7 +2108,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif q.data=="admin:market_status":
         await safe_edit_callback_message_text(q, format_market_status(data), reply_markup=create_market_root_keyboard(data))
     elif q.data=="admin:market_refresh":
-        await MARKET_SERVICE.refresh(merge_market_settings(data))
+        await get_market_snapshot(merge_market_settings(data), force=True)
         await safe_edit_callback_message_text(q, "کش بروزرسانی شد.\n\n" + format_market_status(data), reply_markup=create_market_cache_keyboard(data))
     elif q.data=="admin:market_quick":
         settings = merge_market_settings(data)
@@ -2311,7 +2370,7 @@ async def send_business_welcome_once(message, context: ContextTypes.DEFAULT_TYPE
         return False
     try:
         out_welcome = render_html_text(data.get("welcome_text", "خوش آمدید"), bold=data.get("bold_mode", True))
-        await context.bot.send_message(
+        await tg_send_message(context.bot,
             chat_id=message.chat.id,
             text=out_welcome,
             parse_mode=ParseMode.HTML,
@@ -2365,7 +2424,7 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
             if admin_allowed or await is_admin_authored_business_message(bm, data, context):
                 await delete_admin_trigger_message(bm, context)
             try:
-                await context.bot.send_message(**kwargs)
+                await tg_send_message(context.bot, **kwargs)
             except RetryAfter as exc:
                 logging.warning("business_inline_menu_send_retry_after uid=%s chat_id=%s command=%r retry_after=%s", uid, bm.chat.id, txt, getattr(exc, "retry_after", None))
             except TimedOut:
@@ -2396,7 +2455,7 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
                     del_kwargs = {"chat_id": bm.chat.id, "message_id": bm.message_id}
                     if bc:
                         del_kwargs["business_connection_id"] = bc
-                    await context.bot.delete_message(**del_kwargs)
+                    await tg_delete_message(context.bot, **del_kwargs)
                     logging.info("business_admin_shortcut_delete_ok uid=%s msg_id=%s", uid, bm.message_id)
                 except Exception as delete_exc:
                     logging.warning("business_admin_shortcut_delete_failed uid=%s reason=%s", uid, delete_exc)
@@ -2404,7 +2463,7 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
         kwargs={"chat_id":bm.chat.id,"text":out_text,"parse_mode":ParseMode.HTML}
         if bc: kwargs["business_connection_id"]=bc
         try:
-            await context.bot.send_message(**kwargs)
+            await tg_send_message(context.bot, **kwargs)
         except TimedOut:
             logging.warning("business_shortcut_send_timeout uid=%s chat_id=%s text=%r", uid, bm.chat.id, txt)
             return
@@ -2443,16 +2502,20 @@ async def leave_update_handler() -> None:
 
 
 async def begin_db_import() -> list[asyncio.Task]:
-    global DB_IMPORT_IN_PROGRESS
+    global DB_IMPORT_IN_PROGRESS, DB_IMPORT_STATE
+    await DB_IMPORT_LOCK.acquire()
     current = asyncio.current_task()
     cond = _db_import_condition()
     deadline = time.monotonic() + DB_IMPORT_DRAIN_TIMEOUT_SECONDS
     async with cond:
+        DB_IMPORT_STATE = "IMPORTING"
         DB_IMPORT_IN_PROGRESS = True
+        DB_IMPORT_STATE = "DRAINING"
         cond.notify_all()
         while True:
             pending = [task for task in ACTIVE_UPDATE_TASKS if task is not current and not task.done()]
             if not pending:
+                DB_IMPORT_STATE = "FREEZE"
                 return []
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -2466,15 +2529,20 @@ async def begin_db_import() -> list[asyncio.Task]:
         task.cancel()
     if stale:
         await asyncio.gather(*stale, return_exceptions=True)
+    async with cond:
+        DB_IMPORT_STATE = "FREEZE"
     return stale
 
 
 async def finish_db_import() -> None:
-    global DB_IMPORT_IN_PROGRESS
+    global DB_IMPORT_IN_PROGRESS, DB_IMPORT_STATE
     cond = _db_import_condition()
     async with cond:
         DB_IMPORT_IN_PROGRESS = False
+        DB_IMPORT_STATE = "READY"
         cond.notify_all()
+    if DB_IMPORT_LOCK.locked():
+        DB_IMPORT_LOCK.release()
 
 
 async def stop_market_background_tasks(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2508,6 +2576,7 @@ def reset_runtime_state_after_db_import() -> None:
     STATE.admin_id = STATE.message_id = None
     STATE.temp_shortcuts = None
     CALLBACK_EXECUTION_IDS.clear()
+    CALLBACK_EXECUTION_RESULTS.clear()
     EDIT_MESSAGE_LOCKS.clear()
 
 
@@ -2532,7 +2601,7 @@ async def all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _all_messages_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global DB_IMPORT_IN_PROGRESS
+    global DB_IMPORT_IN_PROGRESS, DB_IMPORT_STATE
     if getattr(update,"business_message",None): await business_message_handler(update, context); return
     if getattr(update, "edited_business_message", None):
         data = load_data()
@@ -2570,11 +2639,14 @@ async def _all_messages_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
             file = await doc.get_file()
             tmp = BASE_DIR / "bot.new.db"
             await file.download_to_drive(custom_path=str(tmp))
+            DB_IMPORT_STATE = "FREEZE"
             await stop_market_background_tasks(context)
+            DB_IMPORT_STATE = "SWAP"
             backup_old = BASE_DIR / f"bot.backup.{int(time.time())}.db"
             if DB_PATH.exists():
                 DB_PATH.replace(backup_old)
             tmp.replace(DB_PATH)
+            DB_IMPORT_STATE = "REBUILD"
             db.init()
             reset_runtime_state_after_db_import()
             MARKET_SERVICE.reset_runtime_state(db, clear_persisted=True)
@@ -2648,7 +2720,7 @@ async def _all_messages_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
             try:
                 if admin_allowed:
                     await delete_admin_trigger_message(update.message, context)
-                    await context.bot.send_message(chat_id=update.effective_chat.id, text=render_html_text(m["preview_text"], bold=data.get("bold_mode", True)), parse_mode=ParseMode.HTML, reply_markup=build_menu_markup(btns))
+                    await tg_send_message(context.bot, chat_id=update.effective_chat.id, text=render_html_text(m["preview_text"], bold=data.get("bold_mode", True)), parse_mode=ParseMode.HTML, reply_markup=build_menu_markup(btns))
                 else:
                     await update.message.reply_text(render_html_text(m["preview_text"], bold=data.get("bold_mode", True)), parse_mode=ParseMode.HTML, reply_markup=build_menu_markup(btns))
             except RetryAfter as exc:
@@ -2859,7 +2931,7 @@ async def _all_messages_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 test_ok = f"ok: {getattr(me, 'status', 'unknown')}"
                 utc_now = datetime.utcnow()
                 tehran_now = datetime.now(ZoneInfo("Asia/Tehran"))
-                await context.bot.send_message(chat_id=cid, text=f"✅ اتصال ربات به چنل گزارشات موفق بود.\nUTC: {utc_now.strftime('%Y-%m-%d %H:%M:%S')}\nAsia/Tehran: {tehran_now.strftime('%Y-%m-%d %H:%M:%S')}")
+                await tg_send_message(context.bot, chat_id=cid, text=f"✅ اتصال ربات به چنل گزارشات موفق بود.\nUTC: {utc_now.strftime('%Y-%m-%d %H:%M:%S')}\nAsia/Tehran: {tehran_now.strftime('%Y-%m-%d %H:%M:%S')}")
             except Exception as exc:
                 test_ok = f"failed: {exc}"
             await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"چنل گزارشات ذخیره شد: {cid}\nوضعیت دسترسی ربات: {test_ok}", reply_markup=create_shortcut_menu_keyboard()); return
@@ -2898,7 +2970,7 @@ async def _all_messages_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if admin_id:
             db.set_json(f"feedback_last:{uid}", txt)
             kb=InlineKeyboardMarkup([[create_primary_button("مشاهده متن پیام", f"feedback:view:{uid}")]])
-            await context.bot.send_message(admin_id, f"شما یک پیام جدید دارید از طرف {update.effective_user.full_name or update.effective_user.first_name}", reply_markup=kb)
+            await tg_send_message(context.bot, chat_id=admin_id, text=f"شما یک پیام جدید دارید از طرف {update.effective_user.full_name or update.effective_user.first_name}", reply_markup=kb)
         return
 
     if data.get("self_bot_enabled", False):
@@ -2947,7 +3019,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text: await update.message.reply_text("Usage: /broadcast your message"); return
     sent=0
     for u in db.list_users(100000):
-        try: await context.bot.send_message(int(u["user_id"]), text); sent+=1
+        try: await tg_send_message(context.bot, chat_id=int(u["user_id"]), text=text); sent+=1
         except Exception as exc: logging.warning("broadcast failed %s %s", u["user_id"], exc)
     await update.message.reply_text(f"ارسال شد برای {sent} کاربر")
 

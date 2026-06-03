@@ -108,6 +108,31 @@ class CallbackContext(DummyContext):
 
 
 
+class CallbackNormalizationAndTelegramAdapterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_normalized_dispatch_attaches_canonical_v1_payload(self):
+        self.assertEqual(bot.normalize_for_dispatch("im_btn:77").canonical, "v1:im:btn:77")
+        self.assertEqual(bot.normalize_for_dispatch("inline:root").runtime, "im:root")
+
+    async def test_delete_message_adapter_strips_business_connection_id(self):
+        calls = []
+
+        class DeleteOnlyBot:
+            async def delete_message(self, **kwargs):
+                calls.append(kwargs)
+
+        await bot.tg_delete_message(DeleteOnlyBot(), chat_id=1, message_id=2, business_connection_id="bc")
+
+        self.assertEqual(calls, [{"chat_id": 1, "message_id": 2}])
+
+    async def test_callback_execution_key_uses_message_and_payload(self):
+        key1 = bot.callback_execution_key("same", 1, "v1:im:btn:1")
+        key2 = bot.callback_execution_key("same", 2, "v1:im:btn:1")
+        key3 = bot.callback_execution_key("same", 1, "v1:im:btn:2")
+
+        self.assertNotEqual(key1, key2)
+        self.assertNotEqual(key1, key3)
+
+
 class MarketSecretBackupTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
