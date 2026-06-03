@@ -449,7 +449,7 @@ def render_market_card(response_text: str, branding: dict[str, Any]) -> bytes:
         draw.text((x, y), display_watermark, font=watermark_font, fill=muted)
 
     out = BytesIO()
-    base.convert("RGB").save(out, format="PNG", compress_level=4)
+    base.convert("RGB").save(out, format="PNG", compress_level=3)
     data = out.getvalue()
     if len(_CARD_CACHE) > 64:
         _CARD_CACHE.clear()
@@ -474,6 +474,21 @@ _SYMBOL_ALIASES = {
 }
 
 
+def _extract_change_pct(plain: str) -> float:
+    code_match = re.search(r"24h\s*:\s*([+-]\s*\d+(?:\.\d+)?)\s*%", plain, re.IGNORECASE)
+    if code_match:
+        return float(code_match.group(1).replace(" ", ""))
+    signed_match = re.search(r"([+-]\s*\d+(?:\.\d+)?)\s*%", plain)
+    if signed_match:
+        return float(signed_match.group(1).replace(" ", ""))
+    direction_match = re.search(r"(افت|ریزش|کاهش|رشد|افزایش|صعود)\s*:?\s*(\d+(?:\.\d+)?)\s*%", plain)
+    if direction_match:
+        value = float(direction_match.group(2))
+        return -value if direction_match.group(1) in {"افت", "ریزش", "کاهش"} else value
+    pct_match = re.search(r"(\d+(?:\.\d+)?)\s*%", plain)
+    return float(pct_match.group(1)) if pct_match else 0.0
+
+
 def _extract_card_facts(response_text: str) -> dict[str, Any]:
     plain = re.sub(r"\n{3,}", "\n\n", _strip_html(response_text)).strip()
     upper = plain.upper()
@@ -482,7 +497,6 @@ def _extract_card_facts(response_text: str) -> dict[str, Any]:
         symbol = next((asset for word, asset in _SYMBOL_ALIASES.items() if word in plain), "USDT")
     usd_match = re.search(r"\$\s*([0-9][0-9,]*(?:\.\d+)?)", plain)
     toman_match = re.search(r"(?:تومان|IRT|تومانی)\s*:?\s*([0-9][0-9,]*(?:\.\d+)?)|([0-9][0-9,]*(?:\.\d+)?)\s*(?:تومان|toman)", plain, re.IGNORECASE)
-    pct_match = re.search(r"([+-]?\d+(?:\.\d+)?)\s*%", plain)
     high_low_match = re.search(r"([0-9][0-9,]*(?:\.\d+)?)\s*/\s*([0-9][0-9,]*(?:\.\d+)?)\s*تومان", plain)
     result_match = re.search(r"🔁\s*([^\n]+)", plain)
     title = next((line.strip() for line in plain.splitlines() if line.strip()), f"قیمت {symbol}")
@@ -491,7 +505,7 @@ def _extract_card_facts(response_text: str) -> dict[str, Any]:
         "title": title.replace("🔺", "").replace("💵", "").strip(),
         "usd": usd_match.group(1) if usd_match else "1",
         "toman": ((toman_match.group(1) or toman_match.group(2)) if toman_match else "-"),
-        "change": float(pct_match.group(1)) if pct_match else 0.0,
+        "change": _extract_change_pct(plain),
         "high_low": high_low_match.groups() if high_low_match else None,
         "result": result_match.group(1).strip() if result_match else "",
     }
@@ -608,9 +622,9 @@ def render_advanced_market_card(response_text: str, branding: dict[str, Any]) ->
         except Exception:
             pass
 
-    panel_w, panel_h = 910, 540
-    panel_x, panel_y = _positioned_box(str(branding.get("price_position") or "center"), (width, height), (panel_w, panel_h), (84, 132))
-    panel_y = max(132, min(panel_y, height - panel_h - 130))
+    panel_w, panel_h = 910, 560
+    panel_x, panel_y = _positioned_box(str(branding.get("price_position") or "center"), (width, height), (panel_w, panel_h), (84, 92))
+    panel_y = max(92, min(panel_y, height - panel_h - 96))
     draw.rounded_rectangle((panel_x + 10, panel_y + 14, panel_x + panel_w + 10, panel_y + panel_h + 14), radius=46, fill=(12, 16, 26, 65))
     draw.rounded_rectangle((panel_x, panel_y, panel_x + panel_w, panel_y + panel_h), radius=46, fill=(255, 255, 255, 244), outline=(255, 255, 255, 180), width=2)
 
@@ -618,16 +632,17 @@ def render_advanced_market_card(response_text: str, branding: dict[str, Any]) ->
     draw.ellipse(dot, fill=accent + (255,))
     draw.text((panel_x + 122, panel_y + 32), facts["symbol"], font=en_bold, fill=(16, 20, 32, text_alpha))
     pair_text = _ellipsize_to_width(draw, f"{facts['symbol']} / USD", en, 220)
-    draw.text((panel_x + panel_w - 240, panel_y + 48), pair_text, font=en, fill=(130, 136, 148, 230))
+    draw.text((panel_x + panel_w - 62, panel_y + 48), pair_text, font=en, fill=(130, 136, 148, 230), anchor="ra")
 
     price_font = _load_font(font_mod, _font_path(english_choice, True), 82)
     price_text = _ellipsize_to_width(draw, f"${facts['usd']}", price_font, panel_w - 124)
     draw.text((panel_x + 62, panel_y + 130), price_text, font=price_font, fill=(8, 12, 24, text_alpha))
     change = facts["change"]
     change_color = (12, 180, 110, 255) if change >= 0 else (226, 64, 75, 255)
-    draw.text((panel_x + 66, panel_y + 230), f"{change:+.2f}%", font=en_bold, fill=change_color)
+    change_text = _ellipsize_to_width(draw, f"{change:+.2f}%", en_bold, panel_w - 124)
+    draw.text((panel_x + 66, panel_y + 220), change_text, font=en_bold, fill=change_color)
 
-    chart_left, chart_top = panel_x + 70, panel_y + 306
+    chart_left, chart_top = panel_x + 70, panel_y + 330
     chart_right, chart_bottom = panel_x + panel_w - 70, panel_y + panel_h - 136
     for i in range(5):
         y = chart_top + i * ((chart_bottom - chart_top) // 4)
@@ -646,7 +661,7 @@ def render_advanced_market_card(response_text: str, branding: dict[str, Any]) ->
         draw.ellipse((point[0] - 5, point[1] - 5, point[0] + 5, point[1] + 5), fill=change_color)
 
     info_w, info_h = panel_w - 120, 74
-    info_x, info_y = panel_x + 60, panel_y + panel_h - 100
+    info_x, info_y = panel_x + 60, panel_y + panel_h - 104
     draw.rounded_rectangle((info_x, info_y, info_x + info_w, info_y + info_h), radius=26, fill=(15, 21, 34, 235))
     _draw_badge(draw, (info_x + 28, info_y + 17), "IRT", en, (255, 255, 255, 255), (39, 150, 92, 255))
     draw.text((info_x + 118, info_y + 21), _ellipsize_to_width(draw, f"{facts['toman']}", en, 275), font=en, fill=(255, 255, 255, text_alpha))
@@ -662,7 +677,7 @@ def render_advanced_market_card(response_text: str, branding: dict[str, Any]) ->
     if facts.get("high_low"):
         high, low = facts["high_low"]
         text = f"High / Low  {high} / {low}"
-        draw.text((panel_x + 62, panel_y + 286), text, font=en_small, fill=(102, 110, 128, 230))
+        draw.text((panel_x + 62, panel_y + 292), _ellipsize_to_width(draw, text, en_small, panel_w - 124), font=en_small, fill=(102, 110, 128, 230))
 
     watermark = str(branding.get("watermark_text") or branding.get("branding_channel_id") or "")[:64]
     if watermark:
@@ -678,5 +693,5 @@ def render_advanced_market_card(response_text: str, branding: dict[str, Any]) ->
         _draw_text(draw, (wm_x + 13, wm_y + 7), watermark, wm_font, (255, 255, 255, min(text_alpha, 230)))
 
     out = BytesIO()
-    base.convert("RGB").save(out, format="PNG", compress_level=4)
+    base.convert("RGB").save(out, format="PNG", compress_level=3)
     return out.getvalue()

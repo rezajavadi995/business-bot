@@ -45,8 +45,9 @@ DEFAULT_QUICK_ASSETS = ["btc", "eth", "trx", "ton", "usdt"]
 DEFAULT_CONVERSION_TARGETS = ["irt", "usd", "ton"]
 CACHE_KEY = "market_cache"
 EXCHANGERATE_COOLDOWN_KEY = "market_provider_state:exchangerate"
-EXCHANGE_REFRESH_SECONDS = 15 * 60
-CRYPTO_REFRESH_SECONDS = 5 * 60
+DEFAULT_PROVIDER_REFRESH_SECONDS = 2 * 60
+EXCHANGE_REFRESH_SECONDS = DEFAULT_PROVIDER_REFRESH_SECONDS
+CRYPTO_REFRESH_SECONDS = DEFAULT_PROVIDER_REFRESH_SECONDS
 EXCHANGE_STALE_SECONDS = 24 * 60 * 60
 CRYPTO_STALE_SECONDS = 6 * 60 * 60
 EXCHANGERATE_429_COOLDOWNS = [5 * 60, 15 * 60, 30 * 60]
@@ -96,8 +97,8 @@ def default_market_settings() -> dict[str, Any]:
         "coingecko_enabled": True,
         "exchangerate_enabled": True,
         "nobitex_enabled": True,
-        "cache_ttl_seconds": int(os.getenv("MARKET_CACHE_TTL_SECONDS", "60") or 60),
-        "stale_ttl_seconds": int(os.getenv("MARKET_STALE_TTL_SECONDS", "86400") or 86400),
+        "cache_ttl_seconds": int(os.getenv("MARKET_CACHE_TTL_SECONDS", "120") or 120),
+        "stale_ttl_seconds": int(os.getenv("MARKET_STALE_TTL_SECONDS", "120") or 120),
         "request_timeout_seconds": float(os.getenv("MARKET_API_TIMEOUT_SECONDS", "8") or 8),
         "stars_unit_amount": 1000.0,
         "stars_unit_usd": 30.0,
@@ -121,8 +122,8 @@ def merge_market_settings(data: dict[str, Any]) -> dict[str, Any]:
     raw["coingecko_enabled"] = bool(raw.get("coingecko_enabled", True))
     raw["exchangerate_enabled"] = bool(raw.get("exchangerate_enabled", True))
     raw["nobitex_enabled"] = bool(raw.get("nobitex_enabled", True))
-    raw["cache_ttl_seconds"] = max(30, min(int(raw.get("cache_ttl_seconds") or 60), 3600))
-    raw["stale_ttl_seconds"] = max(raw["cache_ttl_seconds"], min(int(raw.get("stale_ttl_seconds") or 86400), 24 * 3600))
+    raw["cache_ttl_seconds"] = max(30, min(int(raw.get("cache_ttl_seconds") or 120), 3600))
+    raw["stale_ttl_seconds"] = max(raw["cache_ttl_seconds"], min(int(raw.get("stale_ttl_seconds") or 120), 24 * 3600))
     raw["request_timeout_seconds"] = max(2.0, min(float(raw.get("request_timeout_seconds") or 8), 20.0))
     raw["quick_assets"] = normalize_asset_list(raw.get("quick_assets"), DEFAULT_QUICK_ASSETS)
     raw["default_conversion_targets"] = normalize_asset_list(raw.get("default_conversion_targets"), DEFAULT_CONVERSION_TARGETS)
@@ -293,6 +294,14 @@ def parse_market_intent(text: str) -> MarketIntent | None:
 
 
 
+def provider_refresh_interval(settings: dict[str, Any]) -> int:
+    try:
+        value = int(settings.get("cache_ttl_seconds") or DEFAULT_PROVIDER_REFRESH_SECONDS)
+    except Exception:
+        value = DEFAULT_PROVIDER_REFRESH_SECONDS
+    return max(30, min(value, 3600))
+
+
 class MarketRateService:
     def __init__(self, store: JsonStore | None = None):
         self.store = store
@@ -398,7 +407,7 @@ class MarketRateService:
         await asyncio.sleep(2)
         while not self._stop.is_set():
             settings = settings_getter()
-            interval = CRYPTO_REFRESH_SECONDS
+            interval = provider_refresh_interval(settings)
             if settings.get("_global_active", False) and settings.get("market_engine_enabled", False) and settings.get("market_api_enabled", True):
                 await self.refresh(settings)
             try:
@@ -466,6 +475,7 @@ class MarketRateService:
 
     def _fetch_rates(self, settings: dict[str, Any]) -> dict[str, Any]:
         timeout = float(settings.get("request_timeout_seconds", 8) or 8)
+        provider_refresh_seconds = provider_refresh_interval(settings)
         old_cache = self.read_cache()
         old_rates = old_cache.get("rates_usd") if isinstance(old_cache.get("rates_usd"), dict) else {}
         crypto: dict[str, Any] = {}
@@ -474,11 +484,11 @@ class MarketRateService:
         errors: dict[str, str] = {}
         if settings.get("coingecko_enabled", True):
             crypto_age = self._provider_cache_age(old_cache, "crypto")
-            if cached_rates_for_assets(old_cache, set(CRYPTO_IDS)) and crypto_age is not None and crypto_age < CRYPTO_REFRESH_SECONDS:
-                logging.info("market_cache_hit provider=coingecko age=%s min_refresh=%s", crypto_age, CRYPTO_REFRESH_SECONDS)
+            if cached_rates_for_assets(old_cache, set(CRYPTO_IDS)) and crypto_age is not None and crypto_age < provider_refresh_seconds:
+                logging.info("market_cache_hit provider=coingecko age=%s min_refresh=%s", crypto_age, provider_refresh_seconds)
                 crypto = provider_payload_from_cache(old_cache, set(CRYPTO_IDS), "crypto")
             else:
-                logging.info("market_cache_miss provider=coingecko age=%s min_refresh=%s", crypto_age, CRYPTO_REFRESH_SECONDS)
+                logging.info("market_cache_miss provider=coingecko age=%s min_refresh=%s", crypto_age, provider_refresh_seconds)
                 try:
                     crypto = self._run_provider_singleflight("coingecko", self._fetch_coingecko, settings, timeout)
                     crypto.setdefault("meta", {})["updated_at"] = int(time.time())
@@ -490,8 +500,8 @@ class MarketRateService:
                         crypto = provider_payload_from_cache(old_cache, set(CRYPTO_IDS), "crypto")
         if settings.get("exchangerate_enabled", True):
             fiat_age = self._provider_cache_age(old_cache, "fiat")
-            if cached_rates_for_assets(old_cache, FIAT_ASSETS - {"usd"}) and fiat_age is not None and fiat_age < EXCHANGE_REFRESH_SECONDS:
-                logging.info("market_cache_hit provider=exchangerate age=%s min_refresh=%s", fiat_age, EXCHANGE_REFRESH_SECONDS)
+            if cached_rates_for_assets(old_cache, FIAT_ASSETS - {"usd"}) and fiat_age is not None and fiat_age < provider_refresh_seconds:
+                logging.info("market_cache_hit provider=exchangerate age=%s min_refresh=%s", fiat_age, provider_refresh_seconds)
                 fiat = provider_payload_from_cache(old_cache, FIAT_ASSETS, "fiat")
             elif self._exchangerate_cooldown_active():
                 errors["exchangerate"] = "cooldown"
@@ -499,7 +509,7 @@ class MarketRateService:
                     logging.warning("market_stale_cache_used provider=exchangerate age=%s stale_ttl=%s", cache_age(old_cache), EXCHANGE_STALE_SECONDS)
                     fiat = provider_payload_from_cache(old_cache, FIAT_ASSETS, "fiat")
             else:
-                logging.info("market_cache_miss provider=exchangerate age=%s min_refresh=%s", fiat_age, EXCHANGE_REFRESH_SECONDS)
+                logging.info("market_cache_miss provider=exchangerate age=%s min_refresh=%s", fiat_age, provider_refresh_seconds)
                 try:
                     fiat = self._run_provider_singleflight("exchangerate", self._fetch_exchange_rates, settings, timeout)
                     fiat.setdefault("meta", {})["updated_at"] = int(time.time())
@@ -512,11 +522,11 @@ class MarketRateService:
                         fiat = provider_payload_from_cache(old_cache, FIAT_ASSETS, "fiat")
         if settings.get("nobitex_enabled", True):
             local_age = self._provider_cache_age(old_cache, "local")
-            if cached_rates_for_assets(old_cache, {"irt", "irr", "usdt"}) and local_age is not None and local_age < CRYPTO_REFRESH_SECONDS:
-                logging.info("market_cache_hit provider=nobitex age=%s min_refresh=%s", local_age, CRYPTO_REFRESH_SECONDS)
+            if cached_rates_for_assets(old_cache, {"irt", "irr", "usdt"}) and local_age is not None and local_age < provider_refresh_seconds:
+                logging.info("market_cache_hit provider=nobitex age=%s min_refresh=%s", local_age, provider_refresh_seconds)
                 local = provider_payload_from_cache(old_cache, {"irt", "irr", "usdt", *CRYPTO_IDS.keys()}, "local")
             else:
-                logging.info("market_cache_miss provider=nobitex age=%s min_refresh=%s", local_age, CRYPTO_REFRESH_SECONDS)
+                logging.info("market_cache_miss provider=nobitex age=%s min_refresh=%s", local_age, provider_refresh_seconds)
                 try:
                     local = self._run_provider_singleflight("nobitex", self._fetch_nobitex, settings, timeout)
                     local.setdefault("meta", {})["updated_at"] = int(time.time())

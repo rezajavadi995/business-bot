@@ -13,6 +13,7 @@ from features.market_cards import (
     merge_branding_settings,
     render_market_card,
     shape_rtl_text,
+    _extract_card_facts,
 )
 
 
@@ -46,6 +47,15 @@ class MarketCardBrandingTests(unittest.TestCase):
             image = render_market_card("<b>🔺 قیمت TRX</b>\n💵 دلاری: <b>$0.3456</b>\n🇮🇷 تومانی: <b>59,042</b>\n🟢 رشد: <b>0.20%</b>", branding)
             self.assertGreater(len(image), 1000)
             self.assertTrue(image.startswith(b"\x89PNG"))
+
+
+    def test_advanced_card_extracts_signed_24h_change_over_direction_percent(self):
+        facts = _extract_card_facts("""<b>🔺 قیمت TRX</b>
+📊 تغییرات روزانه
+🔴 افت: <b>2.83%</b>
+<code>24h: -2.83%</code>""")
+        self.assertEqual(facts["symbol"], "TRX")
+        self.assertAlmostEqual(facts["change"], -2.83)
 
     def test_rtl_fallback_changes_persian_display_order(self):
         shaped = shape_rtl_text("قیمت بیت کوین")
