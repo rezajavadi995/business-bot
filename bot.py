@@ -28,8 +28,8 @@ from telegram.error import BadRequest, RetryAfter, TimedOut
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 from features.log_export import build_logs_keyboard, humanize_log_text
 from features.inline_menu import build_inline_menu_admin_kb, paged_rows, CB as IMCB
-from features.inline_actions import ACTION_REGISTRY
-from features.inline_callback import parse as parse_cb, is_valid_im_callback
+from features.inline_actions import get_action_handler
+from features.inline_callback import parse as parse_cb, is_valid_im_callback, normalize_callback_data
 from features.market_engine import MARKET_SERVICE, cache_status, market_help_text, merge_market_settings, normalize_asset_list, parse_market_intent, render_market_response, validate_market_api_key
 from features.market_cards import COLOR_PALETTES, CARD_THEMES, ENGLISH_FONT_CHOICES, PERSIAN_FONT_CHOICES, WATERMARK_POSITIONS, clear_market_card_cache, merge_branding_settings, render_market_card
 
@@ -1461,11 +1461,53 @@ def build_toggle_menu_keyboard(menu_id: int) -> InlineKeyboardMarkup:
 
 
 def is_safe_callback_data(raw: str | None) -> bool:
-    if not raw:
+    normalized = normalize_callback_data(raw)
+    if not normalized:
         return False
-    if len(raw.encode("utf-8")) > 64:
+    if len(normalized.encode("utf-8")) > 64:
         return False
-    return bool(re.fullmatch(r"[A-Za-z0-9_:\-]+", raw))
+    return bool(re.fullmatch(r"[A-Za-z0-9_:\-]+", normalized))
+
+
+def callback_message_button_label(q, callback_data: str) -> str | None:
+    markup = getattr(getattr(q, "message", None), "reply_markup", None)
+    keyboard = getattr(markup, "inline_keyboard", None)
+    if not keyboard:
+        return None
+    for row in keyboard:
+        for button in row:
+            if normalize_callback_data(getattr(button, "callback_data", None)) == callback_data:
+                label = str(getattr(button, "text", "") or "").strip()
+                return re.sub(r"^[✨🚀🧨\s]+", "", label).strip() or None
+    return None
+
+
+def resolve_inline_button_row(button_id: int, q=None):
+    with db.conn() as c:
+        row = c.execute("SELECT id, action_type, action_payload FROM menu_buttons WHERE id=? AND is_active=1", (button_id,)).fetchone()
+    if row:
+        return row, int(row["id"]), "id"
+    label = callback_message_button_label(q, f"im:btn:{button_id}") if q is not None else None
+    if not label:
+        return None, button_id, "missing"
+    with db.conn() as c:
+        matches = c.execute(
+            """
+            SELECT mb.id, mb.action_type, mb.action_payload
+            FROM menu_buttons mb
+            JOIN menus m ON m.id = mb.menu_id
+            WHERE mb.is_active=1 AND m.is_active=1 AND mb.button_text=?
+            ORDER BY mb.updated_at DESC, mb.id DESC
+            """,
+            (label,),
+        ).fetchall()
+    if len(matches) == 1:
+        logging.warning("im_legacy_button_remapped old_button_id=%s new_button_id=%s label=%r", button_id, matches[0]["id"], label)
+        return matches[0], int(matches[0]["id"]), "label"
+    if len(matches) > 1:
+        logging.warning("im_legacy_button_ambiguous old_button_id=%s label=%r matches=%s", button_id, label, len(matches))
+        return None, button_id, "ambiguous"
+    return None, button_id, "missing"
 
 async def maybe_welcome(update: Update, data: dict[str, Any], uid: int, source: str) -> bool:
     if source!="business" or not data.get("welcome_enabled",True): return False
@@ -1491,10 +1533,15 @@ async def panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query
     if not q: return
-    if not is_safe_callback_data(q.data):
-        logging.warning("callback_rejected_invalid data=%r", q.data)
+    raw_callback_data = q.data
+    normalized_callback_data = normalize_callback_data(raw_callback_data)
+    if not is_safe_callback_data(normalized_callback_data):
+        logging.warning("callback_rejected_invalid data=%r normalized=%r", raw_callback_data, normalized_callback_data)
         await safe_callback_answer(q, "Callback نامعتبر است.", show_alert=True)
         return
+    if normalized_callback_data != raw_callback_data:
+        logging.info("callback_legacy_normalized raw=%r normalized=%r", raw_callback_data, normalized_callback_data)
+        q.data = normalized_callback_data
     data=load_data(); uid=q.from_user.id
     bc = getattr(getattr(q, "message", None), "business_connection_id", None)
     admin_allowed = await is_admin_or_business_owner(uid, data, context, bc)
@@ -1512,16 +1559,22 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if inline_button_rate_limited(uid, bid):
                 await block_rate_limited_callback(q, data)
                 return
-        await safe_callback_answer(q)
         if not admin_allowed and (not data.get("active", False) or not data.get("inline_menu_enabled", False)):
+            await safe_callback_answer(q)
             return
-        with db.conn() as c:
-            row=c.execute("SELECT action_type, action_payload FROM menu_buttons WHERE id=? AND is_active=1",(bid,)).fetchone()
-        if not row: return
-        handler = ACTION_REGISTRY.get(row["action_type"])
-        if not handler: return
+        row, resolved_bid, resolution = resolve_inline_button_row(bid, q)
+        if not row:
+            logging.warning("im_button_missing uid=%s button_id=%s resolution=%s data=%r", uid, bid, resolution, q.data)
+            await safe_callback_answer(q, "این دکمه منقضی شده است. لطفاً منو را دوباره باز کنید.", show_alert=True)
+            return
+        handler = get_action_handler(row["action_type"])
+        if not handler:
+            logging.warning("im_action_handler_missing uid=%s button_id=%s action_type=%r", uid, resolved_bid, row["action_type"])
+            await safe_callback_answer(q, "عملیات این دکمه دیگر پشتیبانی نمی‌شود.", show_alert=True)
+            return
+        await safe_callback_answer(q)
         async def send_fn(payload: str):
-            await send_or_replace_button_response(q, context, bid, payload, data)
+            await send_or_replace_button_response(q, context, resolved_bid, payload, data)
         await handler.execute(send_fn, row["action_payload"])
         return
     if q.data and q.data.startswith("im:"):
