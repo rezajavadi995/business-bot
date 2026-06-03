@@ -58,12 +58,6 @@ LEGACY_PREFIX_ALIASES: tuple[tuple[str, str], ...] = (
 
 
 @dataclass(frozen=True)
-class ParsedCallback:
-    ns: str
-    parts: list[str]
-
-
-@dataclass(frozen=True)
 class NormalizedCallback:
     """Callback data after the single pre-dispatch normalization layer.
 
@@ -137,14 +131,6 @@ def callback_execution_key(callback_id: str | None, message_id: object | None, n
         return None
     seed = f"{callback_id}:{message_id or '-'}:{normalized_payload or '-'}"
     return hashlib.sha256(seed.encode("utf-8")).hexdigest()
-
-
-def parse(raw: str | None) -> ParsedCallback | None:
-    value = normalize_callback_data(raw)
-    if not value or ":" not in value:
-        return None
-    parts = value.split(":")
-    return ParsedCallback(ns=parts[0], parts=parts[1:])
 
 
 def is_valid_im_callback(raw: str | None) -> bool:

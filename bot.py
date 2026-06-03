@@ -26,10 +26,10 @@ from telegram import MessageEntity
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, RetryAfter, TimedOut
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
-from features.log_export import build_logs_keyboard, humanize_log_text
+from features.log_export import build_logs_keyboard, humanize_log_text, resolve_log_callback_path
 from features.inline_menu import build_inline_menu_admin_kb, paged_rows, CB as IMCB
 from features.inline_actions import get_action_handler
-from features.inline_callback import callback_execution_key, normalize_for_dispatch, parse as parse_cb, is_valid_im_callback, normalize_callback_data
+from features.inline_callback import callback_execution_key, normalize_for_dispatch, is_valid_im_callback, normalize_callback_data
 from features.market_engine import MARKET_SERVICE, cache_status, market_help_text, merge_market_settings, normalize_asset_list, parse_market_intent, render_market_response, validate_market_api_key, get_market_snapshot
 from features.market_cards import COLOR_PALETTES, CARD_THEMES, ENGLISH_FONT_CHOICES, PERSIAN_FONT_CHOICES, WATERMARK_POSITIONS, clear_market_card_cache, merge_branding_settings, render_market_card
 
@@ -324,8 +324,6 @@ class DB:
             return {"state": r["state"], "payload": json.loads(r["payload"] or "{}")}
     def clear_admin_state(self, admin_id: int):
         with self.conn() as c: c.execute("DELETE FROM admin_states WHERE admin_id=?", (admin_id,))
-    def clear_admin_state_if(self, admin_id: int, state: str):
-        with self.conn() as c: c.execute("DELETE FROM admin_states WHERE admin_id=? AND state=?", (admin_id, state))
     def log_admin(self, admin_id:int, action:str, target_type:str, target_id:int|None, old_value:str|None, new_value:str|None):
         with self.conn() as c:
             c.execute("INSERT INTO admin_logs(admin_id,action,target_type,target_id,old_value,new_value,created_at) VALUES(?,?,?,?,?,?,?)",
@@ -747,6 +745,12 @@ def create_market_root_keyboard(data: dict[str, Any]) -> InlineKeyboardMarkup:
     ])
 
 
+def market_api_key_prompt(provider: str) -> str:
+    if provider == "exchangerate":
+        return "کلید API برای exchangerate را ارسال کنید. برای جلوگیری از 429، اعتبارسنجی این Provider به صورت Cache-first انجام می‌شود و درخواست live جداگانه برای validate ارسال نمی‌شود."
+    return f"کلید API برای {provider} را ارسال کنید. قبل از ذخیره، درخواست واقعی اعتبارسنجی انجام می‌شود."
+
+
 def create_market_api_keyboard(data: dict[str, Any]) -> InlineKeyboardMarkup:
     settings = merge_market_settings(data)
     return InlineKeyboardMarkup([
@@ -1136,19 +1140,6 @@ def is_spam(text: str, shortcuts: dict[str, str]) -> bool:
 def match_shortcut(text: str, shortcuts: dict[str, str]) -> str | None:
     return normalize_shortcut_map(shortcuts).get(normalize_trigger(text))
 
-def hit_limit_and_maybe_ban(uid: int, bucket: str = "global_action", window_sec: int = 60, max_hits: int = 5, ban_sec: int = 5 * 60) -> bool:
-    now = int(time.time())
-    key = f"rate:{bucket}:{uid}"
-    hits = [int(x) for x in db.get_json(key, []) if isinstance(x, int) or str(x).isdigit()]
-    hits = [t for t in hits if now - t < window_sec]
-    hits.append(now)
-    db.set_json(key, hits)
-    if len(hits) > max_hits:
-        db.set_soft_ban(uid, now + ban_sec, spam_delta=1)
-        return True
-    return False
-
-
 def smart_rate_limit(uid: int, bucket: str, action_key: str, window_sec: int, max_total: int, same_window_sec: int, max_same: int, ban_sec: int = 5 * 60) -> bool:
     now = int(time.time())
     key = f"rate2:{bucket}:{uid}"
@@ -1226,11 +1217,6 @@ def inline_button_rate_limited(uid: int, button_id: int) -> bool:
 
 def user_button_rate_limited(uid: int, callback_data: str) -> bool:
     return callback_button_rate_limited(uid, callback_data)
-
-
-def menu_command_rate_limited(uid: int, command: str) -> bool:
-    # Opening inline menus must stay reliable; button callbacks own abuse limits.
-    return False
 
 
 TG_METHOD_ALLOWED_KWARGS: dict[str, set[str]] = {
@@ -1454,13 +1440,6 @@ def format_ts(ts: int | None) -> str:
         return "-"
 
 
-def clip_report_text(value: Any, limit: int = 160) -> str:
-    text = str(value or "").replace("\n", " ").strip()
-    if len(text) > limit:
-        return f"{text[:limit-1]}…"
-    return text or "-"
-
-
 def truncate_preserving_tg_emoji(value: Any, limit: int = 160) -> str:
     text = str(value or "").replace("\n", " ").strip()
     if not text:
@@ -1561,13 +1540,6 @@ def build_users_report(page: int = 0, page_size: int = 8) -> tuple[str, InlineKe
     return header + body, build_report_keyboard(page, total_pages)
 
 
-async def disable_callback_markup(q) -> None:
-    try:
-        await q.edit_message_reply_markup(reply_markup=None)
-    except Exception as exc:
-        logging.warning("callback_markup_disable_failed uid=%s data=%r reason=%s", getattr(getattr(q, "from_user", None), "id", None), getattr(q, "data", None), exc)
-
-
 async def block_banned_callback(q, data: dict[str, Any]) -> None:
     await safe_callback_answer(q, "🚫 شما یک ساعت بن شدید. لطفاً بعد از پایان محدودیت دوباره تلاش کنید.", show_alert=True)
 
@@ -1582,14 +1554,6 @@ async def block_rate_limited_callback(q, data: dict[str, Any], cooldown_seconds:
         await safe_callback_answer(q, "🚫 شما یک ساعت بن شدید.", show_alert=True)
     else:
         await safe_callback_answer(q, f"🚫 شما بن شدید. {persian_digits(minutes)} دقیقه دیگر مجدد تلاش کنید.", show_alert=True)
-
-def invisible_click_marker(marker: int) -> str:
-    return "\u2060" * (1 + (marker % 2))
-
-
-def button_response_text(base_text: str, marker: int, include_marker: bool) -> str:
-    return f"{base_text}{invisible_click_marker(marker)}" if include_marker else base_text
-
 
 async def send_or_replace_button_response(q, context: ContextTypes.DEFAULT_TYPE, button_id: int, payload: str, data: dict[str, Any]):
     if not q.message:
@@ -1659,14 +1623,6 @@ def resolve_inline_button_row(button_id: int):
         return row, int(row["id"]), "id"
     return None, button_id, "missing"
 
-
-async def maybe_welcome(update: Update, data: dict[str, Any], uid: int, source: str) -> bool:
-    if source!="business" or not data.get("welcome_enabled",True): return False
-    row=db.get_user(uid); now=int(time.time())
-    if row is None or int(row["last_seen_at"] or 0)<=0 or now-int(row["last_seen_at"] or 0)>=WELCOME_COOLDOWN_SECONDS:
-        await send_formatted_message(update.message if update.message else update.business_message, data.get("welcome_text","خوش آمدید"), data)
-        return True
-    return False
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_user: return
@@ -2077,10 +2033,9 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_callback_message_text(q, "یک لاگ را انتخاب کنید:", reply_markup=build_logs_keyboard(BASE_DIR))
     elif q.data.startswith("admin:log_file:"):
         name = q.data.split(":", 2)[2]
-        fp = (BASE_DIR / name).resolve()
-        logs_root = (BASE_DIR / "logs").resolve()
-        if logs_root not in fp.parents and fp != logs_root:
-            await safe_edit_callback_message_text(q, "مسیر فایل معتبر نیست.", reply_markup=build_back_kb("admin:logs_menu"))
+        fp = resolve_log_callback_path(BASE_DIR, name)
+        if not fp:
+            await safe_edit_callback_message_text(q, "مسیر فایل معتبر نیست یا فایل لاگ یافت نشد.", reply_markup=build_back_kb("admin:logs_menu"))
             return
         if not fp.exists():
             await safe_edit_callback_message_text(q, "فایل لاگ یافت نشد.", reply_markup=build_back_kb("admin:logs_menu"))
@@ -2128,7 +2083,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         provider = q.data.rsplit(":", 1)[1]
         if provider not in {"coingecko", "exchangerate"}: return
         STATE.flow, STATE.step, STATE.admin_id, STATE.message_id, STATE.pending_key = "market_cfg", "waiting_api_key", uid, q.message.message_id, provider
-        await safe_edit_callback_message_text(q, f"کلید API برای {provider} را ارسال کنید. قبل از ذخیره، درخواست واقعی اعتبارسنجی انجام می‌شود.", reply_markup=build_back_kb("admin:market_api"))
+        await safe_edit_callback_message_text(q, market_api_key_prompt(provider), reply_markup=build_back_kb("admin:market_api"))
     elif q.data.startswith("admin:market_validate:"):
         provider = q.data.rsplit(":", 1)[1]
         key = os.getenv("COINGECKO_API_KEY" if provider=="coingecko" else "EXCHANGERATE_API_KEY", "")

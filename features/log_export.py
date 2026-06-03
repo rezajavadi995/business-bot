@@ -1,8 +1,41 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import Iterable
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+
+
+MAX_CALLBACK_BYTES = 64
+LOG_CALLBACK_PREFIX = "admin:log_file:"
+LOG_TOKEN_PREFIX = "@"
+
+
+def log_callback_payload(base_dir: Path, path: Path) -> str:
+    rel = path.relative_to(base_dir).as_posix()
+    callback_data = f"{LOG_CALLBACK_PREFIX}{rel}"
+    if len(callback_data.encode("utf-8")) <= MAX_CALLBACK_BYTES:
+        return rel
+    digest = hashlib.sha256(rel.encode("utf-8")).hexdigest()[:16]
+    return f"{LOG_TOKEN_PREFIX}{digest}"
+
+
+def resolve_log_callback_path(base_dir: Path, payload: str) -> Path | None:
+    logs_root = (base_dir / "logs").resolve()
+    value = str(payload or "")
+    if value.startswith(LOG_TOKEN_PREFIX):
+        wanted = value[len(LOG_TOKEN_PREFIX):]
+        if not wanted:
+            return None
+        for fp in iter_log_files(base_dir):
+            rel = fp.relative_to(base_dir).as_posix()
+            if hashlib.sha256(rel.encode("utf-8")).hexdigest().startswith(wanted):
+                return fp.resolve()
+        return None
+    fp = (base_dir / value).resolve()
+    if logs_root not in fp.parents and fp != logs_root:
+        return None
+    return fp
 
 
 def build_logs_keyboard(base_dir: Path) -> InlineKeyboardMarkup:
@@ -11,7 +44,8 @@ def build_logs_keyboard(base_dir: Path) -> InlineKeyboardMarkup:
     if logs_dir.exists():
         for fp in iter_log_files(base_dir):
             rel = fp.relative_to(base_dir).as_posix()
-            rows.append([InlineKeyboardButton(f"📄 {rel}", callback_data=f"admin:log_file:{rel}")])
+            payload = log_callback_payload(base_dir, fp)
+            rows.append([InlineKeyboardButton(f"📄 {rel}", callback_data=f"{LOG_CALLBACK_PREFIX}{payload}")])
     if not rows:
         rows.append([InlineKeyboardButton("(لاگی پیدا نشد)", callback_data="noop")])
     rows.append([InlineKeyboardButton("🔴 بازگشت", callback_data="menu:admin")])

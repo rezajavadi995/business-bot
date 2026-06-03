@@ -177,10 +177,6 @@ def normalize_asset(value: str | None) -> str | None:
     return ASSET_ALIASES.get(key)
 
 
-def extract_assets(words: list[str]) -> list[str]:
-    return [asset for asset, _, _ in extract_asset_matches(words)]
-
-
 def extract_asset_matches(words: list[str]) -> list[tuple[str, int, int]]:
     matches: list[tuple[str, int, int]] = []
     idx = 0
@@ -329,10 +325,6 @@ class MarketRateService:
     def write_cache(self, cache: dict[str, Any]) -> None:
         if self.store:
             self.store.set_json(CACHE_KEY, dict(cache))
-
-    def cache_is_fresh(self, settings: dict[str, Any]) -> bool:
-        status = cache_status(self.read_cache(), settings)
-        return bool(status.get("fresh") and status.get("usable"))
 
     def _cache_status_snapshot(self, settings: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
         cache = self.read_cache()
@@ -824,15 +816,6 @@ def provider_payload_from_cache(cache: dict[str, Any], assets: set[str], meta_ke
     return {"rates_usd": selected, "meta": provider_meta}
 
 
-def record_exchangerate_runtime_429() -> None:
-    level = min(int(EXCHANGERATE_RUNTIME_STATE.get("penalty_level") or 0) + 1, len(EXCHANGERATE_429_COOLDOWNS))
-    cooldown_seconds = EXCHANGERATE_429_COOLDOWNS[level - 1]
-    until = int(time.time()) + cooldown_seconds
-    EXCHANGERATE_RUNTIME_STATE.clear()
-    EXCHANGERATE_RUNTIME_STATE.update({"penalty_level": level, "cooldown_until": until, "last_429_at": int(time.time())})
-    logging.warning("market_provider_429 provider=exchangerate penalty_level=%s cooldown_seconds=%s cooldown_until=%s", level, cooldown_seconds, until)
-
-
 def convert_amount(cache: dict[str, Any], amount: float, source: str, target: str, stale_ttl: int) -> ConversionResult | None:
     rates = cache.get("rates_usd") if isinstance(cache, dict) else None
     if not isinstance(rates, dict):
@@ -1159,6 +1142,8 @@ def cache_status(cache: dict[str, Any], settings: dict[str, Any]) -> dict[str, A
         "external_rate_count": external_rate_count,
         "fresh": usable and age <= ttl,
         "usable": usable,
+        "ttl": ttl,
+        "stale_ttl": stale_ttl,
         "last_error": cache.get("last_error") if isinstance(cache, dict) else None,
     }
 

@@ -319,5 +319,16 @@ class MarketEngineAdminSupportTests(unittest.TestCase):
         mock_get.assert_not_called()
 
 
+class MarketEngineCacheStatusTests(unittest.TestCase):
+    def test_cache_status_reports_ttl_values_for_observability(self):
+        settings = merge_market_settings({"market": {"cache_ttl_seconds": 180, "stale_ttl_seconds": 600}})
+        cache = {"updated_at": int(time.time()), "rates_usd": {"usd": 1.0, "trx": 0.12}}
+
+        status = cache_status(cache, settings)
+
+        self.assertEqual(status["ttl"], 180)
+        self.assertEqual(status["stale_ttl"], 600)
+
+
 if __name__ == "__main__":
     unittest.main()
