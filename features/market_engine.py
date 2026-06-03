@@ -1198,3 +1198,21 @@ def market_help_text(is_admin: bool = False) -> str:
 
 
 MARKET_SERVICE = MarketRateService()
+
+
+async def get_market_snapshot(settings: dict[str, Any], *, force: bool = False) -> dict[str, Any]:
+    """Single cache-first entry point for market consumers.
+
+    Request handlers and admin refresh paths use this function instead of calling
+    providers directly, preserving the service-level refresh lock, provider
+    single-flight locks, cooldown gates, and stale-cache fallback behavior.
+    """
+    try:
+        return await MARKET_SERVICE.refresh_if_needed(settings, force=force)
+    except TypeError:
+        if force:
+            raise
+        # Backward-compatible with tests or integrations that monkeypatch the
+        # refresh function before the force keyword existed.
+        return await MARKET_SERVICE.refresh_if_needed(settings)
+
