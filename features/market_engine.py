@@ -5,6 +5,7 @@ import html
 import logging
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -49,7 +50,14 @@ CRYPTO_REFRESH_SECONDS = 5 * 60
 EXCHANGE_STALE_SECONDS = 24 * 60 * 60
 CRYPTO_STALE_SECONDS = 6 * 60 * 60
 EXCHANGERATE_429_COOLDOWNS = [5 * 60, 15 * 60, 30 * 60]
+EXCHANGERATE_MIN_REQUEST_INTERVAL_SECONDS = 60
 EXCHANGERATE_RUNTIME_STATE: dict[str, Any] = {}
+PROVIDER_LOCKS: dict[str, threading.Lock] = {
+    "coingecko": threading.Lock(),
+    "exchangerate": threading.Lock(),
+    "nobitex": threading.Lock(),
+    "fear_greed": threading.Lock(),
+}
 
 
 
@@ -351,13 +359,13 @@ class MarketRateService:
         level = min(int(state.get("penalty_level") or 0) + 1, len(EXCHANGERATE_429_COOLDOWNS))
         cooldown_seconds = EXCHANGERATE_429_COOLDOWNS[level - 1]
         until = int(time.time()) + cooldown_seconds
-        self._write_exchangerate_state({"penalty_level": level, "cooldown_until": until, "last_429_at": int(time.time())})
+        self._write_exchangerate_state({**state, "penalty_level": level, "cooldown_until": until, "last_429_at": int(time.time())})
         logging.warning("market_provider_429 provider=exchangerate penalty_level=%s cooldown_seconds=%s cooldown_until=%s", level, cooldown_seconds, until)
 
     def _reset_exchangerate_penalty(self) -> None:
         state = self._read_exchangerate_state()
         if int(state.get("penalty_level") or 0) or int(state.get("cooldown_until") or 0):
-            self._write_exchangerate_state({"penalty_level": 0, "cooldown_until": 0, "last_success_at": int(time.time())})
+            self._write_exchangerate_state({**state, "penalty_level": 0, "cooldown_until": 0, "last_success_at": int(time.time())})
 
     async def refresh_if_needed(self, settings: dict[str, Any], *, force: bool = False) -> dict[str, Any]:
         if not settings.get("market_api_enabled", True):
@@ -426,6 +434,36 @@ class MarketRateService:
             updated_at = int(cache.get("updated_at") or 0) if isinstance(cache, dict) else 0
         return max(0, int(time.time()) - updated_at) if updated_at else None
 
+    def _provider_lock(self, provider: str) -> threading.Lock:
+        lock = PROVIDER_LOCKS.get(provider)
+        if lock is None:
+            lock = threading.Lock()
+            PROVIDER_LOCKS[provider] = lock
+        return lock
+
+    def _run_provider_singleflight(self, provider: str, fn, *args, **kwargs):
+        lock = self._provider_lock(provider)
+        acquired = lock.acquire(blocking=False)
+        if not acquired:
+            logging.warning("market_provider_concurrent_skip provider=%s", provider)
+            raise RuntimeError(f"{provider} provider request already in progress")
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            lock.release()
+
+    def provider_locks_busy(self) -> bool:
+        return any(lock.locked() for lock in PROVIDER_LOCKS.values())
+
+    async def wait_until_quiescent(self, timeout: float) -> bool:
+        deadline = time.monotonic() + max(float(timeout or 0), 0.0)
+        while self.provider_locks_busy() or self._refresh_lock.locked():
+            if time.monotonic() >= deadline:
+                logging.warning("market_quiesce_timeout provider_locks_busy=%s refresh_locked=%s", self.provider_locks_busy(), self._refresh_lock.locked())
+                return False
+            await asyncio.sleep(0.05)
+        return True
+
     def _fetch_rates(self, settings: dict[str, Any]) -> dict[str, Any]:
         timeout = float(settings.get("request_timeout_seconds", 8) or 8)
         old_cache = self.read_cache()
@@ -442,7 +480,7 @@ class MarketRateService:
             else:
                 logging.info("market_cache_miss provider=coingecko age=%s min_refresh=%s", crypto_age, CRYPTO_REFRESH_SECONDS)
                 try:
-                    crypto = self._fetch_coingecko(settings, timeout)
+                    crypto = self._run_provider_singleflight("coingecko", self._fetch_coingecko, settings, timeout)
                     crypto.setdefault("meta", {})["updated_at"] = int(time.time())
                 except Exception as exc:
                     errors["coingecko"] = safe_error(exc)
@@ -463,7 +501,7 @@ class MarketRateService:
             else:
                 logging.info("market_cache_miss provider=exchangerate age=%s min_refresh=%s", fiat_age, EXCHANGE_REFRESH_SECONDS)
                 try:
-                    fiat = self._fetch_exchange_rates(settings, timeout)
+                    fiat = self._run_provider_singleflight("exchangerate", self._fetch_exchange_rates, settings, timeout)
                     fiat.setdefault("meta", {})["updated_at"] = int(time.time())
                     self._reset_exchangerate_penalty()
                 except Exception as exc:
@@ -480,7 +518,7 @@ class MarketRateService:
             else:
                 logging.info("market_cache_miss provider=nobitex age=%s min_refresh=%s", local_age, CRYPTO_REFRESH_SECONDS)
                 try:
-                    local = self._fetch_nobitex(settings, timeout)
+                    local = self._run_provider_singleflight("nobitex", self._fetch_nobitex, settings, timeout)
                     local.setdefault("meta", {})["updated_at"] = int(time.time())
                 except Exception as exc:
                     errors["nobitex"] = safe_error(exc)
@@ -489,7 +527,12 @@ class MarketRateService:
                         logging.warning("market_stale_cache_used provider=nobitex age=%s stale_ttl=%s", cache_age(old_cache), CRYPTO_STALE_SECONDS)
                         local = provider_payload_from_cache(old_cache, {"irt", "irr", "usdt", *CRYPTO_IDS.keys()}, "local")
         rates_usd: dict[str, float] = {"usd": 1.0}
-        sentiment = self._fetch_fear_greed(timeout)
+        try:
+            sentiment = self._run_provider_singleflight("fear_greed", self._fetch_fear_greed, timeout)
+        except Exception as exc:
+            errors["fear_greed"] = safe_error(exc)
+            logging.warning("market_provider_failed provider=fear_greed reason=%s", errors["fear_greed"])
+            sentiment = {}
         if not sentiment and isinstance(old_cache.get("meta"), dict):
             old_sentiment = old_cache.get("meta", {}).get("fear_greed", {})
             if isinstance(old_sentiment, dict) and cache_age_within(old_cache, CRYPTO_STALE_SECONDS):
@@ -619,6 +662,17 @@ class MarketRateService:
             return {"error": safe_error(exc)}
 
     def _fetch_exchange_rates(self, settings: dict[str, Any], timeout: float) -> dict[str, Any]:
+        if self._exchangerate_cooldown_active():
+            raise RuntimeError("ExchangeRate provider is in cooldown")
+        state = self._read_exchangerate_state()
+        now = int(time.time())
+        last_request_at = int(state.get("last_request_at") or 0)
+        if last_request_at and now - last_request_at < EXCHANGERATE_MIN_REQUEST_INTERVAL_SECONDS:
+            remaining = EXCHANGERATE_MIN_REQUEST_INTERVAL_SECONDS - (now - last_request_at)
+            logging.warning("market_provider_rate_limit_skip provider=exchangerate remaining=%s", remaining)
+            raise RuntimeError(f"ExchangeRate provider rate-limited locally for {remaining}s")
+        state = {**state, "last_request_at": now}
+        self._write_exchangerate_state(state)
         key = os.getenv("EXCHANGERATE_API_KEY", "").strip()
         if key:
             url = f"https://v6.exchangerate-api.com/v6/{key}/latest/USD"
@@ -1056,22 +1110,25 @@ def validate_market_api_key(provider: str, api_key: str, timeout: float = 8.0) -
             if not isinstance(price, (int, float)) or price <= 0:
                 return {"ok": False, "provider": provider, "message": "CoinGecko response did not include BTC/USD price."}
             return {"ok": True, "provider": provider, "message": f"CoinGecko validation OK. BTC/USD={price}", "sample": price}
-        logging.info("market_provider_request provider=exchangerate endpoint=validate_pair")
-        response = requests.get(f"https://v6.exchangerate-api.com/v6/{key}/pair/USD/EUR", timeout=timeout)
-        if response.status_code == 429:
-            record_exchangerate_runtime_429()
-        if response.status_code in {401, 403, 404, 429}:
-            logging.warning("market_provider_failed provider=exchangerate reason=status_%s endpoint=validate_pair", response.status_code)
-            return {"ok": False, "provider": provider, "message": f"ExchangeRate rejected the key/status: {response.status_code}"}
-        response.raise_for_status()
-        logging.info("market_provider_success provider=exchangerate status=%s endpoint=validate_pair", response.status_code)
-        body = response.json()
-        if body.get("result") != "success":
-            return {"ok": False, "provider": provider, "message": str(body.get("error-type") or body.get("result") or "ExchangeRate validation failed")}
-        rate = body.get("conversion_rate")
-        if not isinstance(rate, (int, float)) or rate <= 0:
-            return {"ok": False, "provider": provider, "message": "ExchangeRate response did not include USD/EUR rate."}
-        return {"ok": True, "provider": provider, "message": f"ExchangeRate validation OK. USD/EUR={rate}", "sample": rate}
+        cache = MARKET_SERVICE.read_cache()
+        rates = cache.get("rates_usd") if isinstance(cache, dict) else None
+        eur = rates.get("eur") if isinstance(rates, dict) else None
+        status = cache_status(cache, default_market_settings())
+        if isinstance(eur, (int, float)) and eur > 0 and status.get("usable"):
+            usd_eur = 1.0 / float(eur)
+            return {
+                "ok": True,
+                "provider": provider,
+                "message": f"ExchangeRate key format accepted. Cache-first validation used cached USD/EUR={usd_eur:.6g}; no live validation request was sent.",
+                "sample": usd_eur,
+                "cache_only": True,
+            }
+        return {
+            "ok": False,
+            "provider": provider,
+            "message": "ExchangeRate live validate_pair is disabled to avoid 429s, and no usable cached USD/EUR rate is available yet. The background market refresh must validate this provider before it is reported healthy.",
+            "cache_only": True,
+        }
     except Exception as exc:
         return {"ok": False, "provider": provider, "message": safe_error(exc)}
 

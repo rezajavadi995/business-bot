@@ -15,6 +15,7 @@ from features.market_engine import (
     CACHE_KEY,
     EXCHANGERATE_COOLDOWN_KEY,
     EXCHANGERATE_RUNTIME_STATE,
+    PROVIDER_LOCKS,
 )
 
 
@@ -284,19 +285,24 @@ class MarketEngineAdminSupportTests(unittest.TestCase):
         self.assertAlmostEqual(payload["rates_usd"]["trx"], 59042 / 170820)
         self.assertEqual(payload["meta"]["24h_change"]["trx"], 0.2)
 
-    @patch("features.market_engine.requests.get")
-    def test_validate_exchangerate_key_uses_real_validation_endpoint_shape(self, mock_get):
-        response = Mock()
-        response.status_code = 200
-        response.json.return_value = {"result": "success", "conversion_rate": 0.92}
-        response.raise_for_status.return_value = None
-        mock_get.return_value = response
+    def test_provider_singleflight_rejects_duplicate_provider_fetch(self):
+        service = MarketRateService()
+        lock = PROVIDER_LOCKS["exchangerate"]
+        self.assertTrue(lock.acquire(blocking=False))
+        try:
+            with self.assertRaisesRegex(RuntimeError, "already in progress"):
+                service._run_provider_singleflight("exchangerate", lambda: "called")
+        finally:
+            lock.release()
 
+    @patch("features.market_engine.requests.get")
+    def test_validate_exchangerate_key_is_cache_only_and_never_calls_pair_endpoint(self, mock_get):
         result = validate_market_api_key("exchangerate", "abc123", timeout=3)
 
-        self.assertTrue(result["ok"])
-        self.assertIn("USD/EUR", result["message"])
-        self.assertIn("/abc123/pair/USD/EUR", mock_get.call_args.args[0])
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["cache_only"])
+        self.assertIn("no usable cached USD/EUR rate", result["message"])
+        mock_get.assert_not_called()
 
 
 if __name__ == "__main__":
