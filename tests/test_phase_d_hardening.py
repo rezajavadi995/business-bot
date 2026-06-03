@@ -248,6 +248,30 @@ class PhaseDCallbackRuntimeTests(unittest.IsolatedAsyncioTestCase):
         row = bot.db.get_user(101)
         self.assertEqual(int(row["spam_score"] or 0), 1)
 
+
+    async def test_legacy_inline_button_callback_prefix_still_routes(self):
+        bot.db.upsert_user(101, "", "Customer", None, False, "test", "")
+        context = CallbackContext()
+        q = DummyCallbackQuery(101, f"im_btn:{self.button_id}")
+
+        await bot.callbacks(SimpleNamespace(callback_query=q), context)
+
+        self.assertEqual(q.data, f"im:btn:{self.button_id}")
+        self.assertEqual(q.answers[-1], (None, False))
+        self.assertEqual(context.bot.sent[0]["text"], "<b>payload</b>")
+
+    async def test_legacy_inline_action_type_alias_still_routes(self):
+        with bot.db.conn() as c:
+            c.execute("UPDATE menu_buttons SET action_type='send_text' WHERE id=?", (self.button_id,))
+        bot.db.upsert_user(101, "", "Customer", None, False, "test", "")
+        context = CallbackContext()
+        q = DummyCallbackQuery(101, f"im:btn:{self.button_id}")
+
+        await bot.callbacks(SimpleNamespace(callback_query=q), context)
+
+        self.assertEqual(q.answers[-1], (None, False))
+        self.assertEqual(context.bot.sent[0]["text"], "<b>payload</b>")
+
     async def test_callback_retry_after_does_not_send_fallback_or_crash(self):
         bot.db.upsert_user(101, "", "Customer", None, False, "test", "")
         context = CallbackContext()
