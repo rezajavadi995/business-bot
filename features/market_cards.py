@@ -340,6 +340,16 @@ def _ellipsize_to_width(draw, text: str, font, max_width: int) -> str:
     return (raw + suffix) if raw else suffix
 
 
+def _fit_font_to_width(draw, font_mod, path: str, text: str, max_width: int, start_size: int, min_size: int):
+    size = start_size
+    while size > min_size:
+        font = _load_font(font_mod, path, size)
+        if _text_width(draw, text, font) <= max_width:
+            return font
+        size -= 2
+    return _load_font(font_mod, path, min_size)
+
+
 def _watermark_xy(position: str, width: int, height: int, tw: int, th: int, margin_x: int = 105, margin_y: int = 105) -> tuple[int, int]:
     y_map = {"top": margin_y, "center": (height - th) // 2, "bottom": height - th - 145}
     x_map = {"left": margin_x, "center": (width - tw) // 2, "right": width - tw - margin_x}
@@ -376,16 +386,18 @@ def render_market_card(response_text: str, branding: dict[str, Any]) -> bytes:
     primary = _hex_to_rgb(branding.get("card_primary_color"), _hex_to_rgb(theme["primary"], (35, 54, 255)))
     secondary = _hex_to_rgb(branding.get("card_secondary_color"), _hex_to_rgb(theme["secondary"], (138, 43, 226)))
     dark = bool(branding.get("card_dark_mode", theme.get("dark", True)))
-    base = image_mod.new("RGB", (width, height), (8, 11, 25) if dark else (245, 247, 255))
+    small_w, small_h = max(180, width // 6), max(180, height // 6)
+    base = image_mod.new("RGB", (small_w, small_h), (8, 11, 25) if dark else (245, 247, 255))
     px = base.load()
-    for y in range(height):
-        ratio = y / max(height - 1, 1)
+    for y in range(small_h):
+        ratio = y / max(small_h - 1, 1)
         r = int(primary[0] * (1 - ratio) + secondary[0] * ratio)
         g = int(primary[1] * (1 - ratio) + secondary[1] * ratio)
         b = int(primary[2] * (1 - ratio) + secondary[2] * ratio)
-        for x in range(width):
-            vignette = 1 - (abs(x - width / 2) / width) * 0.35
+        for x in range(small_w):
+            vignette = 1 - (abs(x - small_w / 2) / small_w) * 0.35
             px[x, y] = (int(r * vignette), int(g * vignette), int(b * vignette))
+    base = base.resize((width, height), _resample_filter(image_mod))
 
     overlay = image_mod.new("RGBA", (width, height), (0, 0, 0, 0))
     draw = draw_mod.Draw(overlay)
@@ -481,7 +493,7 @@ def _extract_change_pct(plain: str) -> float:
     signed_match = re.search(r"([+-]\s*\d+(?:\.\d+)?)\s*%", plain)
     if signed_match:
         return float(signed_match.group(1).replace(" ", ""))
-    direction_match = re.search(r"(افت|ریزش|کاهش|رشد|افزایش|صعود)\s*:?\s*(\d+(?:\.\d+)?)\s*%", plain)
+    direction_match = re.search(r"(افت|ریزش|کاهش|رشد|افزایش|صعود)[^\d%\n]{0,32}(\d+(?:\.\d+)?)\s*%", plain)
     if direction_match:
         value = float(direction_match.group(2))
         return -value if direction_match.group(1) in {"افت", "ریزش", "کاهش"} else value
@@ -561,19 +573,24 @@ def _positioned_box(position: str, canvas: tuple[int, int], size: tuple[int, int
     return x_map.get(horizontal, x_map["center"]), y_map.get(vertical, y_map["center"])
 
 
+def _resample_filter(image_mod):
+    return getattr(getattr(image_mod, "Resampling", image_mod), "LANCZOS", getattr(image_mod, "LANCZOS", 1))
+
+
 def _advanced_background(image_mod, width: int, height: int, primary: tuple[int, int, int], secondary: tuple[int, int, int]):
-    base = image_mod.new("RGB", (width, height), primary)
+    small_w, small_h = max(180, width // 5), max(150, height // 5)
+    base = image_mod.new("RGB", (small_w, small_h), primary)
     px = base.load()
-    for x in range(width):
-        ratio = x / max(width - 1, 1)
+    for x in range(small_w):
+        ratio = x / max(small_w - 1, 1)
         r = int(primary[0] * (1 - ratio) + secondary[0] * ratio)
         g = int(primary[1] * (1 - ratio) + secondary[1] * ratio)
         b = int(primary[2] * (1 - ratio) + secondary[2] * ratio)
-        for y in range(height):
-            center = 1 - min(0.28, (((x - width / 2) ** 2 + (y - height / 2) ** 2) ** 0.5 / width) * 0.22)
-            soft = 0.92 + 0.08 * math.sin((x + y) / 210)
+        for y in range(small_h):
+            center = 1 - min(0.28, (((x - small_w / 2) ** 2 + (y - small_h / 2) ** 2) ** 0.5 / small_w) * 0.22)
+            soft = 0.92 + 0.08 * math.sin((x + y) / 42)
             px[x, y] = (int(r * center * soft), int(g * center * soft), int(b * center * soft))
-    return base.convert("RGBA")
+    return base.resize((width, height), _resample_filter(image_mod)).convert("RGBA")
 
 
 def render_advanced_market_card(response_text: str, branding: dict[str, Any]) -> bytes:
@@ -660,13 +677,22 @@ def render_advanced_market_card(response_text: str, branding: dict[str, Any]) ->
     for point in points[::8]:
         draw.ellipse((point[0] - 5, point[1] - 5, point[0] + 5, point[1] + 5), fill=change_color)
 
-    info_w, info_h = panel_w - 120, 74
-    info_x, info_y = panel_x + 60, panel_y + panel_h - 104
+    info_w, info_h = panel_w - 120, 78
+    info_x, info_y = panel_x + 60, panel_y + panel_h - 106
     draw.rounded_rectangle((info_x, info_y, info_x + info_w, info_y + info_h), radius=26, fill=(15, 21, 34, 235))
-    _draw_badge(draw, (info_x + 28, info_y + 17), "IRT", en, (255, 255, 255, 255), (39, 150, 92, 255))
-    draw.text((info_x + 118, info_y + 21), _ellipsize_to_width(draw, f"{facts['toman']}", en, 275), font=en, fill=(255, 255, 255, text_alpha))
-    _draw_badge(draw, (info_x + 430, info_y + 17), "USD", en, (255, 255, 255, 255), (74, 105, 164, 255))
-    draw.text((info_x + 530, info_y + 21), _ellipsize_to_width(draw, f"${facts['usd']}", en, info_x + info_w - (info_x + 530) - 24), font=en, fill=(255, 255, 255, text_alpha))
+    irt_badge = _draw_badge(draw, (info_x + 28, info_y + 18), "IRT", en, (255, 255, 255, 255), (39, 150, 92, 255))
+    usd_badge = _draw_badge(draw, (info_x + 460, info_y + 18), "USD", en, (255, 255, 255, 255), (74, 105, 164, 255))
+    irt_x = irt_badge[2] + 28
+    usd_x = usd_badge[2] + 28
+    irt_max_w = max(120, usd_badge[0] - irt_x - 28)
+    usd_max_w = max(120, info_x + info_w - usd_x - 24)
+    number_path = _font_path(english_choice, False)
+    irt_text = str(facts["toman"])
+    usd_text = f"${facts['usd']}"
+    irt_font = _fit_font_to_width(draw, font_mod, number_path, irt_text, irt_max_w, 32, 22)
+    usd_font = _fit_font_to_width(draw, font_mod, number_path, usd_text, usd_max_w, 32, 22)
+    draw.text((irt_x, info_y + 22), _ellipsize_to_width(draw, irt_text, irt_font, irt_max_w), font=irt_font, fill=(255, 255, 255, text_alpha))
+    draw.text((usd_x, info_y + 22), _ellipsize_to_width(draw, usd_text, usd_font, usd_max_w), font=usd_font, fill=(255, 255, 255, text_alpha))
 
     if facts.get("result") and not re.search(r"(?:تومان|toman|IRT)", str(facts.get("result")), re.IGNORECASE):
         rb_w, rb_h = 520, 58

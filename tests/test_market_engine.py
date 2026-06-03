@@ -109,6 +109,12 @@ class MarketEngineRenderTests(unittest.TestCase):
         self.assertEqual(settings["stale_ttl_seconds"], 120)
         self.assertEqual(provider_refresh_interval(settings), 120)
 
+    def test_existing_short_market_cache_ttl_is_clamped_to_two_minutes(self):
+        settings = merge_market_settings({"market": {"cache_ttl_seconds": 60, "stale_ttl_seconds": 60}})
+        self.assertEqual(settings["cache_ttl_seconds"], 120)
+        self.assertEqual(settings["stale_ttl_seconds"], 120)
+        self.assertEqual(provider_refresh_interval(settings), 120)
+
     def test_conversion_uses_cache_only(self):
         text = render_market_response("100 usd trx", self.settings, self.cache)
         self.assertIn("833.333 TRX", text)

@@ -57,6 +57,14 @@ class MarketCardBrandingTests(unittest.TestCase):
         self.assertEqual(facts["symbol"], "TRX")
         self.assertAlmostEqual(facts["change"], -2.83)
 
+
+    def test_advanced_card_extracts_negative_direction_from_conversion_line(self):
+        facts = _extract_card_facts("""<b>🔺 تبدیل 12 TRX</b>
+<blockquote>🔁 <b>690,000 تومان</b></blockquote>
+📊 🔴 افت روزانه: <b>2.83%</b>
+💵 دلار: <b>$4.004</b>""")
+        self.assertAlmostEqual(facts["change"], -2.83)
+
     def test_rtl_fallback_changes_persian_display_order(self):
         shaped = shape_rtl_text("قیمت بیت کوین")
         self.assertNotEqual(shaped, "قیمت بیت کوین")

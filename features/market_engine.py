@@ -122,7 +122,7 @@ def merge_market_settings(data: dict[str, Any]) -> dict[str, Any]:
     raw["coingecko_enabled"] = bool(raw.get("coingecko_enabled", True))
     raw["exchangerate_enabled"] = bool(raw.get("exchangerate_enabled", True))
     raw["nobitex_enabled"] = bool(raw.get("nobitex_enabled", True))
-    raw["cache_ttl_seconds"] = max(30, min(int(raw.get("cache_ttl_seconds") or 120), 3600))
+    raw["cache_ttl_seconds"] = max(DEFAULT_PROVIDER_REFRESH_SECONDS, min(int(raw.get("cache_ttl_seconds") or 120), 3600))
     raw["stale_ttl_seconds"] = max(raw["cache_ttl_seconds"], min(int(raw.get("stale_ttl_seconds") or 120), 24 * 3600))
     raw["request_timeout_seconds"] = max(2.0, min(float(raw.get("request_timeout_seconds") or 8), 20.0))
     raw["quick_assets"] = normalize_asset_list(raw.get("quick_assets"), DEFAULT_QUICK_ASSETS)
@@ -299,7 +299,7 @@ def provider_refresh_interval(settings: dict[str, Any]) -> int:
         value = int(settings.get("cache_ttl_seconds") or DEFAULT_PROVIDER_REFRESH_SECONDS)
     except Exception:
         value = DEFAULT_PROVIDER_REFRESH_SECONDS
-    return max(30, min(value, 3600))
+    return max(DEFAULT_PROVIDER_REFRESH_SECONDS, min(value, 3600))
 
 
 class MarketRateService:

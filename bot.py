@@ -2886,7 +2886,8 @@ async def _all_messages_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
             if result.get("ok"):
                 set_env_value(env_key, api_key)
                 STATE.flow = STATE.step = STATE.pending_key = None
-                await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text="✅ کلید معتبر بود و در .env ذخیره شد.\n" + result.get("message", ""), reply_markup=create_market_api_keyboard(data)); return
+                success_text = "✅ کلید در .env ذخیره شد. اعتبارسنجی ExchangeRate به صورت Cache-first انجام شد و درخواست زنده ارسال نشد.\n" if result.get("cache_only") else "✅ کلید معتبر بود و در .env ذخیره شد.\n"
+                await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text=success_text + result.get("message", ""), reply_markup=create_market_api_keyboard(data)); return
             await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text="❌ کلید ذخیره نشد؛ اعتبارسنجی واقعی ناموفق بود.\n" + result.get("message", ""), reply_markup=build_back_kb("admin:market_api")); return
         if STATE.step=="waiting_number":
             field = STATE.pending_key or ""
@@ -2896,8 +2897,8 @@ async def _all_messages_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text="عدد نامعتبر است. دوباره مقدار عددی ارسال کنید.", reply_markup=build_back_kb("admin:market_root")); return
             if field in {"cache_ttl_seconds", "stale_ttl_seconds"}:
                 value = int(value)
-            if field == "cache_ttl_seconds" and not 30 <= int(value) <= 3600:
-                await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text="TTL باید بین 30 و 3600 ثانیه باشد.", reply_markup=build_back_kb("admin:market_cache")); return
+            if field == "cache_ttl_seconds" and not 120 <= int(value) <= 3600:
+                await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text="TTL باید بین 120 و 3600 ثانیه باشد.", reply_markup=build_back_kb("admin:market_cache")); return
             if field == "stale_ttl_seconds" and not 30 <= int(value) <= 86400:
                 await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text="Stale fallback باید بین 30 و 86400 ثانیه باشد.", reply_markup=build_back_kb("admin:market_cache")); return
             if field in {"stars_unit_amount", "stars_unit_usd", "stars_manual_override_usd"} and value < 0:
