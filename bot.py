@@ -401,6 +401,11 @@ DB_IMPORT_CONDITION: asyncio.Condition | None = None
 DB_IMPORT_DRAIN_TIMEOUT_SECONDS = 15
 BACKGROUND_TASK_SHUTDOWN_TIMEOUT_SECONDS = 20
 MARKET_REFRESH_TASK: asyncio.Task | None = None
+CALLBACK_EXECUTION_TTL_SECONDS = 10 * 60
+CALLBACK_EXECUTION_LOCK = asyncio.Lock()
+CALLBACK_EXECUTION_IDS: dict[str, int] = {}
+EDIT_MESSAGE_LOCKS: dict[str, asyncio.Lock] = {}
+
 
 def setup_logging() -> None:
     LOG_DIR.mkdir(exist_ok=True)
@@ -897,7 +902,7 @@ async def render_admin_panel(update, context, data, *, edit=False, query=None) -
         if not q:
             return False
         try:
-            await q.edit_message_text(text, reply_markup=reply_markup)
+            await safe_edit_callback_message_text(q, text, reply_markup=reply_markup)
         except BadRequest as exc:
             if "message is not modified" in str(exc).lower():
                 return True
@@ -1243,6 +1248,114 @@ async def safe_callback_answer(q, text: str | None = None, show_alert: bool = Fa
         return False
 
 
+def _prune_callback_execution_ids(now: int) -> None:
+    expired = [key for key, ts in CALLBACK_EXECUTION_IDS.items() if now - int(ts or 0) > CALLBACK_EXECUTION_TTL_SECONDS]
+    for key in expired:
+        CALLBACK_EXECUTION_IDS.pop(key, None)
+
+
+async def claim_callback_execution(callback_id: str | None) -> bool:
+    if not callback_id:
+        return True
+    now = int(time.time())
+    async with CALLBACK_EXECUTION_LOCK:
+        _prune_callback_execution_ids(now)
+        if callback_id in CALLBACK_EXECUTION_IDS:
+            return False
+        CALLBACK_EXECUTION_IDS[callback_id] = now
+        return True
+
+
+def stable_payload_hash(payload: Any) -> str:
+    def normalize(value: Any) -> Any:
+        if hasattr(value, "to_dict"):
+            try:
+                return value.to_dict()
+            except Exception:
+                return repr(value)
+        if isinstance(value, dict):
+            return {str(k): normalize(v) for k, v in sorted(value.items(), key=lambda item: str(item[0]))}
+        if isinstance(value, (list, tuple)):
+            return [normalize(v) for v in value]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return repr(value)
+    encoded = json.dumps(normalize(payload), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def edit_state_key(chat_id: Any, message_id: Any, business_connection_id: str | None = None) -> str:
+    bc = business_connection_id or "-"
+    return f"edit_state:{bc}:{chat_id}:{message_id}"
+
+
+def edit_lock_key(chat_id: Any, message_id: Any, business_connection_id: str | None = None) -> str:
+    return edit_state_key(chat_id, message_id, business_connection_id)
+
+
+def edit_message_lock(chat_id: Any, message_id: Any, business_connection_id: str | None = None) -> asyncio.Lock:
+    key = edit_lock_key(chat_id, message_id, business_connection_id)
+    lock = EDIT_MESSAGE_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        EDIT_MESSAGE_LOCKS[key] = lock
+    return lock
+
+
+def edit_payload_hash(args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
+    return stable_payload_hash({"args": list(args), "kwargs": kwargs})
+
+
+async def safe_edit_callback_message_text(q, *args, **kwargs) -> bool:
+    message = getattr(q, "message", None)
+    chat = getattr(message, "chat", None)
+    chat_id = getattr(chat, "id", None)
+    message_id = getattr(message, "message_id", None)
+    bc = getattr(message, "business_connection_id", None)
+    if chat_id is None or message_id is None:
+        try:
+            await q.edit_message_text(*args, **kwargs)
+            return True
+        except BadRequest as exc:
+            if "message is not modified" in str(exc).lower():
+                return True
+            raise
+    state_key = edit_state_key(chat_id, message_id, bc)
+    desired_hash = edit_payload_hash(args, kwargs)
+    async with edit_message_lock(chat_id, message_id, bc):
+        previous = db.get_json(state_key, {})
+        if isinstance(previous, dict) and previous.get("hash") == desired_hash:
+            logging.info("edit_message_idempotent_skip chat_id=%s message_id=%s", chat_id, message_id)
+            return True
+        try:
+            await q.edit_message_text(*args, **kwargs)
+        except BadRequest as exc:
+            if "message is not modified" not in str(exc).lower():
+                raise
+        db.set_json(state_key, {"hash": desired_hash, "updated_at": int(time.time())})
+        return True
+
+
+async def safe_bot_edit_message_text(bot_obj, *, chat_id, message_id, business_connection_id: str | None = None, **kwargs) -> bool:
+    state_key = edit_state_key(chat_id, message_id, business_connection_id)
+    edit_kwargs = dict(kwargs)
+    if business_connection_id:
+        edit_kwargs["business_connection_id"] = business_connection_id
+    desired_hash = edit_payload_hash((), {"chat_id": chat_id, "message_id": message_id, **edit_kwargs})
+    async with edit_message_lock(chat_id, message_id, business_connection_id):
+        previous = db.get_json(state_key, {})
+        if isinstance(previous, dict) and previous.get("hash") == desired_hash:
+            logging.info("bot_edit_message_idempotent_skip chat_id=%s message_id=%s", chat_id, message_id)
+            return True
+        try:
+            await bot_obj.edit_message_text(chat_id=chat_id, message_id=message_id, **edit_kwargs)
+        except BadRequest as exc:
+            if "message is not modified" not in str(exc).lower():
+                raise
+        db.set_json(state_key, {"hash": desired_hash, "updated_at": int(time.time())})
+        return True
+
+
 def format_ts(ts: int | None) -> str:
     if not ts:
         return "-"
@@ -1401,18 +1514,13 @@ async def send_or_replace_button_response(q, context: ContextTypes.DEFAULT_TYPE,
         base_kwargs["business_connection_id"] = bc
     previous = db.get_json(storage_key, {})
     prev_msg_id = int(previous.get("message_id") or 0) if isinstance(previous, dict) else 0
-    prev_marker = int(previous.get("marker") or 0) if isinstance(previous, dict) else 0
-    next_marker = (prev_marker + 1) % 2
     if prev_msg_id:
         try:
-            await context.bot.edit_message_text(message_id=prev_msg_id, text=button_response_text(out_text, next_marker, True), **base_kwargs)
-            db.set_json(storage_key, {"message_id": prev_msg_id, "updated_at": int(time.time()), "marker": next_marker})
+            edited = await safe_bot_edit_message_text(context.bot, message_id=prev_msg_id, text=out_text, **base_kwargs)
+            if edited:
+                db.set_json(storage_key, {"message_id": prev_msg_id, "updated_at": int(time.time()), "hash": stable_payload_hash(out_text)})
             return
         except BadRequest as exc:
-            if "message is not modified" in str(exc).lower():
-                logging.info("button_response_same_payload_ignored uid=%s bid=%s prev_msg_id=%s", q.from_user.id, button_id, prev_msg_id)
-                db.set_json(storage_key, {"message_id": prev_msg_id, "updated_at": int(time.time()), "marker": next_marker})
-                return
             logging.warning("button_response_edit_failed uid=%s bid=%s reason=%s", q.from_user.id, button_id, exc)
         except RetryAfter as exc:
             logging.warning("button_response_edit_retry_after uid=%s bid=%s retry_after=%s", q.from_user.id, button_id, getattr(exc, "retry_after", None))
@@ -1421,7 +1529,7 @@ async def send_or_replace_button_response(q, context: ContextTypes.DEFAULT_TYPE,
             logging.warning("button_response_edit_failed uid=%s bid=%s reason=%s", q.from_user.id, button_id, exc)
     try:
         sent = await context.bot.send_message(text=out_text, **base_kwargs)
-        db.set_json(storage_key, {"message_id": sent.message_id, "updated_at": int(time.time()), "marker": 0})
+        db.set_json(storage_key, {"message_id": sent.message_id, "updated_at": int(time.time()), "hash": stable_payload_hash(out_text)})
     except RetryAfter as exc:
         logging.warning("button_response_send_retry_after uid=%s bid=%s retry_after=%s", q.from_user.id, button_id, getattr(exc, "retry_after", None))
     except TimedOut:
@@ -1469,45 +1577,13 @@ def is_safe_callback_data(raw: str | None) -> bool:
     return bool(re.fullmatch(r"[A-Za-z0-9_:\-]+", normalized))
 
 
-def callback_message_button_label(q, callback_data: str) -> str | None:
-    markup = getattr(getattr(q, "message", None), "reply_markup", None)
-    keyboard = getattr(markup, "inline_keyboard", None)
-    if not keyboard:
-        return None
-    for row in keyboard:
-        for button in row:
-            if normalize_callback_data(getattr(button, "callback_data", None)) == callback_data:
-                label = str(getattr(button, "text", "") or "").strip()
-                return re.sub(r"^[✨🚀🧨\s]+", "", label).strip() or None
-    return None
-
-
-def resolve_inline_button_row(button_id: int, q=None):
+def resolve_inline_button_row(button_id: int):
     with db.conn() as c:
         row = c.execute("SELECT id, action_type, action_payload FROM menu_buttons WHERE id=? AND is_active=1", (button_id,)).fetchone()
     if row:
         return row, int(row["id"]), "id"
-    label = callback_message_button_label(q, f"im:btn:{button_id}") if q is not None else None
-    if not label:
-        return None, button_id, "missing"
-    with db.conn() as c:
-        matches = c.execute(
-            """
-            SELECT mb.id, mb.action_type, mb.action_payload
-            FROM menu_buttons mb
-            JOIN menus m ON m.id = mb.menu_id
-            WHERE mb.is_active=1 AND m.is_active=1 AND mb.button_text=?
-            ORDER BY mb.updated_at DESC, mb.id DESC
-            """,
-            (label,),
-        ).fetchall()
-    if len(matches) == 1:
-        logging.warning("im_legacy_button_remapped old_button_id=%s new_button_id=%s label=%r", button_id, matches[0]["id"], label)
-        return matches[0], int(matches[0]["id"]), "label"
-    if len(matches) > 1:
-        logging.warning("im_legacy_button_ambiguous old_button_id=%s label=%r matches=%s", button_id, label, len(matches))
-        return None, button_id, "ambiguous"
     return None, button_id, "missing"
+
 
 async def maybe_welcome(update: Update, data: dict[str, Any], uid: int, source: str) -> bool:
     if source!="business" or not data.get("welcome_enabled",True): return False
@@ -1533,6 +1609,10 @@ async def panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query
     if not q: return
+    if not await claim_callback_execution(getattr(q, "id", None)):
+        logging.info("callback_duplicate_ignored id=%s data=%r", getattr(q, "id", None), getattr(q, "data", None))
+        await safe_callback_answer(q)
+        return
     raw_callback_data = q.data
     normalized_callback_data = normalize_callback_data(raw_callback_data)
     if not is_safe_callback_data(normalized_callback_data):
@@ -1562,7 +1642,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not admin_allowed and (not data.get("active", False) or not data.get("inline_menu_enabled", False)):
             await safe_callback_answer(q)
             return
-        row, resolved_bid, resolution = resolve_inline_button_row(bid, q)
+        row, resolved_bid, resolution = resolve_inline_button_row(bid)
         if not row:
             logging.warning("im_button_missing uid=%s button_id=%s resolution=%s data=%r", uid, bid, resolution, q.data)
             await safe_callback_answer(q, "این دکمه منقضی شده است. لطفاً منو را دوباره باز کنید.", show_alert=True)
@@ -1583,38 +1663,38 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if is_state_stale(uid):
             db.clear_admin_state(uid)
-            await q.edit_message_text("State منقضی شد. دوباره از منو شروع کنید.", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False)))
+            await safe_edit_callback_message_text(q, "State منقضی شد. دوباره از منو شروع کنید.", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False)))
             return
         if not admin_allowed: return
         if (not data.get("active", False)) and not admin_allowed and q.data not in {IMCB["ROOT"], IMCB["TOGGLE"], IMCB["CANCEL"], IMCB["CONFIRM_NO"]}:
             await safe_callback_answer(q, "اول باید ربات را از وضعیت سراسری روشن کنید.", show_alert=True); return
         if q.data == IMCB["ROOT"]:
-            await q.edit_message_text("Inline Menu Engine", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False)))
+            await safe_edit_callback_message_text(q, "Inline Menu Engine", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False)))
             return
         if q.data == IMCB["TOGGLE"]:
             if not data.get("active", False) and not admin_allowed:
                 await safe_callback_answer(q, "اول ربات را روشن کنید.", show_alert=True); return
             data["inline_menu_enabled"] = not data.get("inline_menu_enabled", False); save_data(data)
             db.log_admin(uid, "toggle", "inline_menu", None, None, str(data["inline_menu_enabled"]))
-            await q.edit_message_text("Inline Menu Engine", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False)))
+            await safe_edit_callback_message_text(q, "Inline Menu Engine", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False)))
             return
         if q.data == IMCB["CREATE"]:
             db.set_admin_state(uid, "im_create_command", {})
-            await q.edit_message_text("Step 1/5: command menu را ارسال کنید.", reply_markup=build_back_kb("im:root")); return
+            await safe_edit_callback_message_text(q, "Step 1/5: command menu را ارسال کنید.", reply_markup=build_back_kb("im:root")); return
         if q.data == IMCB["ADD_BTN"]:
             menus=[{"id":m["id"],"label":f"{m['command']}"} for m in db.list_menus()]
-            await q.edit_message_text("انتخاب منو:", reply_markup=paged_rows(menus,"im:addbtnpick",0)); return
+            await safe_edit_callback_message_text(q, "انتخاب منو:", reply_markup=paged_rows(menus,"im:addbtnpick",0)); return
         if ":page:" in q.data and q.data.startswith(("im:addbtnpick","im:mgrpick","im:editpick","im:livepick","im:togpick")):
             parts=q.data.split(":")
             prefix=":".join(parts[:2]); page=int(parts[-1])
             menus=[{"id":m["id"],"label":(f"{'✅' if m['is_active'] else '❌'} {m['command']}" if prefix=="im:togpick" else f"{m['command']}")} for m in db.list_menus()]
-            await q.edit_message_text("انتخاب منو:", reply_markup=paged_rows(menus,prefix,page)); return
+            await safe_edit_callback_message_text(q, "انتخاب منو:", reply_markup=paged_rows(menus,prefix,page)); return
         if q.data == IMCB["ACTIVE"]:
             menus=[{"id":m["id"],"label":f"{'✅' if m['is_active'] else '❌'} {m['command']}"} for m in db.list_menus()]
-            await q.edit_message_text("🟢 مدیریت فعال/غیرفعال منو و دکمه‌ها:", reply_markup=paged_rows(menus,"im:togpick",0)); return
+            await safe_edit_callback_message_text(q, "🟢 مدیریت فعال/غیرفعال منو و دکمه‌ها:", reply_markup=paged_rows(menus,"im:togpick",0)); return
         if q.data == IMCB["LIVE"]:
             menus=[{"id":m["id"],"label":f"{m['command']}"} for m in db.list_menus()]
-            await q.edit_message_text("Live Menus:", reply_markup=paged_rows(menus,"im:livepick",0)); return
+            await safe_edit_callback_message_text(q, "Live Menus:", reply_markup=paged_rows(menus,"im:livepick",0)); return
         if q.data.startswith("im:livepick:"):
             parts=q.data.split(":")
             if len(parts) >= 4 and parts[2] == "page":
@@ -1623,52 +1703,52 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 mid=int(parts[2])
                 menu = next((m for m in db.list_menus() if int(m["id"]) == mid), None)
                 if not menu:
-                    await q.edit_message_text("این منو دیگر وجود ندارد.", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False))); return
+                    await safe_edit_callback_message_text(q, "این منو دیگر وجود ندارد.", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False))); return
                 btns = db.menu_buttons(mid)
                 rows = [[InlineKeyboardButton(btns[i]["button_text"], callback_data=f"im:btn:{btns[i]['id']}"),
                          InlineKeyboardButton(btns[i+1]["button_text"], callback_data=f"im:btn:{btns[i+1]['id']}")] if i+1 < len(btns)
                         else [InlineKeyboardButton(btns[i]["button_text"], callback_data=f"im:btn:{btns[i]['id']}")]
                         for i in range(0, len(btns), 2)]
                 rows.append([InlineKeyboardButton("🔙 بازگشت به لیست", callback_data="im:live")])
-                await q.edit_message_text(f"📋 Menu: {menu['command']}\n\n{menu['preview_text']}", reply_markup=InlineKeyboardMarkup(rows)); return
+                await safe_edit_callback_message_text(q, f"📋 Menu: {menu['command']}\n\n{menu['preview_text']}", reply_markup=InlineKeyboardMarkup(rows)); return
 
         if q.data.startswith("im:togpick:"):
             try: mid=int(q.data.split(":")[2])
             except Exception: logging.warning("im_invalid_payload uid=%s data=%r", uid, q.data); return
             menu = db.menu_by_id(mid)
             if not menu:
-                await q.edit_message_text("این منو دیگر وجود ندارد.", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False))); return
-            await q.edit_message_text(f"⚙️ وضعیت منو: {menu['command']}", reply_markup=build_toggle_menu_keyboard(mid)); return
+                await safe_edit_callback_message_text(q, "این منو دیگر وجود ندارد.", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False))); return
+            await safe_edit_callback_message_text(q, f"⚙️ وضعیت منو: {menu['command']}", reply_markup=build_toggle_menu_keyboard(mid)); return
         if q.data.startswith("im:togmenu:"):
             mid=int(q.data.split(":")[2])
             menu = db.menu_by_id(mid)
             if not menu:
-                await q.edit_message_text("این منو دیگر وجود ندارد.", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False))); return
+                await safe_edit_callback_message_text(q, "این منو دیگر وجود ندارد.", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False))); return
             db.set_menu_active(mid, not bool(menu["is_active"]))
             db.log_admin(uid,"toggle","menu_active",mid,str(bool(menu["is_active"])),str(not bool(menu["is_active"])))
             menu = db.menu_by_id(mid)
-            await q.edit_message_text(f"⚙️ وضعیت منو: {menu['command']}", reply_markup=build_toggle_menu_keyboard(mid)); return
+            await safe_edit_callback_message_text(q, f"⚙️ وضعیت منو: {menu['command']}", reply_markup=build_toggle_menu_keyboard(mid)); return
         if q.data.startswith("im:togbtn:"):
             bid=int(q.data.split(":")[2])
             btn = db.button_by_id(bid)
             if not btn:
-                await q.edit_message_text("این دکمه دیگر وجود ندارد.", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False))); return
+                await safe_edit_callback_message_text(q, "این دکمه دیگر وجود ندارد.", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False))); return
             db.set_button_active(bid, not bool(btn["is_active"]))
             db.log_admin(uid,"toggle","button_active",bid,str(bool(btn["is_active"])),str(not bool(btn["is_active"])))
             menu = db.menu_by_id(int(btn["menu_id"]))
-            await q.edit_message_text(f"⚙️ وضعیت منو: {menu['command'] if menu else '-'}", reply_markup=build_toggle_menu_keyboard(int(btn["menu_id"]))); return
+            await safe_edit_callback_message_text(q, f"⚙️ وضعیت منو: {menu['command'] if menu else '-'}", reply_markup=build_toggle_menu_keyboard(int(btn["menu_id"]))); return
 
         if q.data.startswith("im:addbtnpick:"):
             try: mid=int(q.data.split(":")[2])
             except Exception: logging.warning("im_invalid_payload uid=%s data=%r", uid, q.data); return
             if not any(int(m["id"])==mid for m in db.list_menus()):
-                logging.warning("im_stale_menu_pick uid=%s menu_id=%s", uid, mid); await q.edit_message_text("منو دیگر وجود ندارد."); return
+                logging.warning("im_stale_menu_pick uid=%s menu_id=%s", uid, mid); await safe_edit_callback_message_text(q, "منو دیگر وجود ندارد."); return
             db.set_admin_state(uid,"im_add_btn_text",{"menu_id":mid})
-            await q.edit_message_text("متن دکمه جدید را ارسال کنید.", reply_markup=build_back_kb("im:root")); return
+            await safe_edit_callback_message_text(q, "متن دکمه جدید را ارسال کنید.", reply_markup=build_back_kb("im:root")); return
         if q.data == IMCB["MGR"] or q.data == IMCB["EDIT"]:
             menus=[{"id":m["id"],"label":f"{m['command']}"} for m in db.list_menus()]
             pref="im:mgrpick" if q.data==IMCB["MGR"] else "im:editpick"
-            await q.edit_message_text("انتخاب منو:", reply_markup=paged_rows(menus,pref,0)); return
+            await safe_edit_callback_message_text(q, "انتخاب منو:", reply_markup=paged_rows(menus,pref,0)); return
         if q.data.startswith("im:mgrpick:"):
             try: mid=int(q.data.split(":")[2])
             except Exception: logging.warning("im_invalid_payload uid=%s data=%r", uid, q.data); return
@@ -1676,12 +1756,12 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rows=[[InlineKeyboardButton("❌ Delete Entire Menu",callback_data=f"im:delmenu:{mid}")]]
             for b in btns: rows.append([InlineKeyboardButton(f"🧨 حذف {b['button_text']}",callback_data=f"im:delbtn:{b['id']}")])
             rows.append([InlineKeyboardButton("🧨 Cancel",callback_data="im:root")])
-            await q.edit_message_text("Menu Manager", reply_markup=InlineKeyboardMarkup(rows)); return
+            await safe_edit_callback_message_text(q, "Menu Manager", reply_markup=InlineKeyboardMarkup(rows)); return
         if q.data.startswith("im:editpick:"):
             try: mid=int(q.data.split(":")[2])
             except Exception: logging.warning("im_invalid_payload uid=%s data=%r", uid, q.data); return
             db.set_admin_state(uid,"im_edit_choose",{"menu_id":mid})
-            await q.edit_message_text("Edit Menu", reply_markup=InlineKeyboardMarkup([
+            await safe_edit_callback_message_text(q, "Edit Menu", reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("1) Edit Preview Text",callback_data="im:edit:preview")],
                 [InlineKeyboardButton("2) Edit Menu Command",callback_data="im:edit:command")],
                 [InlineKeyboardButton("3) Edit Button Name",callback_data="im:edit:btnname")],
@@ -1691,34 +1771,34 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if q.data.startswith("im:edit:"):
             st=db.get_admin_state(uid) or {}
             mid=int((st.get("payload") or {}).get("menu_id",0))
-            if not mid: await q.edit_message_text("State invalid", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled",False), data.get("active",False))); return
+            if not mid: await safe_edit_callback_message_text(q, "State invalid", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled",False), data.get("active",False))); return
             op=q.data.split(":")[2]
             if op=="preview":
-                db.set_admin_state(uid,"im_edit_preview_text",{"menu_id":mid}); await q.edit_message_text("Preview جدید را بفرستید."); return
+                db.set_admin_state(uid,"im_edit_preview_text",{"menu_id":mid}); await safe_edit_callback_message_text(q, "Preview جدید را بفرستید."); return
             if op=="command":
-                db.set_admin_state(uid,"im_edit_command_text",{"menu_id":mid}); await q.edit_message_text("Command جدید را بفرستید."); return
+                db.set_admin_state(uid,"im_edit_command_text",{"menu_id":mid}); await safe_edit_callback_message_text(q, "Command جدید را بفرستید."); return
             btns=db.menu_buttons(mid)
             rows=[[InlineKeyboardButton(b["button_text"],callback_data=f"im:editpickbtn:{op}:{b['id']}")] for b in btns]
             rows.append([InlineKeyboardButton("🧨 Cancel",callback_data="im:cancel")])
-            await q.edit_message_text("Button را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(rows)); return
+            await safe_edit_callback_message_text(q, "Button را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(rows)); return
         if q.data.startswith("im:editpickbtn:"):
             _,_,op,bid=q.data.split(":")
             if not db.button_by_id(int(bid)):
                 logging.warning("im_stale_callback_button_missing uid=%s button_id=%s", uid, bid)
-                await q.edit_message_text("آیتم دیگر وجود ندارد.", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False))); return
+                await safe_edit_callback_message_text(q, "آیتم دیگر وجود ندارد.", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False))); return
             if op=="btnname":
                 db.set_admin_state(uid, "im_edit_button_name", {"button_id":int(bid)})
-                await q.edit_message_text("نام جدید دکمه را بفرستید.", reply_markup=build_back_kb("im:root")); return
+                await safe_edit_callback_message_text(q, "نام جدید دکمه را بفرستید.", reply_markup=build_back_kb("im:root")); return
             db.set_admin_state(uid, "im_edit_button_output_action_type", {"button_id":int(bid)})
-            await q.edit_message_text("What should this button do?", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("just_text",callback_data="im:act:just_text")],[InlineKeyboardButton("Cancel",callback_data="im:cancel")]])); return
+            await safe_edit_callback_message_text(q, "What should this button do?", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("just_text",callback_data="im:act:just_text")],[InlineKeyboardButton("Cancel",callback_data="im:cancel")]])); return
         if q.data.startswith("im:delmenu:"):
             mid=int(q.data.split(":")[2]); db.set_admin_state(uid,"im_confirm_del_menu",{"menu_id":mid})
-            await q.edit_message_text("تایید حذف کامل منو؟", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("YES",callback_data="im:confirm:yes"),InlineKeyboardButton("NO",callback_data="im:confirm:no")]])); return
+            await safe_edit_callback_message_text(q, "تایید حذف کامل منو؟", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("YES",callback_data="im:confirm:yes"),InlineKeyboardButton("NO",callback_data="im:confirm:no")]])); return
         if q.data.startswith("im:delbtn:"):
             bid=int(q.data.split(":")[2]); db.set_admin_state(uid,"im_confirm_del_btn",{"button_id":bid})
-            await q.edit_message_text("تایید حذف دکمه؟", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("YES",callback_data="im:confirm:yes"),InlineKeyboardButton("NO",callback_data="im:confirm:no")]])); return
+            await safe_edit_callback_message_text(q, "تایید حذف دکمه؟", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("YES",callback_data="im:confirm:yes"),InlineKeyboardButton("NO",callback_data="im:confirm:no")]])); return
         if q.data == IMCB["CONFIRM_NO"] or q.data == IMCB["CANCEL"]:
-            db.clear_admin_state(uid); await q.edit_message_text("لغو شد.", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False))); return
+            db.clear_admin_state(uid); await safe_edit_callback_message_text(q, "لغو شد.", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False))); return
         if q.data == IMCB["CONFIRM_YES"]:
             st=db.get_admin_state(uid) or {}
             if st.get("state")=="im_confirm_del_menu":
@@ -1729,21 +1809,21 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 bid=int(st["payload"]["button_id"])
                 ok = db.delete_button_atomic(bid)
                 db.log_admin(uid,"delete_button","menu_button",bid,None,json.dumps({"status":"ok" if ok else "missing"}, ensure_ascii=False))
-            db.clear_admin_state(uid); await q.edit_message_text("انجام شد.", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False))); return
+            db.clear_admin_state(uid); await safe_edit_callback_message_text(q, "انجام شد.", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False))); return
         if q.data=="im:act:just_text":
             st=db.get_admin_state(uid) or {}
             if st.get("state") in {"im_create_action_type", "im_edit_button_output_action_type"}:
                 p=st.get("payload",{}); p["action_type"]="just_text"
                 if st.get("state")=="im_create_action_type":
                     db.set_admin_state(uid,"im_create_output_text",p)
-                    await q.edit_message_text("Step 5/5: Enter the text that will be sent when this button is clicked.", reply_markup=build_back_kb("im:root")); return
+                    await safe_edit_callback_message_text(q, "Step 5/5: Enter the text that will be sent when this button is clicked.", reply_markup=build_back_kb("im:root")); return
                 db.set_admin_state(uid,"im_edit_button_output",p)
-                await q.edit_message_text("Enter the new output message for this button", reply_markup=build_back_kb("im:root")); return
+                await safe_edit_callback_message_text(q, "Enter the new output message for this button", reply_markup=build_back_kb("im:root")); return
         if q.data=="im:addbtn:act:just_text":
             st=db.get_admin_state(uid) or {}
             if st.get("state")=="im_add_btn_action_type":
                 p=st.get("payload",{}); p["action_type"]="just_text"; db.set_admin_state(uid,"im_add_btn_output",p)
-                await q.edit_message_text("Enter the text that will be sent when this button is clicked", reply_markup=build_back_kb("im:root")); return
+                await safe_edit_callback_message_text(q, "Enter the text that will be sent when this button is clicked", reply_markup=build_back_kb("im:root")); return
         if q.data=="im:create:confirm:yes":
             st=db.get_admin_state(uid) or {}
             if st.get("state")=="im_create_confirm":
@@ -1752,12 +1832,12 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 bid=db.add_menu_button(mid, p["button_text"], p.get("action_type","just_text"), p["output_text"])
                 db.log_admin(uid,"create","menu",mid,None,json.dumps(p,ensure_ascii=False))
                 db.clear_admin_state(uid)
-                await q.edit_message_text(f"✅ Menu created (menu_id={mid}, button_id={bid})", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False))); return
+                await safe_edit_callback_message_text(q, f"✅ Menu created (menu_id={mid}, button_id={bid})", reply_markup=build_inline_menu_admin_kb(data.get("inline_menu_enabled", False), data.get("active", False))); return
         if q.data=="im:create:confirm:no":
             st=db.get_admin_state(uid) or {}
             if st.get("state")=="im_create_confirm":
                 p=st.get("payload",{}); db.set_admin_state(uid,"im_create_output_text",p)
-                await q.edit_message_text("Output را دوباره بفرستید.", reply_markup=build_back_kb("im:root")); return
+                await safe_edit_callback_message_text(q, "Output را دوباره بفرستید.", reply_markup=build_back_kb("im:root")); return
     if q.data and q.data.startswith("user:"):
         db.touch_user_activity(uid, "user_button", q.data)
         if not admin_allowed:
@@ -1800,20 +1880,20 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         handled_panel_ui = await render_admin_panel(update, context, data, edit=True, query=q)
     if handled_panel_ui:
         pass
-    elif q.data=="admin:features": await q.edit_message_text("فیچرها", reply_markup=create_features_keyboard(data))
+    elif q.data=="admin:features": await safe_edit_callback_message_text(q, "فیچرها", reply_markup=create_features_keyboard(data))
     elif q.data.startswith("feature:"):
         key=q.data.split(":",1)[1]
         if key in data["features"]:
             data["features"][key]=not data["features"][key]
             if key=="admin_bold_mode": data["bold_mode"]=data["features"][key]
-            save_data(data); await q.edit_message_text(f"{key} => {data['features'][key]}", reply_markup=create_features_keyboard(data))
-    elif q.data=="admin:texts": await q.edit_message_text("انتخاب متن برای ویرایش", reply_markup=create_texts_keyboard())
+            save_data(data); await safe_edit_callback_message_text(q, f"{key} => {data['features'][key]}", reply_markup=create_features_keyboard(data))
+    elif q.data=="admin:texts": await safe_edit_callback_message_text(q, "انتخاب متن برای ویرایش", reply_markup=create_texts_keyboard())
     elif q.data.startswith("text:"):
         key=q.data.split(":",1)[1]
         if key in TEXT_KEYS:
             STATE.flow,STATE.step,STATE.admin_id,STATE.message_id,STATE.pending_key="text_edit","waiting_value",uid,q.message.message_id,key
-            await q.edit_message_text(f"متن قبلی ({TEXT_KEYS[key]}):\n{data.get(key,'') or '(خالی)'}\n\nمتن جدید را ارسال کنید.")
-    elif q.data=="admin:shortcut_menu": await q.edit_message_text("مدیریت سلف بات", reply_markup=create_shortcut_menu_keyboard())
+            await safe_edit_callback_message_text(q, f"متن قبلی ({TEXT_KEYS[key]}):\n{data.get(key,'') or '(خالی)'}\n\nمتن جدید را ارسال کنید.")
+    elif q.data=="admin:shortcut_menu": await safe_edit_callback_message_text(q, "مدیریت سلف بات", reply_markup=create_shortcut_menu_keyboard())
     elif q.data=="admin:shortcut_view":
         sc = db.load_shortcuts()
         if sc:
@@ -1825,88 +1905,88 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             out = "📚 شورت‌کات‌های فعلی:\n\n" + "\n".join(lines)
         else:
             out = "📚 شورت‌کات‌های فعلی:\n\nموردی ثبت نشده است."
-        await q.edit_message_text(out, parse_mode=ParseMode.HTML, reply_markup=create_shortcut_menu_keyboard())
-    elif q.data=="admin:shortcut_cfg": STATE.flow,STATE.step,STATE.admin_id,STATE.message_id,STATE.temp_shortcuts="shortcut_cfg","waiting_name",uid,q.message.message_id,{}; await q.edit_message_text("نام شورت‌کات را وارد کنید:", reply_markup=build_back_kb("admin:shortcut_menu"))
+        await safe_edit_callback_message_text(q, out, parse_mode=ParseMode.HTML, reply_markup=create_shortcut_menu_keyboard())
+    elif q.data=="admin:shortcut_cfg": STATE.flow,STATE.step,STATE.admin_id,STATE.message_id,STATE.temp_shortcuts="shortcut_cfg","waiting_name",uid,q.message.message_id,{}; await safe_edit_callback_message_text(q, "نام شورت‌کات را وارد کنید:", reply_markup=build_back_kb("admin:shortcut_menu"))
     elif q.data=="admin:shortcut_delete_menu":
         sc = db.load_shortcuts()
         kb = build_shortcut_pick_keyboard(sc, "admin:shortcut_delete_pick", "shortcut_delete_tokens") if sc else InlineKeyboardMarkup([[create_danger_button("بازگشت", "admin:shortcut_menu")]])
-        await q.edit_message_text("انتخاب شورت‌کات برای حذف:", reply_markup=kb)
+        await safe_edit_callback_message_text(q, "انتخاب شورت‌کات برای حذف:", reply_markup=kb)
     elif q.data.startswith("admin:shortcut_delete_pick:"):
         token = q.data.split(":", 2)[2]
         key = db.get_watch("shortcut_delete_tokens", {}).get(token)
         if not key:
-            await q.edit_message_text("آیتم معتبر نیست. دوباره لیست را باز کنید.", reply_markup=create_shortcut_menu_keyboard()); return
+            await safe_edit_callback_message_text(q, "آیتم معتبر نیست. دوباره لیست را باز کنید.", reply_markup=create_shortcut_menu_keyboard()); return
         db.set_watch("shortcut_delete_confirm_token", {"x": key})
-        await q.edit_message_text(f"حذف «{key}» تایید می‌شود؟", reply_markup=InlineKeyboardMarkup([[create_danger_button("تایید حذف", "admin:shortcut_delete_confirm:x")], [create_primary_button("انصراف", "admin:shortcut_menu")]]))
+        await safe_edit_callback_message_text(q, f"حذف «{key}» تایید می‌شود؟", reply_markup=InlineKeyboardMarkup([[create_danger_button("تایید حذف", "admin:shortcut_delete_confirm:x")], [create_primary_button("انصراف", "admin:shortcut_menu")]]))
     elif q.data.startswith("admin:shortcut_delete_confirm:"):
         token = q.data.split(":", 2)[2]
         key = db.get_watch("shortcut_delete_confirm_token", {}).get(token)
         if not key:
-            await q.edit_message_text("آیتم معتبر نیست.", reply_markup=create_shortcut_menu_keyboard()); return
+            await safe_edit_callback_message_text(q, "آیتم معتبر نیست.", reply_markup=create_shortcut_menu_keyboard()); return
         db.delete_shortcut(key)
-        await q.edit_message_text("شورت‌کات حذف شد.", reply_markup=create_shortcut_menu_keyboard())
+        await safe_edit_callback_message_text(q, "شورت‌کات حذف شد.", reply_markup=create_shortcut_menu_keyboard())
     elif q.data=="admin:shortcut_edit_menu":
         sc = db.load_shortcuts()
         kb = build_shortcut_pick_keyboard(sc, "admin:shortcut_edit_pick", "shortcut_edit_tokens") if sc else InlineKeyboardMarkup([[create_danger_button("بازگشت", "admin:shortcut_menu")]])
-        await q.edit_message_text("انتخاب شورت‌کات برای ویرایش:", reply_markup=kb)
+        await safe_edit_callback_message_text(q, "انتخاب شورت‌کات برای ویرایش:", reply_markup=kb)
     elif q.data.startswith("admin:shortcut_edit_pick:"):
         token = q.data.split(":", 2)[2]
         key = db.get_watch("shortcut_edit_tokens", {}).get(token)
         if not key:
-            await q.edit_message_text("آیتم معتبر نیست. دوباره لیست را باز کنید.", reply_markup=create_shortcut_menu_keyboard()); return
+            await safe_edit_callback_message_text(q, "آیتم معتبر نیست. دوباره لیست را باز کنید.", reply_markup=create_shortcut_menu_keyboard()); return
         STATE.flow, STATE.step, STATE.admin_id, STATE.message_id, STATE.pending_key = "shortcut_edit", "choose_field", uid, q.message.message_id, key
-        await q.edit_message_text(f"شورت‌کات «{key}»\nکدام بخش ویرایش شود؟", reply_markup=InlineKeyboardMarkup([[create_primary_button("کلید", "admin:shortcut_edit_key"), create_primary_button("متن", "admin:shortcut_edit_value")], [create_danger_button("بازگشت", "admin:shortcut_menu")]]))
+        await safe_edit_callback_message_text(q, f"شورت‌کات «{key}»\nکدام بخش ویرایش شود؟", reply_markup=InlineKeyboardMarkup([[create_primary_button("کلید", "admin:shortcut_edit_key"), create_primary_button("متن", "admin:shortcut_edit_value")], [create_danger_button("بازگشت", "admin:shortcut_menu")]]))
     elif q.data=="admin:shortcut_edit_key":
         STATE.step = "waiting_new_key"
-        await q.edit_message_text("کلید جدید را ارسال کنید:", reply_markup=build_back_kb("admin:shortcut_menu"))
+        await safe_edit_callback_message_text(q, "کلید جدید را ارسال کنید:", reply_markup=build_back_kb("admin:shortcut_menu"))
     elif q.data=="admin:shortcut_edit_value":
         STATE.step = "waiting_new_value"
-        await q.edit_message_text("متن جدید را ارسال کنید:", reply_markup=build_back_kb("admin:shortcut_menu"))
+        await safe_edit_callback_message_text(q, "متن جدید را ارسال کنید:", reply_markup=build_back_kb("admin:shortcut_menu"))
     elif q.data=="admin:watch_channel_cfg":
         STATE.flow, STATE.step, STATE.admin_id, STATE.message_id = "watch_cfg", "waiting_channel_id", uid, q.message.message_id
-        await q.edit_message_text("آیدی عددی چنل گزارشات را با علامت - ارسال کنید.\nمثال: -1001234567890", reply_markup=build_back_kb("admin:shortcut_menu"))
+        await safe_edit_callback_message_text(q, "آیدی عددی چنل گزارشات را با علامت - ارسال کنید.\nمثال: -1001234567890", reply_markup=build_back_kb("admin:shortcut_menu"))
     elif q.data=="admin:watch_keywords_add":
         STATE.flow, STATE.step, STATE.admin_id, STATE.message_id = "watch_cfg", "waiting_keywords_add", uid, q.message.message_id
-        await q.edit_message_text("کلمات مانیتور را با ویرگول بفرستید.\nمثال: نامحدود,تست,ربات سلف", reply_markup=build_back_kb("admin:shortcut_menu"))
+        await safe_edit_callback_message_text(q, "کلمات مانیتور را با ویرگول بفرستید.\nمثال: نامحدود,تست,ربات سلف", reply_markup=build_back_kb("admin:shortcut_menu"))
     elif q.data=="admin:watch_keywords_remove":
         current = db.get_watch("watch_keywords", [])
         kb = build_watch_keyword_pick_keyboard(current, "admin:watch_kw_remove_pick", "watch_kw_remove_tokens") if current else InlineKeyboardMarkup([[create_danger_button("بازگشت", "admin:shortcut_menu")]])
-        await q.edit_message_text("انتخاب کلمه مانیتور برای حذف:", reply_markup=kb)
+        await safe_edit_callback_message_text(q, "انتخاب کلمه مانیتور برای حذف:", reply_markup=kb)
     elif q.data.startswith("admin:watch_kw_remove_pick:"):
         token = q.data.split(":", 2)[2]
         key = db.get_watch("watch_kw_remove_tokens", {}).get(token)
         if not key:
-            await q.edit_message_text("آیتم معتبر نیست.", reply_markup=create_shortcut_menu_keyboard()); return
+            await safe_edit_callback_message_text(q, "آیتم معتبر نیست.", reply_markup=create_shortcut_menu_keyboard()); return
         db.set_watch("watch_kw_remove_confirm", {"x": key})
-        await q.edit_message_text(f"حذف کلمه «{key}» تایید می‌شود؟", reply_markup=InlineKeyboardMarkup([[create_danger_button("تایید حذف", "admin:watch_kw_remove_confirm:x")], [create_primary_button("انصراف", "admin:shortcut_menu")]]))
+        await safe_edit_callback_message_text(q, f"حذف کلمه «{key}» تایید می‌شود؟", reply_markup=InlineKeyboardMarkup([[create_danger_button("تایید حذف", "admin:watch_kw_remove_confirm:x")], [create_primary_button("انصراف", "admin:shortcut_menu")]]))
     elif q.data.startswith("admin:watch_kw_remove_confirm:"):
         token = q.data.split(":", 2)[2]
         key = db.get_watch("watch_kw_remove_confirm", {}).get(token)
         if not key:
-            await q.edit_message_text("آیتم معتبر نیست.", reply_markup=create_shortcut_menu_keyboard()); return
+            await safe_edit_callback_message_text(q, "آیتم معتبر نیست.", reply_markup=create_shortcut_menu_keyboard()); return
         old = db.get_watch("watch_keywords", [])
         left = [x for x in old if str(x).strip().lower() != str(key).strip().lower()]
         db.set_watch("watch_keywords", left)
-        await q.edit_message_text("کلمه مانیتور حذف شد.", reply_markup=create_shortcut_menu_keyboard())
+        await safe_edit_callback_message_text(q, "کلمه مانیتور حذف شد.", reply_markup=create_shortcut_menu_keyboard())
     elif q.data=="admin:watch_keywords_stats":
         configured = db.get_watch("watch_keywords", [])
         rows = {r["keyword"]: r["cnt"] for r in db.hit_stats()}
         out = "📚 مشاهده کلمات مانیتور:\n\n" + ("\n".join([f"• {k}: {rows.get(k, 0)}" for k in configured]) if configured else "کلمه‌ای ثبت نشده.")
-        await q.edit_message_text(out, reply_markup=build_back_kb("admin:shortcut_menu"))
+        await safe_edit_callback_message_text(q, out, reply_markup=build_back_kb("admin:shortcut_menu"))
     elif q.data=="admin:db_import":
         STATE.flow, STATE.step, STATE.admin_id, STATE.message_id = "db_import", "waiting_document", uid, q.message.message_id
-        await q.edit_message_text("فایل دیتابیس (.db) را همینجا ارسال کنید.", reply_markup=build_back_kb("menu:admin"))
+        await safe_edit_callback_message_text(q, "فایل دیتابیس (.db) را همینجا ارسال کنید.", reply_markup=build_back_kb("menu:admin"))
     elif q.data=="admin:logs_menu":
-        await q.edit_message_text("یک لاگ را انتخاب کنید:", reply_markup=build_logs_keyboard(BASE_DIR))
+        await safe_edit_callback_message_text(q, "یک لاگ را انتخاب کنید:", reply_markup=build_logs_keyboard(BASE_DIR))
     elif q.data.startswith("admin:log_file:"):
         name = q.data.split(":", 2)[2]
         fp = (BASE_DIR / name).resolve()
         logs_root = (BASE_DIR / "logs").resolve()
         if logs_root not in fp.parents and fp != logs_root:
-            await q.edit_message_text("مسیر فایل معتبر نیست.", reply_markup=build_back_kb("admin:logs_menu"))
+            await safe_edit_callback_message_text(q, "مسیر فایل معتبر نیست.", reply_markup=build_back_kb("admin:logs_menu"))
             return
         if not fp.exists():
-            await q.edit_message_text("فایل لاگ یافت نشد.", reply_markup=build_back_kb("admin:logs_menu"))
+            await safe_edit_callback_message_text(q, "فایل لاگ یافت نشد.", reply_markup=build_back_kb("admin:logs_menu"))
         else:
             with fp.open("r", encoding="utf-8", errors="replace") as f:
                 pretty = humanize_log_text(fp, f.read())
@@ -1916,17 +1996,17 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             with temp_path.open("rb") as doc:
                 await context.bot.send_document(chat_id=uid, document=doc, filename=f"{fp.stem}-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}.txt")
             temp_path.unlink(missing_ok=True)
-            await q.edit_message_text("فایل لاگ ارسال شد.", reply_markup=build_back_kb("admin:logs_menu"))
-    elif q.data=="shortcut:continue_yes": STATE.step="waiting_name"; await q.edit_message_text("نام شورت‌کات بعدی را وارد کنید:", reply_markup=build_back_kb("admin:shortcut_menu"))
+            await safe_edit_callback_message_text(q, "فایل لاگ ارسال شد.", reply_markup=build_back_kb("admin:logs_menu"))
+    elif q.data=="shortcut:continue_yes": STATE.step="waiting_name"; await safe_edit_callback_message_text(q, "نام شورت‌کات بعدی را وارد کنید:", reply_markup=build_back_kb("admin:shortcut_menu"))
     elif q.data=="shortcut:continue_no":
         if STATE.temp_shortcuts:
             db.save_shortcuts(STATE.temp_shortcuts)
         STATE.flow=STATE.step=STATE.pending_key=None
         STATE.temp_shortcuts=None
-        await q.edit_message_text("شورت‌کات‌ها ذخیره شدند.", reply_markup=create_shortcut_menu_keyboard())
+        await safe_edit_callback_message_text(q, "شورت‌کات‌ها ذخیره شدند.", reply_markup=create_shortcut_menu_keyboard())
     elif q.data=="admin:market_root":
         STATE.flow = STATE.step = STATE.pending_key = None
-        await q.edit_message_text(format_market_status(data), reply_markup=create_market_root_keyboard(data))
+        await safe_edit_callback_message_text(q, format_market_status(data), reply_markup=create_market_root_keyboard(data))
     elif q.data=="admin:market_toggle":
         if not data.get("active", False):
             await safe_callback_answer(q, "اول ربات را روشن کنید.", show_alert=True); return
@@ -1935,10 +2015,10 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data["market"] = market_settings
         save_data(data)
         db.log_admin(uid, "toggle", "market_engine", None, None, str(market_settings["market_engine_enabled"]))
-        await q.edit_message_text(format_market_status(data), reply_markup=create_market_root_keyboard(data))
+        await safe_edit_callback_message_text(q, format_market_status(data), reply_markup=create_market_root_keyboard(data))
     elif q.data=="admin:market_api":
         STATE.flow = STATE.step = STATE.pending_key = None
-        await q.edit_message_text(format_market_status(data), reply_markup=create_market_api_keyboard(data))
+        await safe_edit_callback_message_text(q, format_market_status(data), reply_markup=create_market_api_keyboard(data))
     elif q.data.startswith("admin:market_api_toggle:"):
         key = q.data.rsplit(":", 1)[1]
         settings = merge_market_settings(data)
@@ -1946,52 +2026,52 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             settings[key] = not settings.get(key, True)
             data["market"] = settings
             save_data(data)
-        await q.edit_message_text(format_market_status(data), reply_markup=create_market_api_keyboard(data))
+        await safe_edit_callback_message_text(q, format_market_status(data), reply_markup=create_market_api_keyboard(data))
     elif q.data.startswith("admin:market_set_key:"):
         provider = q.data.rsplit(":", 1)[1]
         if provider not in {"coingecko", "exchangerate"}: return
         STATE.flow, STATE.step, STATE.admin_id, STATE.message_id, STATE.pending_key = "market_cfg", "waiting_api_key", uid, q.message.message_id, provider
-        await q.edit_message_text(f"کلید API برای {provider} را ارسال کنید. قبل از ذخیره، درخواست واقعی اعتبارسنجی انجام می‌شود.", reply_markup=build_back_kb("admin:market_api"))
+        await safe_edit_callback_message_text(q, f"کلید API برای {provider} را ارسال کنید. قبل از ذخیره، درخواست واقعی اعتبارسنجی انجام می‌شود.", reply_markup=build_back_kb("admin:market_api"))
     elif q.data.startswith("admin:market_validate:"):
         provider = q.data.rsplit(":", 1)[1]
         key = os.getenv("COINGECKO_API_KEY" if provider=="coingecko" else "EXCHANGERATE_API_KEY", "")
         result = await asyncio.to_thread(validate_market_api_key, provider, key, merge_market_settings(data).get("request_timeout_seconds", 8))
-        await q.edit_message_text(("✅ " if result.get("ok") else "❌ ") + result.get("message", "unknown"), reply_markup=create_market_api_keyboard(data))
+        await safe_edit_callback_message_text(q, ("✅ " if result.get("ok") else "❌ ") + result.get("message", "unknown"), reply_markup=create_market_api_keyboard(data))
     elif q.data=="admin:market_test":
         await MARKET_SERVICE.refresh(merge_market_settings(data))
-        await q.edit_message_text("درخواست زنده انجام شد.\n\n" + format_market_status(data), reply_markup=create_market_api_keyboard(data))
+        await safe_edit_callback_message_text(q, "درخواست زنده انجام شد.\n\n" + format_market_status(data), reply_markup=create_market_api_keyboard(data))
     elif q.data=="admin:market_stars":
         STATE.flow = STATE.step = STATE.pending_key = None
-        await q.edit_message_text("⭐ Stars Rate Settings", reply_markup=create_market_stars_keyboard(data))
+        await safe_edit_callback_message_text(q, "⭐ Stars Rate Settings", reply_markup=create_market_stars_keyboard(data))
     elif q.data=="admin:market_cache":
         STATE.flow = STATE.step = STATE.pending_key = None
-        await q.edit_message_text(format_market_status(data), reply_markup=create_market_cache_keyboard(data))
+        await safe_edit_callback_message_text(q, format_market_status(data), reply_markup=create_market_cache_keyboard(data))
     elif q.data=="admin:market_status":
-        await q.edit_message_text(format_market_status(data), reply_markup=create_market_root_keyboard(data))
+        await safe_edit_callback_message_text(q, format_market_status(data), reply_markup=create_market_root_keyboard(data))
     elif q.data=="admin:market_refresh":
         await MARKET_SERVICE.refresh(merge_market_settings(data))
-        await q.edit_message_text("کش بروزرسانی شد.\n\n" + format_market_status(data), reply_markup=create_market_cache_keyboard(data))
+        await safe_edit_callback_message_text(q, "کش بروزرسانی شد.\n\n" + format_market_status(data), reply_markup=create_market_cache_keyboard(data))
     elif q.data=="admin:market_quick":
         settings = merge_market_settings(data)
         STATE.flow, STATE.step, STATE.admin_id, STATE.message_id, STATE.pending_key = "market_cfg", "waiting_quick_assets", uid, q.message.message_id, "quick_assets"
-        await q.edit_message_text("Quick Assets فعلی:\n" + ", ".join(settings.get("quick_assets", [])) + "\n\nلیست جدید را با کاما ارسال کنید. نمونه: BTC,ETH,TRX,TON,USDT", reply_markup=build_back_kb("admin:market_root"))
+        await safe_edit_callback_message_text(q, "Quick Assets فعلی:\n" + ", ".join(settings.get("quick_assets", [])) + "\n\nلیست جدید را با کاما ارسال کنید. نمونه: BTC,ETH,TRX,TON,USDT", reply_markup=build_back_kb("admin:market_root"))
     elif q.data=="admin:market_help":
-        await q.edit_message_text(market_help_text(is_admin=True), reply_markup=create_market_root_keyboard(data))
+        await safe_edit_callback_message_text(q, market_help_text(is_admin=True), reply_markup=create_market_root_keyboard(data))
     elif q.data=="admin:market_branding":
         STATE.flow = STATE.step = STATE.pending_key = None
         merge_branding_settings(data)
-        await q.edit_message_text("🎨 Market Card Branding", reply_markup=create_market_branding_keyboard(data))
+        await safe_edit_callback_message_text(q, "🎨 Market Card Branding", reply_markup=create_market_branding_keyboard(data))
     elif q.data=="admin:market_theme":
         STATE.flow = STATE.step = STATE.pending_key = None
         merge_branding_settings(data)
-        await q.edit_message_text("🌓 Market Card Theme", reply_markup=create_market_theme_keyboard(data))
+        await safe_edit_callback_message_text(q, "🌓 Market Card Theme", reply_markup=create_market_theme_keyboard(data))
     elif q.data=="admin:market_fonts":
         STATE.flow = STATE.step = STATE.pending_key = None
-        await q.edit_message_text("🔤 Market Fonts", reply_markup=create_market_fonts_keyboard(data))
+        await safe_edit_callback_message_text(q, "🔤 Market Fonts", reply_markup=create_market_fonts_keyboard(data))
     elif q.data.startswith("admin:market_fonts:"):
         kind = q.data.rsplit(":", 1)[1]
         if kind not in {"persian", "english"}: return
-        await q.edit_message_text("فونت را انتخاب کنید:", reply_markup=create_market_font_select_keyboard(kind))
+        await safe_edit_callback_message_text(q, "فونت را انتخاب کنید:", reply_markup=create_market_font_select_keyboard(kind))
     elif q.data.startswith("admin:market_font_preview:"):
         _, _, kind, font_key = q.data.split(":", 3)
         branding = merge_branding_settings(data)
@@ -2005,7 +2085,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_photo(chat_id=uid, photo=BytesIO(image_bytes), caption=f"Preview: {choices[font_key]['label']}")
         except Exception as exc:
             logging.warning("market_font_preview_failed reason=%s", exc)
-        await q.edit_message_text("این فونت اعمال شود؟", reply_markup=create_market_confirm_keyboard(f"admin:market_font_apply:{kind}:{font_key}", f"admin:market_fonts:{kind}"))
+        await safe_edit_callback_message_text(q, "این فونت اعمال شود؟", reply_markup=create_market_confirm_keyboard(f"admin:market_font_apply:{kind}:{font_key}", f"admin:market_fonts:{kind}"))
     elif q.data.startswith("admin:market_font_apply:"):
         _, _, kind, font_key = q.data.split(":", 3)
         branding = merge_branding_settings(data)
@@ -2014,15 +2094,15 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         branding["persian_font" if kind == "persian" else "english_font"] = font_key
         data.setdefault("market", {})["card"] = branding
         save_data(data)
-        await q.edit_message_text("✅ فونت اعمال شد.", reply_markup=create_market_fonts_keyboard(data))
+        await safe_edit_callback_message_text(q, "✅ فونت اعمال شد.", reply_markup=create_market_fonts_keyboard(data))
     elif q.data=="admin:market_positions":
-        await q.edit_message_text("Position Settings", reply_markup=create_position_settings_keyboard())
+        await safe_edit_callback_message_text(q, "Position Settings", reply_markup=create_position_settings_keyboard())
     elif q.data=="admin:market_watermark_positions":
-        await q.edit_message_text("Watermark position را انتخاب کنید:", reply_markup=create_watermark_position_keyboard())
+        await safe_edit_callback_message_text(q, "Watermark position را انتخاب کنید:", reply_markup=create_watermark_position_keyboard())
     elif q.data.startswith("admin:market_positions:"):
         kind = q.data.rsplit(":", 1)[1]
         if kind not in {"watermark", "price", "branding"}: return
-        await q.edit_message_text("Position را انتخاب کنید:", reply_markup=create_market_position_keyboard(kind))
+        await safe_edit_callback_message_text(q, "Position را انتخاب کنید:", reply_markup=create_market_position_keyboard(kind))
     elif q.data.startswith("admin:market_position_preview:"):
         parts = q.data.split(":")
         if len(parts) == 4:
@@ -2038,7 +2118,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_photo(chat_id=uid, photo=BytesIO(image_bytes), caption=f"Preview: {kind} / {WATERMARK_POSITIONS[pos]}")
         except Exception as exc:
             logging.warning("market_position_preview_failed reason=%s", exc)
-        await q.edit_message_text("این موقعیت ذخیره شود؟", reply_markup=create_market_confirm_keyboard(f"admin:market_position_apply:{kind}:{pos}", f"admin:market_positions:{kind}"))
+        await safe_edit_callback_message_text(q, "این موقعیت ذخیره شود؟", reply_markup=create_market_confirm_keyboard(f"admin:market_position_apply:{kind}:{pos}", f"admin:market_positions:{kind}"))
     elif q.data.startswith("admin:market_position_apply:"):
         parts = q.data.split(":")
         if len(parts) == 4:
@@ -2051,9 +2131,9 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         branding[field_map[kind]] = pos
         data.setdefault("market", {})["card"] = branding
         save_data(data)
-        await q.edit_message_text("✅ Position ذخیره شد.", reply_markup=create_position_settings_keyboard())
+        await safe_edit_callback_message_text(q, "✅ Position ذخیره شد.", reply_markup=create_position_settings_keyboard())
     elif q.data=="admin:market_theme_select":
-        await q.edit_message_text("Theme را انتخاب کنید:", reply_markup=create_market_theme_select_keyboard())
+        await safe_edit_callback_message_text(q, "Theme را انتخاب کنید:", reply_markup=create_market_theme_select_keyboard())
     elif q.data.startswith("admin:market_theme_preview:"):
         theme_key = q.data.rsplit(":", 1)[1]
         if theme_key not in CARD_THEMES: return
@@ -2065,7 +2145,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_photo(chat_id=uid, photo=BytesIO(image_bytes), caption=f"Preview: {theme['label']}")
         except Exception as exc:
             logging.warning("market_theme_preview_failed reason=%s", exc)
-        await q.edit_message_text("این theme اعمال شود؟", reply_markup=create_market_confirm_keyboard(f"admin:market_theme_apply:{theme_key}", "admin:market_theme_select"))
+        await safe_edit_callback_message_text(q, "این theme اعمال شود؟", reply_markup=create_market_confirm_keyboard(f"admin:market_theme_apply:{theme_key}", "admin:market_theme_select"))
     elif q.data.startswith("admin:market_theme_apply:"):
         theme_key = q.data.rsplit(":", 1)[1]
         if theme_key not in CARD_THEMES: return
@@ -2074,9 +2154,9 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         branding.update({"card_theme": theme_key, "card_primary_color": theme["primary"], "card_secondary_color": theme["secondary"], "card_dark_mode": bool(theme["dark"])})
         data.setdefault("market", {})["card"] = branding
         save_data(data)
-        await q.edit_message_text("✅ Theme اعمال شد.", reply_markup=create_market_theme_keyboard(data))
+        await safe_edit_callback_message_text(q, "✅ Theme اعمال شد.", reply_markup=create_market_theme_keyboard(data))
     elif q.data=="admin:market_palette_select":
-        await q.edit_message_text("Color palette را انتخاب کنید:", reply_markup=create_market_palette_keyboard())
+        await safe_edit_callback_message_text(q, "Color palette را انتخاب کنید:", reply_markup=create_market_palette_keyboard())
     elif q.data.startswith("admin:market_palette_preview:"):
         palette_key = q.data.rsplit(":", 1)[1]
         if palette_key not in COLOR_PALETTES: return
@@ -2088,7 +2168,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_photo(chat_id=uid, photo=BytesIO(image_bytes), caption=f"Preview: {palette['label']}")
         except Exception as exc:
             logging.warning("market_palette_preview_failed reason=%s", exc)
-        await q.edit_message_text("این palette اعمال شود؟", reply_markup=create_market_confirm_keyboard(f"admin:market_palette_apply:{palette_key}", "admin:market_palette_select"))
+        await safe_edit_callback_message_text(q, "این palette اعمال شود؟", reply_markup=create_market_confirm_keyboard(f"admin:market_palette_apply:{palette_key}", "admin:market_palette_select"))
     elif q.data.startswith("admin:market_palette_apply:"):
         palette_key = q.data.rsplit(":", 1)[1]
         if palette_key not in COLOR_PALETTES: return
@@ -2098,33 +2178,33 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         branding["card_secondary_color"] = palette["secondary"]
         data.setdefault("market", {})["card"] = branding
         save_data(data)
-        await q.edit_message_text("✅ Palette اعمال شد.", reply_markup=create_market_theme_keyboard(data))
+        await safe_edit_callback_message_text(q, "✅ Palette اعمال شد.", reply_markup=create_market_theme_keyboard(data))
     elif q.data=="admin:market_card_style_toggle":
         branding = merge_branding_settings(data)
         branding["card_style"] = "advanced" if branding.get("card_style") != "advanced" else "classic"
         data.setdefault("market", {})["card"] = branding
         save_data(data)
-        await q.edit_message_text("✅ نوع کارت تغییر کرد. برای دیدن نتیجه Preview بگیرید.", reply_markup=create_market_branding_keyboard(data))
+        await safe_edit_callback_message_text(q, "✅ نوع کارت تغییر کرد. برای دیدن نتیجه Preview بگیرید.", reply_markup=create_market_branding_keyboard(data))
     elif q.data=="admin:market_opacity_menu":
         STATE.flow, STATE.step, STATE.admin_id, STATE.message_id, STATE.pending_key = "market_card_cfg", "waiting_number", uid, q.message.message_id, "text_opacity"
-        await q.edit_message_text("Opacity متن میزان شفافیت نوشته‌های روی کارت است؛ عدد 255 کاملاً پررنگ و 40 خیلی کم‌رنگ است. مقدار 40 تا 255 را ارسال کنید و بعد Preview بگیرید.", reply_markup=build_back_kb("admin:market_branding"))
+        await safe_edit_callback_message_text(q, "Opacity متن میزان شفافیت نوشته‌های روی کارت است؛ عدد 255 کاملاً پررنگ و 40 خیلی کم‌رنگ است. مقدار 40 تا 255 را ارسال کنید و بعد Preview بگیرید.", reply_markup=build_back_kb("admin:market_branding"))
     elif q.data=="admin:market_logo_remove":
         branding = merge_branding_settings(data)
         branding["logo_enabled"] = False
         branding["logo_path"] = ""
         data.setdefault("market", {})["card"] = branding
         save_data(data)
-        await q.edit_message_text("✅ لوگو حذف/غیرفعال شد.", reply_markup=create_market_branding_keyboard(data))
+        await safe_edit_callback_message_text(q, "✅ لوگو حذف/غیرفعال شد.", reply_markup=create_market_branding_keyboard(data))
     elif q.data=="admin:market_card_preview":
         branding = merge_branding_settings(data)
         sample = "<b>🔺 قیمت TRX</b>\n<blockquote>💰 <b>جزئیات قیمت</b>\n💵 دلاری: <b>$0.3456</b>\n🇮🇷 تومانی: <b>59,042</b>\n</blockquote>\n<blockquote>📊 <b>تغییرات روزانه</b>\n🟢 رشد: <b>0.20%</b></blockquote>\n🕘 <code>1405/03/10 | 06:28:42</code>"
         try:
             image_bytes = await asyncio.to_thread(render_market_card, sample, branding)
             await context.bot.send_photo(chat_id=uid, photo=BytesIO(image_bytes), caption="Market Card Preview")
-            await q.edit_message_text("✅ پیش‌نمایش کارت ارسال شد.", reply_markup=create_market_root_keyboard(data))
+            await safe_edit_callback_message_text(q, "✅ پیش‌نمایش کارت ارسال شد.", reply_markup=create_market_root_keyboard(data))
         except Exception as exc:
             logging.warning("market_card_preview_failed reason=%s", exc)
-            await q.edit_message_text(f"❌ ساخت کارت ناموفق بود: {exc}", reply_markup=create_market_root_keyboard(data))
+            await safe_edit_callback_message_text(q, f"❌ ساخت کارت ناموفق بود: {exc}", reply_markup=create_market_root_keyboard(data))
     elif q.data.startswith("admin:market_card_bool:"):
         field = q.data.rsplit(":", 1)[1]
         branding = merge_branding_settings(data)
@@ -2133,25 +2213,25 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data.setdefault("market", {})["card"] = branding
             save_data(data)
         kb = create_market_theme_keyboard(data) if field == "card_dark_mode" else create_market_fonts_keyboard(data) if field in {"persian_bold", "english_bold"} else create_market_branding_keyboard(data)
-        await q.edit_message_text("🎨 Market Card Settings", reply_markup=kb)
+        await safe_edit_callback_message_text(q, "🎨 Market Card Settings", reply_markup=kb)
     elif q.data=="admin:market_card_logo_upload":
         STATE.flow, STATE.step, STATE.admin_id, STATE.message_id, STATE.pending_key = "market_card_cfg", "waiting_logo", uid, q.message.message_id, "logo_path"
-        await q.edit_message_text("لوگوی کارت را به صورت photo یا فایل تصویر ارسال کنید.", reply_markup=build_back_kb("admin:market_branding"))
+        await safe_edit_callback_message_text(q, "لوگوی کارت را به صورت photo یا فایل تصویر ارسال کنید.", reply_markup=build_back_kb("admin:market_branding"))
     elif q.data.startswith("admin:market_card_text:"):
         field = q.data.rsplit(":", 1)[1]
         if field not in {"branding_text", "branding_channel_id", "watermark_text", "watermark_position", "card_theme", "card_primary_color", "card_secondary_color", "manual_colors"}: return
         STATE.flow, STATE.step, STATE.admin_id, STATE.message_id, STATE.pending_key = "market_card_cfg", "waiting_text", uid, q.message.message_id, field
-        await q.edit_message_text(f"مقدار جدید برای {field} را ارسال کنید.", reply_markup=build_back_kb("admin:market_branding"))
+        await safe_edit_callback_message_text(q, f"مقدار جدید برای {field} را ارسال کنید.", reply_markup=build_back_kb("admin:market_branding"))
     elif q.data.startswith("admin:market_card_number:"):
         field = q.data.rsplit(":", 1)[1]
         if field not in {"text_opacity"}: return
         STATE.flow, STATE.step, STATE.admin_id, STATE.message_id, STATE.pending_key = "market_card_cfg", "waiting_number", uid, q.message.message_id, field
-        await q.edit_message_text(f"عدد جدید برای {field} را ارسال کنید. مثال: 220", reply_markup=build_back_kb("admin:market_branding"))
+        await safe_edit_callback_message_text(q, f"عدد جدید برای {field} را ارسال کنید. مثال: 220", reply_markup=build_back_kb("admin:market_branding"))
     elif q.data.startswith("admin:market_edit:"):
         field = q.data.rsplit(":", 1)[1]
         if field not in {"stars_unit_amount", "stars_unit_usd", "stars_manual_override_usd", "cache_ttl_seconds", "stale_ttl_seconds"}: return
         STATE.flow, STATE.step, STATE.admin_id, STATE.message_id, STATE.pending_key = "market_cfg", "waiting_number", uid, q.message.message_id, field
-        await q.edit_message_text(f"مقدار عددی جدید برای {field} را ارسال کنید.", reply_markup=build_back_kb("admin:market_root"))
+        await safe_edit_callback_message_text(q, f"مقدار عددی جدید برای {field} را ارسال کنید.", reply_markup=build_back_kb("admin:market_root"))
     elif q.data.startswith("admin:market_bool:"):
         field = q.data.rsplit(":", 1)[1]
         settings = merge_market_settings(data)
@@ -2159,7 +2239,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             settings[field] = not settings.get(field, False)
             data["market"] = settings
             save_data(data)
-        await q.edit_message_text("⭐ Stars Rate Settings", reply_markup=create_market_stars_keyboard(data))
+        await safe_edit_callback_message_text(q, "⭐ Stars Rate Settings", reply_markup=create_market_stars_keyboard(data))
     elif q.data.startswith("admin:market_clear:"):
         field = q.data.rsplit(":", 1)[1]
         settings = merge_market_settings(data)
@@ -2167,10 +2247,10 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             settings[field] = None
             data["market"] = settings
             save_data(data)
-        await q.edit_message_text("⭐ Stars Rate Settings", reply_markup=create_market_stars_keyboard(data))
+        await safe_edit_callback_message_text(q, "⭐ Stars Rate Settings", reply_markup=create_market_stars_keyboard(data))
     elif q.data=="admin:welcome_cfg":
         STATE.flow,STATE.step,STATE.admin_id,STATE.message_id,STATE.pending_key="welcome_cfg","waiting_value",uid,q.message.message_id,"welcome_text"
-        await q.edit_message_text(f"📝 حالت ویرایش Welcome فعال شد.\n\n✅ همین حالا متن جدید ولکام را در پیام بعدی ارسال کنید.\n\nمتن فعلی:\n{render_html_text(data.get('welcome_text','') or '(خالی)')}", parse_mode=ParseMode.HTML, reply_markup=build_back_kb("menu:admin"))
+        await safe_edit_callback_message_text(q, f"📝 حالت ویرایش Welcome فعال شد.\n\n✅ همین حالا متن جدید ولکام را در پیام بعدی ارسال کنید.\n\nمتن فعلی:\n{render_html_text(data.get('welcome_text','') or '(خالی)')}", parse_mode=ParseMode.HTML, reply_markup=build_back_kb("menu:admin"))
     elif q.data=="admin:report" or q.data.startswith("admin:report_page:"):
         page = 0
         if q.data.startswith("admin:report_page:"):
@@ -2179,15 +2259,15 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 page = 0
         rep, kb = build_users_report(page)
-        await q.edit_message_text(rep, parse_mode=ParseMode.HTML, reply_markup=kb)
-    elif q.data=="admin:broadcast_help": await q.edit_message_text("برای برودکست از دستور /broadcast <متن> استفاده کنید.", reply_markup=build_back_kb("menu:admin"))
+        await safe_edit_callback_message_text(q, rep, parse_mode=ParseMode.HTML, reply_markup=kb)
+    elif q.data=="admin:broadcast_help": await safe_edit_callback_message_text(q, "برای برودکست از دستور /broadcast <متن> استفاده کنید.", reply_markup=build_back_kb("menu:admin"))
     elif q.data=="admin:feedback_list":
         rows=db.list_feedbacks(100)
         out="📝 همه بازخوردها:\n\n" + ("\n\n".join([f"• {r['full_name'] or '-'} (@{r['username'] or '-'})\n  پیام: {r['message']}" for r in rows]) if rows else "موردی ثبت نشده است.")
-        await q.edit_message_text(out, reply_markup=build_back_kb("menu:admin"))
+        await safe_edit_callback_message_text(q, out, reply_markup=build_back_kb("menu:admin"))
     elif q.data.startswith("feedback:view:"):
         vid=q.data.split(":",2)[2]; msg=db.get_json(f"feedback_last:{vid}","(یافت نشد)")
-        await q.edit_message_text(f"متن پیام بازخورد:\n{msg}", reply_markup=build_back_kb("menu:admin"))
+        await safe_edit_callback_message_text(q, f"متن پیام بازخورد:\n{msg}", reply_markup=build_back_kb("menu:admin"))
 
 
 
@@ -2307,7 +2387,7 @@ async def business_message_handler(update: Update, context: ContextTypes.DEFAULT
                 edit_kwargs = {"chat_id": bm.chat.id, "message_id": bm.message_id, "text": out_self, "parse_mode": ParseMode.HTML}
                 if bc:
                     edit_kwargs["business_connection_id"] = bc
-                await context.bot.edit_message_text(**edit_kwargs)
+                await safe_bot_edit_message_text(context.bot, **edit_kwargs)
                 logging.info("business_admin_shortcut_edit_ok uid=%s msg_id=%s", uid, bm.message_id)
                 return
             except Exception as exc:
@@ -2366,9 +2446,10 @@ async def begin_db_import() -> list[asyncio.Task]:
     global DB_IMPORT_IN_PROGRESS
     current = asyncio.current_task()
     cond = _db_import_condition()
-    DB_IMPORT_IN_PROGRESS = True
     deadline = time.monotonic() + DB_IMPORT_DRAIN_TIMEOUT_SECONDS
     async with cond:
+        DB_IMPORT_IN_PROGRESS = True
+        cond.notify_all()
         while True:
             pending = [task for task in ACTIVE_UPDATE_TASKS if task is not current and not task.done()]
             if not pending:
@@ -2406,16 +2487,17 @@ async def stop_market_background_tasks(context: ContextTypes.DEFAULT_TYPE) -> No
     if MARKET_REFRESH_TASK and not MARKET_REFRESH_TASK.done():
         tasks.append(MARKET_REFRESH_TASK)
     if tasks:
+        for task in tasks:
+            task.cancel()
         done, pending = await asyncio.wait(tasks, timeout=BACKGROUND_TASK_SHUTDOWN_TIMEOUT_SECONDS)
         for task in done:
             with contextlib.suppress(asyncio.CancelledError):
                 exc = task.exception()
                 if exc:
                     logging.warning("market_background_shutdown_error reason=%s", exc)
-        for task in pending:
-            task.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
+    await MARKET_SERVICE.wait_until_quiescent(BACKGROUND_TASK_SHUTDOWN_TIMEOUT_SECONDS)
     MARKET_REFRESH_TASK = None
 
 
@@ -2425,6 +2507,8 @@ def reset_runtime_state_after_db_import() -> None:
     STATE.flow = STATE.step = STATE.pending_key = None
     STATE.admin_id = STATE.message_id = None
     STATE.temp_shortcuts = None
+    CALLBACK_EXECUTION_IDS.clear()
+    EDIT_MESSAGE_LOCKS.clear()
 
 
 def gate_update_handler(handler):
@@ -2596,7 +2680,7 @@ async def _all_messages_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 tg_file = await update.message.document.get_file()
                 suffix = Path(update.message.document.file_name or "logo.png").suffix or ".png"
             if not tg_file:
-                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="لطفاً فقط تصویر ارسال کنید.", reply_markup=build_back_kb("admin:market_branding")); return
+                await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text="لطفاً فقط تصویر ارسال کنید.", reply_markup=build_back_kb("admin:market_branding")); return
             logo_dir = BASE_DIR / "assets" / "market"
             logo_dir.mkdir(parents=True, exist_ok=True)
             logo_path = logo_dir / f"card_logo{suffix}"
@@ -2606,21 +2690,21 @@ async def _all_messages_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
             data.setdefault("market", {})["card"] = branding
             save_data(data)
             STATE.flow = STATE.step = STATE.pending_key = None
-            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="✅ لوگوی کارت ذخیره و فعال شد.", reply_markup=create_market_branding_keyboard(data)); return
+            await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text="✅ لوگوی کارت ذخیره و فعال شد.", reply_markup=create_market_branding_keyboard(data)); return
         if STATE.step=="waiting_text":
             value = txt.strip()
             if field == "manual_colors":
                 parts = [x.strip() for x in re.split(r"[,،\s]+", value) if x.strip()]
                 if len(parts) < 2 or not all(re.fullmatch(r"#?[0-9a-fA-F]{6}", x) for x in parts[:2]):
-                    await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="دو رنگ معتبر ارسال کنید. نمونه: #2336ff #8a2be2", reply_markup=build_back_kb("admin:market_theme")); return
+                    await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text="دو رنگ معتبر ارسال کنید. نمونه: #2336ff #8a2be2", reply_markup=build_back_kb("admin:market_theme")); return
                 branding["card_primary_color"] = parts[0] if parts[0].startswith("#") else f"#{parts[0]}"
                 branding["card_secondary_color"] = parts[1] if parts[1].startswith("#") else f"#{parts[1]}"
                 data.setdefault("market", {})["card"] = branding
                 save_data(data)
                 STATE.flow = STATE.step = STATE.pending_key = None
-                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="✅ رنگ‌های دستی ذخیره شد. برای مشاهده Preview بگیرید.", reply_markup=create_market_theme_keyboard(data)); return
+                await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text="✅ رنگ‌های دستی ذخیره شد. برای مشاهده Preview بگیرید.", reply_markup=create_market_theme_keyboard(data)); return
             if field in {"card_primary_color", "card_secondary_color"} and not re.fullmatch(r"#?[0-9a-fA-F]{6}", value):
-                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="رنگ نامعتبر است. نمونه: #2336ff", reply_markup=build_back_kb("admin:market_theme")); return
+                await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text="رنگ نامعتبر است. نمونه: #2336ff", reply_markup=build_back_kb("admin:market_theme")); return
             if field in {"card_primary_color", "card_secondary_color"} and not value.startswith("#"):
                 value = f"#{value}"
             if field == "branding_channel_id":
@@ -2628,7 +2712,7 @@ async def _all_messages_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     if value and int(value) >= 0:
                         raise ValueError()
                 except Exception:
-                    await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="Channel ID نامعتبر است. نمونه معتبر: -1001234567890", reply_markup=build_back_kb("admin:market_branding")); return
+                    await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text="Channel ID نامعتبر است. نمونه معتبر: -1001234567890", reply_markup=build_back_kb("admin:market_branding")); return
                 if value:
                     try:
                         me = await context.bot.get_chat_member(int(value), context.bot.id)
@@ -2641,25 +2725,25 @@ async def _all_messages_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
             else:
                 feedback = f"✅ {field} بروزرسانی شد."
             if field in {"watermark_position", "branding_position", "price_position"} and value not in WATERMARK_POSITIONS:
-                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="از دکمه‌های Position استفاده کنید.", reply_markup=create_position_settings_keyboard()); return
+                await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text="از دکمه‌های Position استفاده کنید.", reply_markup=create_position_settings_keyboard()); return
             branding[field] = value[:256]
             data.setdefault("market", {})["card"] = branding
             save_data(data)
             STATE.flow = STATE.step = STATE.pending_key = None
             kb = create_market_theme_keyboard(data) if field.startswith("card_") else create_market_branding_keyboard(data)
-            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=feedback, reply_markup=kb); return
+            await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text=feedback, reply_markup=kb); return
         if STATE.step=="waiting_number":
             try:
                 value = int(float(txt.strip()))
             except Exception:
-                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="عدد نامعتبر است.", reply_markup=build_back_kb("admin:market_branding")); return
+                await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text="عدد نامعتبر است.", reply_markup=build_back_kb("admin:market_branding")); return
             if field == "text_opacity" and not 40 <= value <= 255:
-                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="opacity باید بین 40 و 255 باشد.", reply_markup=build_back_kb("admin:market_branding")); return
+                await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text="opacity باید بین 40 و 255 باشد.", reply_markup=build_back_kb("admin:market_branding")); return
             branding[field] = value
             data.setdefault("market", {})["card"] = branding
             save_data(data)
             STATE.flow = STATE.step = STATE.pending_key = None
-            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"✅ {field} بروزرسانی شد: {value}", reply_markup=create_market_branding_keyboard(data)); return
+            await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"✅ {field} بروزرسانی شد: {value}", reply_markup=create_market_branding_keyboard(data)); return
 
     if STATE.admin_id==uid and STATE.flow=="market_cfg" and can_edit_flow(uid):
         settings = merge_market_settings(data)
@@ -2669,27 +2753,27 @@ async def _all_messages_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
             api_key = txt.strip()
             if not env_key:
                 STATE.flow = STATE.step = STATE.pending_key = None
-                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="Provider نامعتبر است.", reply_markup=create_market_api_keyboard(data)); return
+                await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text="Provider نامعتبر است.", reply_markup=create_market_api_keyboard(data)); return
             result = await asyncio.to_thread(validate_market_api_key, provider, api_key, settings.get("request_timeout_seconds", 8))
             if result.get("ok"):
                 set_env_value(env_key, api_key)
                 STATE.flow = STATE.step = STATE.pending_key = None
-                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="✅ کلید معتبر بود و در .env ذخیره شد.\n" + result.get("message", ""), reply_markup=create_market_api_keyboard(data)); return
-            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="❌ کلید ذخیره نشد؛ اعتبارسنجی واقعی ناموفق بود.\n" + result.get("message", ""), reply_markup=build_back_kb("admin:market_api")); return
+                await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text="✅ کلید معتبر بود و در .env ذخیره شد.\n" + result.get("message", ""), reply_markup=create_market_api_keyboard(data)); return
+            await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text="❌ کلید ذخیره نشد؛ اعتبارسنجی واقعی ناموفق بود.\n" + result.get("message", ""), reply_markup=build_back_kb("admin:market_api")); return
         if STATE.step=="waiting_number":
             field = STATE.pending_key or ""
             try:
                 value = float(txt.replace(",", "").strip())
             except Exception:
-                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="عدد نامعتبر است. دوباره مقدار عددی ارسال کنید.", reply_markup=build_back_kb("admin:market_root")); return
+                await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text="عدد نامعتبر است. دوباره مقدار عددی ارسال کنید.", reply_markup=build_back_kb("admin:market_root")); return
             if field in {"cache_ttl_seconds", "stale_ttl_seconds"}:
                 value = int(value)
             if field == "cache_ttl_seconds" and not 30 <= int(value) <= 3600:
-                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="TTL باید بین 30 و 3600 ثانیه باشد.", reply_markup=build_back_kb("admin:market_cache")); return
+                await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text="TTL باید بین 30 و 3600 ثانیه باشد.", reply_markup=build_back_kb("admin:market_cache")); return
             if field == "stale_ttl_seconds" and not 30 <= int(value) <= 86400:
-                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="Stale fallback باید بین 30 و 86400 ثانیه باشد.", reply_markup=build_back_kb("admin:market_cache")); return
+                await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text="Stale fallback باید بین 30 و 86400 ثانیه باشد.", reply_markup=build_back_kb("admin:market_cache")); return
             if field in {"stars_unit_amount", "stars_unit_usd", "stars_manual_override_usd"} and value < 0:
-                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="مقدار نمی‌تواند منفی باشد.", reply_markup=build_back_kb("admin:market_stars")); return
+                await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text="مقدار نمی‌تواند منفی باشد.", reply_markup=build_back_kb("admin:market_stars")); return
             settings[field] = value
             data["market"] = settings
             save_data(data)
@@ -2700,7 +2784,7 @@ async def _all_messages_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 unit = max(float(settings.get("stars_unit_amount") or 1000), 1.0)
                 effective = float(settings.get("stars_manual_override_usd") or settings.get("stars_unit_usd") or 0) / unit
                 suffix = f"\nPreview: 2000 Stars ≈ {effective * 2000:.4f} USD"
-            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"✅ {field} بروزرسانی شد: {value}{suffix}", reply_markup=kb); return
+            await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"✅ {field} بروزرسانی شد: {value}{suffix}", reply_markup=kb); return
         if STATE.step=="waiting_quick_assets":
             raw_items = [x.strip() for x in re.split(r"[,،\s]+", txt) if x.strip()]
             normalized = normalize_asset_list(raw_items, settings.get("quick_assets", []))
@@ -2708,14 +2792,14 @@ async def _all_messages_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
             data["market"] = settings
             save_data(data)
             STATE.flow = STATE.step = STATE.pending_key = None
-            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="✅ Quick Assets بروزرسانی شد:\n" + ", ".join(normalized), reply_markup=create_market_root_keyboard(data)); return
+            await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text="✅ Quick Assets بروزرسانی شد:\n" + ", ".join(normalized), reply_markup=create_market_root_keyboard(data)); return
 
     if STATE.admin_id==uid and STATE.flow=="text_edit" and STATE.step=="waiting_value" and STATE.pending_key and can_edit_flow(uid):
         key=STATE.pending_key; old=data.get(key,""); data[key]=src_txt; save_data(data); STATE.flow=STATE.step=STATE.pending_key=None
         preview = f"ذخیره شد.\nمتن قبلی:\n{render_html_text(old or '(خالی)')}\n\nمتن جدید:\n{render_html_text(src_txt)}"
-        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=preview, parse_mode=ParseMode.HTML, reply_markup=create_texts_keyboard()); return
+        await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text=preview, parse_mode=ParseMode.HTML, reply_markup=create_texts_keyboard()); return
     if STATE.admin_id==uid and STATE.flow=="shortcut_cfg" and can_edit_flow(uid):
-        if STATE.step=="waiting_name": STATE.pending_key=txt; STATE.step="waiting_value"; await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"نام شورت‌کات: {txt}\nمتن شورت‌کات را وارد کنید:", reply_markup=build_back_kb("admin:shortcut_menu")); return
+        if STATE.step=="waiting_name": STATE.pending_key=txt; STATE.step="waiting_value"; await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"نام شورت‌کات: {txt}\nمتن شورت‌کات را وارد کنید:", reply_markup=build_back_kb("admin:shortcut_menu")); return
         if STATE.step=="waiting_value":
             key=(STATE.pending_key or "").strip()
             if key:
@@ -2724,39 +2808,39 @@ async def _all_messages_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 logging.info("shortcut_saved_single key=%s", key)
             STATE.step="confirm_continue"
             kb=InlineKeyboardMarkup([[create_success_button("ادامه","shortcut:continue_yes"),create_danger_button("پایان","shortcut:continue_no")]])
-            await context.bot.edit_message_text(chat_id=update.effective_chat.id,message_id=STATE.message_id,text="آیا ادامه می‌دهید؟",reply_markup=kb)
+            await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id,message_id=STATE.message_id,text="آیا ادامه می‌دهید؟",reply_markup=kb)
             return
     if STATE.admin_id==uid and STATE.flow=="shortcut_edit" and can_edit_flow(uid):
         old_key = (STATE.pending_key or "").strip()
         if not old_key:
             STATE.flow = STATE.step = STATE.pending_key = None
-            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="کلید قبلی یافت نشد. دوباره از منو وارد شوید.", reply_markup=create_shortcut_menu_keyboard()); return
+            await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text="کلید قبلی یافت نشد. دوباره از منو وارد شوید.", reply_markup=create_shortcut_menu_keyboard()); return
         sc = db.load_shortcuts()
         if STATE.step=="waiting_new_key":
             new_key = txt.strip()
             if not new_key:
-                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="کلید جدید خالی است. دوباره وارد کنید.", reply_markup=build_back_kb("admin:shortcut_menu")); return
+                await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text="کلید جدید خالی است. دوباره وارد کنید.", reply_markup=build_back_kb("admin:shortcut_menu")); return
             if old_key not in sc:
                 STATE.flow = STATE.step = STATE.pending_key = None
-                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="شورت‌کات قبلی پیدا نشد.", reply_markup=create_shortcut_menu_keyboard()); return
+                await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text="شورت‌کات قبلی پیدا نشد.", reply_markup=create_shortcut_menu_keyboard()); return
             if new_key != old_key and new_key in sc:
-                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="این کلید قبلاً وجود دارد. کلید دیگری بفرستید.", reply_markup=build_back_kb("admin:shortcut_menu")); return
+                await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text="این کلید قبلاً وجود دارد. کلید دیگری بفرستید.", reply_markup=build_back_kb("admin:shortcut_menu")); return
             val = sc[old_key]
             db.delete_shortcut(old_key)
             db.save_shortcuts({new_key: val})
             STATE.flow = STATE.step = STATE.pending_key = None
-            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"کلید شورت‌کات تغییر کرد:\n{old_key} -> {new_key}", reply_markup=create_shortcut_menu_keyboard()); return
+            await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"کلید شورت‌کات تغییر کرد:\n{old_key} -> {new_key}", reply_markup=create_shortcut_menu_keyboard()); return
         if STATE.step=="waiting_new_value":
             if old_key not in sc:
                 STATE.flow = STATE.step = STATE.pending_key = None
-                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="شورت‌کات پیدا نشد.", reply_markup=create_shortcut_menu_keyboard()); return
+                await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text="شورت‌کات پیدا نشد.", reply_markup=create_shortcut_menu_keyboard()); return
             db.save_shortcuts({old_key: src_txt})
             STATE.flow = STATE.step = STATE.pending_key = None
-            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="متن شورت‌کات بروزرسانی شد.", reply_markup=create_shortcut_menu_keyboard()); return
+            await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text="متن شورت‌کات بروزرسانی شد.", reply_markup=create_shortcut_menu_keyboard()); return
     if STATE.admin_id==uid and STATE.flow=="welcome_cfg" and STATE.step=="waiting_value" and can_edit_flow(uid):
         old=data.get("welcome_text",""); data["welcome_text"]=src_txt; save_data(data); STATE.flow=STATE.step=None
         preview = f"✅ Welcome بروزرسانی شد و از همین دیتابیس خوانده می‌شود.\n\nقبلی:\n{render_html_text(old or '(خالی)')}\n\nجدید:\n{render_html_text(src_txt)}"
-        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=preview, parse_mode=ParseMode.HTML, reply_markup=create_admin_keyboard(data)); return
+        await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text=preview, parse_mode=ParseMode.HTML, reply_markup=create_admin_keyboard(data)); return
     if STATE.admin_id==uid and STATE.flow=="watch_cfg" and can_edit_flow(uid):
         if STATE.step=="waiting_channel_id":
             raw = txt.strip()
@@ -2765,7 +2849,7 @@ async def _all_messages_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 if cid >= 0:
                     raise ValueError()
             except Exception:
-                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text="فرمت نامعتبر است. نمونه: -1001234567890", reply_markup=build_back_kb("admin:shortcut_menu"))
+                await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text="فرمت نامعتبر است. نمونه: -1001234567890", reply_markup=build_back_kb("admin:shortcut_menu"))
                 return
             db.set_watch("watch_report_chat_id", cid)
             STATE.flow = STATE.step = None
@@ -2778,20 +2862,20 @@ async def _all_messages_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 await context.bot.send_message(chat_id=cid, text=f"✅ اتصال ربات به چنل گزارشات موفق بود.\nUTC: {utc_now.strftime('%Y-%m-%d %H:%M:%S')}\nAsia/Tehran: {tehran_now.strftime('%Y-%m-%d %H:%M:%S')}")
             except Exception as exc:
                 test_ok = f"failed: {exc}"
-            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"چنل گزارشات ذخیره شد: {cid}\nوضعیت دسترسی ربات: {test_ok}", reply_markup=create_shortcut_menu_keyboard()); return
+            await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"چنل گزارشات ذخیره شد: {cid}\nوضعیت دسترسی ربات: {test_ok}", reply_markup=create_shortcut_menu_keyboard()); return
         if STATE.step=="waiting_keywords_add":
             old = db.get_watch("watch_keywords", [])
             merged = list(dict.fromkeys(old + parse_keyword_csv(txt)))
             db.set_watch("watch_keywords", merged)
             STATE.flow = STATE.step = None
-            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"کلمات ذخیره شدند.\n{', '.join(merged) if merged else '-'}", reply_markup=create_shortcut_menu_keyboard()); return
+            await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"کلمات ذخیره شدند.\n{', '.join(merged) if merged else '-'}", reply_markup=create_shortcut_menu_keyboard()); return
         if STATE.step=="waiting_keywords_remove":
             old = db.get_watch("watch_keywords", [])
             remove_set = {x.lower() for x in parse_keyword_csv(txt)}
             left = [x for x in old if str(x).lower() not in remove_set]
             db.set_watch("watch_keywords", left)
             STATE.flow = STATE.step = None
-            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"حذف انجام شد.\nباقی‌مانده: {', '.join(left) if left else '-'}", reply_markup=create_shortcut_menu_keyboard()); return
+            await safe_bot_edit_message_text(context.bot, chat_id=update.effective_chat.id, message_id=STATE.message_id, text=f"حذف انجام شد.\nباقی‌مانده: {', '.join(left) if left else '-'}", reply_markup=create_shortcut_menu_keyboard()); return
 
     if not data.get("active", False) and not is_admin(uid, data):
         return

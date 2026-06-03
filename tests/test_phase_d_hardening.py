@@ -1,3 +1,4 @@
+import asyncio
 import os
 import sqlite3
 import tempfile
@@ -64,12 +65,15 @@ class DummyCallbackMessage:
 
 
 class DummyCallbackQuery:
-    def __init__(self, uid, data, message=None):
+    _seq = 0
+
+    def __init__(self, uid, data, message=None, query_id=None):
+        DummyCallbackQuery._seq += 1
         self.from_user = SimpleNamespace(id=uid, username=f"u{uid}", full_name=f"User {uid}", first_name="User")
         self.data = data
         self.message = message or DummyCallbackMessage()
         self.answers = []
-        self.id = "query-id"
+        self.id = query_id or f"query-id-{DummyCallbackQuery._seq}"
 
     async def answer(self, text=None, show_alert=False):
         self.answers.append((text, show_alert))
@@ -207,11 +211,15 @@ class PhaseDCallbackRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.button_id = bot.db.add_menu_button(menu_id, "tariff", "just_text", "payload")
         self.data = {**bot.get_default_data(), "admin_id": 42, "active": True, "inline_menu_enabled": True}
         bot.load_data = lambda: self.data
+        bot.CALLBACK_EXECUTION_IDS.clear()
+        bot.EDIT_MESSAGE_LOCKS.clear()
 
     def tearDown(self):
         bot.db = self.old_db
         bot.load_data = self.old_load_data
         bot.BUSINESS_OWNER_CACHE.clear()
+        bot.CALLBACK_EXECUTION_IDS.clear()
+        bot.EDIT_MESSAGE_LOCKS.clear()
         self.tmp.cleanup()
 
     async def test_admin_inline_menu_button_bypasses_ban_and_disabled_engine(self):
@@ -244,7 +252,7 @@ class PhaseDCallbackRuntimeTests(unittest.IsolatedAsyncioTestCase):
         sends = [item for item in context.bot.sent if "edit" not in item]
         edits = [item for item in context.bot.sent if "edit" in item]
         self.assertEqual(len(sends), 1)
-        self.assertEqual(len(edits), bot.CALLBACK_ALLOWED_INTERACTIONS - 1)
+        self.assertEqual(len(edits), 0)
         row = bot.db.get_user(101)
         self.assertEqual(int(row["spam_score"] or 0), 1)
 
@@ -272,6 +280,20 @@ class PhaseDCallbackRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(q.answers[-1], (None, False))
         self.assertEqual(context.bot.sent[0]["text"], "<b>payload</b>")
 
+
+    async def test_duplicate_callback_id_executes_only_once(self):
+        bot.db.upsert_user(101, "", "Customer", None, False, "test", "")
+        context = CallbackContext()
+        q1 = DummyCallbackQuery(101, f"im:btn:{self.button_id}", query_id="same-callback-id")
+        q2 = DummyCallbackQuery(101, f"im:btn:{self.button_id}", query_id="same-callback-id")
+
+        await bot.callbacks(SimpleNamespace(callback_query=q1), context)
+        await bot.callbacks(SimpleNamespace(callback_query=q2), context)
+
+        self.assertEqual(q1.answers[-1], (None, False))
+        self.assertEqual(q2.answers[-1], (None, False))
+        self.assertEqual(len([item for item in context.bot.sent if "edit" not in item]), 1)
+
     async def test_callback_retry_after_does_not_send_fallback_or_crash(self):
         bot.db.upsert_user(101, "", "Customer", None, False, "test", "")
         context = CallbackContext()
@@ -288,6 +310,50 @@ class PhaseDCallbackRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(q2.answers[-1], (None, False))
         self.assertEqual(len(context.bot.sent), sent_before)
+
+
+
+
+class DBImportGateTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        bot.DB_IMPORT_IN_PROGRESS = False
+        bot.ACTIVE_UPDATE_TASKS.clear()
+        bot.DB_IMPORT_CONDITION = None
+
+    async def asyncTearDown(self):
+        bot.DB_IMPORT_IN_PROGRESS = False
+        bot.ACTIVE_UPDATE_TASKS.clear()
+        if bot.DB_IMPORT_CONDITION is not None:
+            async with bot.DB_IMPORT_CONDITION:
+                bot.DB_IMPORT_CONDITION.notify_all()
+
+    async def test_begin_db_import_blocks_new_handlers_until_active_handlers_drain(self):
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def active_handler():
+            self.assertTrue(await bot.enter_update_handler())
+            entered.set()
+            try:
+                await release.wait()
+            finally:
+                await bot.leave_update_handler()
+
+        active_task = asyncio.create_task(active_handler())
+        await entered.wait()
+        begin_task = asyncio.create_task(bot.begin_db_import())
+        await asyncio.sleep(0)
+
+        self.assertTrue(bot.DB_IMPORT_IN_PROGRESS)
+        self.assertFalse(await bot.enter_update_handler())
+
+        release.set()
+        drained = await begin_task
+        self.assertEqual(drained, [])
+        await active_task
+        await bot.finish_db_import()
+        self.assertTrue(await bot.enter_update_handler())
+        await bot.leave_update_handler()
 
 
 class PhaseDWelcomeInteractionTests(unittest.TestCase):
@@ -386,6 +452,8 @@ class PhaseDBusinessAdminMenuTests(unittest.IsolatedAsyncioTestCase):
         bot.db.add_menu_button(1, "tariff", "just_text", "payload")
         self.data = {**bot.get_default_data(), "admin_id": 42, "active": True, "inline_menu_enabled": True}
         bot.load_data = lambda: self.data
+        bot.CALLBACK_EXECUTION_IDS.clear()
+        bot.EDIT_MESSAGE_LOCKS.clear()
 
         async def no_watch(*args, **kwargs):
             return None
