@@ -6,6 +6,7 @@ import html
 import json
 import logging
 import os
+import sys
 import re
 import sqlite3
 import time
@@ -32,6 +33,9 @@ from features.inline_actions import get_action_handler
 from features.inline_callback import callback_execution_key, normalize_for_dispatch, parse as parse_cb, is_valid_im_callback, normalize_callback_data
 from features.market_engine import MARKET_SERVICE, cache_status, market_help_text, merge_market_settings, normalize_asset_list, parse_market_intent, render_market_response, validate_market_api_key, get_market_snapshot
 from features.market_cards import COLOR_PALETTES, CARD_THEMES, ENGLISH_FONT_CHOICES, PERSIAN_FONT_CHOICES, WATERMARK_POSITIONS, clear_market_card_cache, merge_branding_settings, render_market_card
+
+if sys.prefix == sys.base_prefix:
+    raise RuntimeError("Must run inside virtual environment (.venv)")
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
