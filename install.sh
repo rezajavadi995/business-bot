@@ -6,7 +6,8 @@ set -Eeuo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
 PROJECT_NAME="business-bot"
-PROJECT_DIR="${PROJECT_DIR:-$PWD}"
+#PROJECT_DIR="${PROJECT_DIR:-$PWD}"
+PROJECT_DIR="/opt/business-bot"
 DEFAULT_REPO_URL="https://github.com/rezajavadi995/business-bot.git"
 VENV_DIR="${VENV_DIR:-$PROJECT_DIR/.venv}"
 ENV_FILE="${ENV_FILE:-$PROJECT_DIR/.env}"
