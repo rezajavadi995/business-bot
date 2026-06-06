@@ -1676,8 +1676,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_user: return
     data=load_data(); u=update.effective_user
     db.upsert_user(u.id,u.username or "",u.full_name or u.first_name or "",None,False,"start",update.message.text)
-    await send_formatted_message(update.message, f"سلام {u.first_name} 🌟\nبه ربات خوش آمدی. دکمه منو را بزن.", data)
-    await update.message.reply_text("menu", reply_markup=ReplyKeyboardMarkup([["menu"]], resize_keyboard=True))
+    await send_formatted_message(
+    update.message,
+    f"سلام {u.first_name} 🌟\n\n"
+    f"به سوپر ربات ما خوش اومدی\n"
+    f"جهت ادامه، روی یکی از دکمه های زیر کلیک کنید\n"
+    f"یا اگر دستور مد نظر خود را می‌دانید\n"
+    f"با / ارسال کنید",
+    data
+    )
+    
+    await update.message.reply_text(
+    "🛸",
+    reply_markup=ReplyKeyboardMarkup([["menu"]], resize_keyboard=True)
+    )
 
 async def panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_user: return
