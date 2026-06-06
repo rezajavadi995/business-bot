@@ -150,43 +150,91 @@ check_disk_space() {
   success "Disk space OK (${avail_mb}MB available)."
 }
 
+
 validate_repo_files() {
-  log "Validating repository files..."
-  if [[ ! -f "$REQUIREMENTS_FILE" || ! -f "$PROJECT_DIR/bot.py" ]]; then
-    warn "Repository looks incomplete at: $PROJECT_DIR"
+  log "Validating repository..."
 
-    local repo_url="${REPO_URL:-$DEFAULT_REPO_URL}"
-    local target_dir="$PROJECT_DIR"
-
-    if [[ "$PROJECT_DIR" == "/root" ]]; then
-      target_dir="/opt/business-bot"
-      log "Detected one-liner/root mode. Using install path: $target_dir"
-    fi
-
-    warn "Attempting automatic repo recreation from: $repo_url"
-    local tmp_clone
-    tmp_clone="$(mktemp -d)"
-    retry_command 3 5 git clone --depth 1 "$repo_url" "$tmp_clone"
-
-    [[ -f "$tmp_clone/bot.py" && -f "$tmp_clone/requirements.txt" ]] || error_exit "Cloned repository is incomplete."
-
-    if [[ "$target_dir" != "$PROJECT_DIR" ]]; then
-      PROJECT_DIR="$target_dir"
-      VENV_DIR="$PROJECT_DIR/.venv"
-      ENV_FILE="$PROJECT_DIR/.env"
-      REQUIREMENTS_FILE="$PROJECT_DIR/requirements.txt"
-    fi
-
-    rm -rf "$PROJECT_DIR"
-    mkdir -p "$PROJECT_DIR"
-    cp -a "$tmp_clone/." "$PROJECT_DIR/"
-    rm -rf "$tmp_clone"
-    success "Repository recreated successfully in $PROJECT_DIR."
+  if [[ ! -d "$PROJECT_DIR" ]]; then
+    error_exit "Repository missing"
   fi
 
-  [[ -s "$REQUIREMENTS_FILE" ]] || error_exit "requirements.txt exists but is empty."
-  success "Repository validation passed."
+  if [[ ! -f "$PROJECT_DIR/bot.py" ]]; then
+    error_exit "bot.py missing"
+  fi
+
+  if [[ ! -f "$PROJECT_DIR/requirements.txt" ]]; then
+    error_exit "requirements missing"
+  fi
+
+  if [[ ! -s "$PROJECT_DIR/requirements.txt" ]]; then
+    error_exit "requirements empty"
+  fi
+
+  success "Repo valid"
 }
+
+#validate_repo_files() {
+ # log "Validating repository files..."
+ # if [[ ! -f "$REQUIREMENTS_FILE" || ! -f "$PROJECT_DIR/bot.py" ]]; then
+ #   warn "Repository looks incomplete at: $PROJECT_DIR"
+
+   # local repo_url="${REPO_URL:-$DEFAULT_REPO_URL}"
+  #  local target_dir="$PROJECT_DIR"
+
+   # if [[ "$PROJECT_DIR" == "/root" ]]; then
+    #  target_dir="/opt/business-bot"
+    #  log "Detected one-liner/root mode. Using install path: $target_dir"
+   # fi
+
+   # warn "Attempting automatic repo recreation from: $repo_url"
+    #local tmp_clone
+    #tmp_clone="$(mktemp -d)"
+   # retry_command 3 5 git clone --depth 1 "$repo_url" "$tmp_clone"
+
+   # [[ -f "$tmp_clone/bot.py" && -f "$tmp_clone/requirements.txt" ]] || error_exit "Cloned repository is incomplete."
+
+    #if [[ "$target_dir" != "$PROJECT_DIR" ]]; then
+      #PROJECT_DIR="$target_dir"
+      #VENV_DIR="$PROJECT_DIR/.venv"
+      #ENV_FILE="$PROJECT_DIR/.env"
+      #REQUIREMENTS_FILE="$PROJECT_DIR/requirements.txt"
+    #fi
+    
+
+    #rm -rf "$PROJECT_DIR"
+    #mkdir -p "$PROJECT_DIR"
+    #cp -a "$tmp_clone/." "$PROJECT_DIR/"
+   # rm -rf "$tmp_clone"
+   # success "Repository recreated successfully in $PROJECT_DIR."
+  #fi
+
+ # [[ -s "$REQUIREMENTS_FILE" ]] || error_exit "requirements.txt exists but is empty."
+ # success "Repository validation passed."
+#}
+
+
+#new
+bootstrap_project() {
+  echo "[BOOTSTRAP] checking project..."
+
+  if [[ -d "$PROJECT_DIR/.git" && -f "$PROJECT_DIR/bot.py" ]]; then
+    echo "[BOOTSTRAP] valid repo exists → skip"
+    return
+  fi
+
+  rm -rf "$PROJECT_DIR"
+  mkdir -p /opt
+
+  echo "[BOOTSTRAP] cloning repo..."
+  git clone --depth 1 "$DEFAULT_REPO_URL" "$PROJECT_DIR" || {
+    echo "[BOOTSTRAP] first clone failed → retry"
+    git clone --depth 1 "$DEFAULT_REPO_URL" "$PROJECT_DIR" || \
+      error_exit "git clone failed permanently"
+  }
+
+  [[ -f "$PROJECT_DIR/bot.py" ]] || error_exit "repo incomplete after clone"
+}
+
 
 resolve_os() {
   [[ -r /etc/os-release ]] || error_exit "Cannot read /etc/os-release"
@@ -478,13 +526,14 @@ main() {
   log "Starting ${PROJECT_NAME} production installer..."
   log "Working directory: $PROJECT_DIR"
 
-  [[ -d "$PROJECT_DIR" ]] || error_exit "Project directory does not exist: $PROJECT_DIR"
-
+  #[[ -d "$PROJECT_DIR" ]] || error_exit "Project directory does not exist: $PROJECT_DIR"
+  bootstrap_project
   resolve_os
   check_disk_space
   check_internet
-  validate_repo_files
   install_system_dependencies
+  validate_repo_files
+  #install_system_dependencies
   create_venv
   activate_venv
   install_python_dependencies
