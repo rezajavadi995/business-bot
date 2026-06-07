@@ -408,9 +408,13 @@ DB_IMPORT_DRAIN_TIMEOUT_SECONDS = 15
 BACKGROUND_TASK_SHUTDOWN_TIMEOUT_SECONDS = 20
 MARKET_REFRESH_TASK: asyncio.Task | None = None
 CALLBACK_EXECUTION_TTL_SECONDS = 10 * 60
+PANEL_CALLBACK_DEDUPE_SECONDS = 2
+PANEL_MESSAGE_DEDUPE_SECONDS = 10 * 60
 CALLBACK_EXECUTION_LOCK = asyncio.Lock()
 CALLBACK_EXECUTION_IDS: dict[str, int] = {}
 CALLBACK_EXECUTION_RESULTS: dict[str, str] = {}
+PANEL_CALLBACK_FINGERPRINTS: dict[str, int] = {}
+PANEL_MESSAGE_LOCKS: dict[str, asyncio.Lock] = {}
 EDIT_MESSAGE_LOCKS: dict[str, asyncio.Lock] = {}
 
 
@@ -895,11 +899,12 @@ async def render_admin_panel(update, context, data, *, edit=False, query=None) -
     The return value describes only the UI side effect and must not be used
     as a global callback-pipeline stop signal.
     """
+    update_id = getattr(update, "update_id", None)
     user_data = getattr(context, "user_data", None)
-    if user_data is not None:
-        if user_data.get("panel_rendered_for_update") == update.update_id:
+    if update_id is not None and user_data is not None:
+        if user_data.get("panel_rendered_for_update") == update_id:
             return True
-        user_data["panel_rendered_for_update"] = update.update_id
+        user_data["panel_rendered_for_update"] = update_id
 
     text = "پنل ادمین"
     reply_markup = create_admin_keyboard(data)
@@ -1359,6 +1364,25 @@ async def claim_callback_execution(callback_id: str | None, message_id: object |
         return True
 
 
+def _prune_panel_callback_fingerprints(now: int) -> None:
+    expired = [key for key, ts in PANEL_CALLBACK_FINGERPRINTS.items() if now - int(ts or 0) > PANEL_CALLBACK_DEDUPE_SECONDS]
+    for key in expired:
+        PANEL_CALLBACK_FINGERPRINTS.pop(key, None)
+
+
+async def claim_panel_callback_fingerprint(uid: int, message_id: object | None, normalized_payload: str | None) -> bool:
+    if not normalized_payload:
+        return True
+    key = f"{uid}:{message_id or '-'}:{normalized_payload}"
+    now = int(time.time())
+    async with CALLBACK_EXECUTION_LOCK:
+        _prune_panel_callback_fingerprints(now)
+        if key in PANEL_CALLBACK_FINGERPRINTS:
+            return False
+        PANEL_CALLBACK_FINGERPRINTS[key] = now
+        return True
+
+
 def stable_payload_hash(payload: Any) -> str:
     def normalize(value: Any) -> Any:
         if hasattr(value, "to_dict"):
@@ -1672,6 +1696,64 @@ async def maybe_welcome(update: Update, data: dict[str, Any], uid: int, source: 
         return True
     return False
 
+
+
+def is_admin_panel_trigger(text: str | None) -> bool:
+    value = str(text or "").strip()
+    if not value:
+        return False
+    return re.fullmatch(r"/?panel(?:@\w+)?", value, flags=re.IGNORECASE) is not None
+
+
+def clear_admin_panel_flow_state(uid: int) -> None:
+    STATE.flow = STATE.step = STATE.pending_key = None
+    STATE.temp_shortcuts = None
+    db.clear_admin_state(uid)
+
+
+def panel_message_dedupe_key(message: Any) -> str | None:
+    chat = getattr(message, "chat", None)
+    chat_id = getattr(chat, "id", None)
+    message_id = getattr(message, "message_id", None)
+    if chat_id is None or message_id is None:
+        return None
+    return f"admin_panel_request:{chat_id}:{message_id}"
+
+
+def panel_message_lock(key: str) -> asyncio.Lock:
+    lock = PANEL_MESSAGE_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        PANEL_MESSAGE_LOCKS[key] = lock
+    return lock
+
+
+async def claim_panel_message_render(message: Any) -> bool:
+    key = panel_message_dedupe_key(message)
+    if not key:
+        return True
+    now = int(time.time())
+    async with panel_message_lock(key):
+        previous = db.get_json(key, {})
+        if isinstance(previous, dict) and now - int(previous.get("processed_at") or 0) <= PANEL_MESSAGE_DEDUPE_SECONDS:
+            logging.info("admin_panel_message_duplicate_ignored key=%s", key)
+            return False
+        db.set_json(key, {"processed_at": now})
+        return True
+
+
+async def open_admin_panel_from_message(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict[str, Any] | None = None) -> bool:
+    if not update.message or not update.effective_user:
+        return False
+    data = data or load_data()
+    uid = update.effective_user.id
+    if not is_admin(uid, data):
+        return False
+    clear_admin_panel_flow_state(uid)
+    if not await claim_panel_message_render(update.message):
+        return True
+    return await render_admin_panel(update, context, data, edit=False)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_user: return
     data=load_data(); u=update.effective_user
@@ -1692,10 +1774,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.effective_user: return
-    data=load_data()
-    if not is_admin(update.effective_user.id,data): return
-    return await render_admin_panel(update, context, data, edit=False)
+    return await open_admin_panel_from_message(update, context)
 
 
 
@@ -1974,6 +2053,10 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     panel_callback_data = {"menu:admin", "toggle:active", "admin:selfbot", "admin:welcome_toggle", "admin:db_export"}
     handled_panel_ui = False
     if q.data in panel_callback_data or q.data.startswith("panel:"):
+        if not await claim_panel_callback_fingerprint(uid, message_id, normalized.canonical):
+            logging.info("admin_panel_callback_duplicate_ignored uid=%s message_id=%s canonical=%r", uid, message_id, normalized.canonical)
+            await safe_callback_answer(q)
+            return
         if q.data=="toggle:active":
             data["active"]=not data["active"]
             save_data(data)
@@ -2631,6 +2714,8 @@ def reset_runtime_state_after_db_import() -> None:
     STATE.temp_shortcuts = None
     CALLBACK_EXECUTION_IDS.clear()
     CALLBACK_EXECUTION_RESULTS.clear()
+    PANEL_CALLBACK_FINGERPRINTS.clear()
+    PANEL_MESSAGE_LOCKS.clear()
     EDIT_MESSAGE_LOCKS.clear()
 
 
@@ -2738,11 +2823,9 @@ async def _all_messages_impl(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     # Monitoring is event-driven from business/channel/group updates.
     data=load_data(); uid=update.effective_user.id; src_txt=text_with_custom_emoji_markup(update.message); txt=(update.message.text or "").strip()
-    if txt.lower() in {"panel", "/panel"} and is_admin(uid,data):
-        STATE.flow=STATE.step=STATE.pending_key=None
-        STATE.temp_shortcuts=None
-        db.clear_admin_state(uid)
-        return await render_admin_panel(update, context, data, edit=False)
+    if is_admin_panel_trigger(txt):
+        if await open_admin_panel_from_message(update, context, data):
+            return
     if txt.casefold() in {"help convert", "help market", "market help", "راهنمای تبدیل", "راهنمای بازار"}:
         await update.message.reply_text(market_help_text(is_admin=is_admin(uid, data)))
         return
