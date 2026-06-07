@@ -215,24 +215,27 @@ validate_repo_files() {
 
 #new
 bootstrap_project() {
-  echo "[BOOTSTRAP] checking project..."
+  echo "[BOOTSTRAP] syncing project..."
 
-  if [[ -d "$PROJECT_DIR/.git" && -f "$PROJECT_DIR/bot.py" ]]; then
-    echo "[BOOTSTRAP] valid repo exists → skip"
-    return
-  fi
-
-  rm -rf "$PROJECT_DIR"
   mkdir -p /opt
 
-  echo "[BOOTSTRAP] cloning repo..."
-  git clone --depth 1 "$DEFAULT_REPO_URL" "$PROJECT_DIR" || {
-    echo "[BOOTSTRAP] first clone failed → retry"
-    git clone --depth 1 "$DEFAULT_REPO_URL" "$PROJECT_DIR" || \
-      error_exit "git clone failed permanently"
-  }
+  if [[ -d "$PROJECT_DIR/.git" ]]; then
+    echo "[BOOTSTRAP] repo exists → forcing update"
 
-  [[ -f "$PROJECT_DIR/bot.py" ]] || error_exit "repo incomplete after clone"
+    cd "$PROJECT_DIR" || exit 1
+
+    git fetch origin
+    git reset --hard origin/main
+    git clean -fd
+
+  else
+    echo "[BOOTSTRAP] cloning fresh repo"
+    rm -rf "$PROJECT_DIR"
+    git clone --depth 1 "$DEFAULT_REPO_URL" "$PROJECT_DIR"
+  fi
+
+  # VERIFY
+  [[ -f "$PROJECT_DIR/bot.py" ]] || error_exit "repo invalid after sync"
 }
 
 
@@ -350,17 +353,39 @@ validate_text_file_not_html() {
   fi
 }
 
+ensure_clean_pip_state() {
+  log "Upgrading pip tooling..."
+  python -m pip install --upgrade pip setuptools wheel || warn "pip upgrade failed, continuing..."
+}
+
+validate_requirements() {
+  grep -v "^#" "$REQUIREMENTS_FILE" | grep -q "==" || warn "Unpinned dependency detected"
+}
+
+
 install_python_dependencies() {
   log "Installing Python dependencies from requirements..."
 
   validate_text_file_not_html "$REQUIREMENTS_FILE"
 
-  python -m pip install --upgrade pip setuptools wheel
-  python -m pip --version >/dev/null 2>&1 || error_exit "pip inside venv is not functional"
+  validate_requirements
 
-  retry_command 3 4 python -m pip install -r "$REQUIREMENTS_FILE"
+  ensure_clean_pip_state
+
+  python -m pip --version >/dev/null 2>&1 || error_exit "pip broken in venv"
+
+  retry_command 3 4 python -m pip install -r "$REQUIREMENTS_FILE" || {
+    warn "pip failed → retrying after refresh..."
+
+    ensure_clean_pip_state
+
+    retry_command 2 5 python -m pip install -r "$REQUIREMENTS_FILE" || \
+      error_exit "pip install permanently failed"
+  }
+
   success "Python dependencies installed successfully."
 }
+
 
 ensure_env_file() {
   log "Ensuring .env exists..."
@@ -531,6 +556,7 @@ main() {
   resolve_os
   check_disk_space
   check_internet
+  ensure_clean_pip_state
   install_system_dependencies
   validate_repo_files
   #install_system_dependencies
