@@ -51,6 +51,20 @@ class DummyBot:
 class DummyContext:
     def __init__(self):
         self.bot = DummyBot()
+        self.user_data = {}
+
+
+class DummyMessage:
+    def __init__(self, text, chat_id=555, message_id=77):
+        self.text = text
+        self.caption = None
+        self.chat = DummyChat(chat_id)
+        self.message_id = message_id
+        self.replies = []
+
+    async def reply_text(self, text, **kwargs):
+        self.replies.append((text, kwargs))
+
 
 
 class DummyCallbackMessage:
@@ -237,6 +251,8 @@ class PhaseDCallbackRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.data = {**bot.get_default_data(), "admin_id": 42, "active": True, "inline_menu_enabled": True}
         bot.load_data = lambda: self.data
         bot.CALLBACK_EXECUTION_IDS.clear()
+        bot.PANEL_CALLBACK_FINGERPRINTS.clear()
+        bot.PANEL_MESSAGE_LOCKS.clear()
         bot.EDIT_MESSAGE_LOCKS.clear()
 
     def tearDown(self):
@@ -244,8 +260,46 @@ class PhaseDCallbackRuntimeTests(unittest.IsolatedAsyncioTestCase):
         bot.load_data = self.old_load_data
         bot.BUSINESS_OWNER_CACHE.clear()
         bot.CALLBACK_EXECUTION_IDS.clear()
+        bot.PANEL_CALLBACK_FINGERPRINTS.clear()
+        bot.PANEL_MESSAGE_LOCKS.clear()
         bot.EDIT_MESSAGE_LOCKS.clear()
         self.tmp.cleanup()
+
+
+    async def test_admin_panel_message_triggers_share_single_idempotent_path(self):
+        context = CallbackContext()
+        message = DummyMessage("Panel", message_id=700)
+        update = SimpleNamespace(message=message, effective_message=message, effective_chat=message.chat, effective_user=SimpleNamespace(id=42))
+
+        handled_first = await bot.open_admin_panel_from_message(update, context, self.data)
+        handled_second = await bot.open_admin_panel_from_message(update, context, self.data)
+
+        self.assertTrue(handled_first)
+        self.assertTrue(handled_second)
+        self.assertEqual(len(context.bot.sent), 1)
+        self.assertEqual(context.bot.sent[0]["text"], "پنل ادمین")
+        self.assertIsNone(bot.STATE.flow)
+
+    async def test_panel_trigger_accepts_case_and_slash_variants(self):
+        self.assertTrue(bot.is_admin_panel_trigger("panel"))
+        self.assertTrue(bot.is_admin_panel_trigger("Panel"))
+        self.assertTrue(bot.is_admin_panel_trigger("/panel"))
+        self.assertTrue(bot.is_admin_panel_trigger("/Panel"))
+        self.assertFalse(bot.is_admin_panel_trigger("panel now"))
+
+    async def test_duplicate_panel_toggle_callback_executes_only_once(self):
+        context = CallbackContext()
+        message = DummyCallbackMessage()
+        q1 = DummyCallbackQuery(42, "toggle:active", message=message, query_id="toggle-1")
+        q2 = DummyCallbackQuery(42, "toggle:active", message=message, query_id="toggle-2")
+        self.data["active"] = True
+
+        await bot.callbacks(SimpleNamespace(callback_query=q1), context)
+        await bot.callbacks(SimpleNamespace(callback_query=q2), context)
+
+        self.assertFalse(self.data["active"])
+        self.assertTrue(hasattr(q1, "edited_text"))
+        self.assertFalse(hasattr(q2, "edited_text"))
 
     async def test_admin_inline_menu_button_bypasses_ban_and_disabled_engine(self):
         self.data["active"] = False
@@ -479,6 +533,8 @@ class PhaseDBusinessAdminMenuTests(unittest.IsolatedAsyncioTestCase):
         self.data = {**bot.get_default_data(), "admin_id": 42, "active": True, "inline_menu_enabled": True}
         bot.load_data = lambda: self.data
         bot.CALLBACK_EXECUTION_IDS.clear()
+        bot.PANEL_CALLBACK_FINGERPRINTS.clear()
+        bot.PANEL_MESSAGE_LOCKS.clear()
         bot.EDIT_MESSAGE_LOCKS.clear()
 
         async def no_watch(*args, **kwargs):
